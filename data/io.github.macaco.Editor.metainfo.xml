@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.macaco.Editor</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <name>macaco</name>
+  <summary>Editor di testo leggero e minimale</summary>
+  <description>
+    <p>
+      Editor di testo GTK 4 scritto in Rust: evidenziazione della sintassi per
+      14 linguaggi e Markdown, schede affiancate con confronto (diff),
+      conversione tra codifiche (UTF-8, UTF-16, ISO-8859-1/15, Windows-1252),
+      cerca e sostituisci con espressioni regolari, recupero automatico dei
+      documenti non salvati.
+    </p>
+  </description>
+  <launchable type="desktop-id">io.github.macaco.Editor.desktop</launchable>
+  <provides>
+    <binary>macaco</binary>
+  </provides>
+  <categories>
+    <category>Utility</category>
+    <category>TextEditor</category>
+  </categories>
+  <content_rating type="oars-1.1"/>
+  <releases>
+    <release version="0.2.0" date="2026-10-11"/>
+  </releases>
+</component>

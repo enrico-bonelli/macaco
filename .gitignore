@@ -1,0 +1,12 @@
+# Compilati
+/target
+
+# Pacchettizzazione locale (non pubblicata)
+/packaging/
+
+# Cartelle nascoste (impostazioni di editor e strumenti)
+.*/
+
+# File di backup
+*~
+*.swp

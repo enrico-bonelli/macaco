@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Name=macaco
+GenericName=Editor di testo
+Comment=Editor di testo leggero e minimale
+Exec=macaco %F
+Icon=io.github.macaco.Editor
+Terminal=false
+Categories=Utility;TextEditor;
+MimeType=text/plain;text/x-csrc;text/x-chdr;text/x-c++src;text/x-c++hdr;text/rust;text/x-python;application/x-shellscript;text/javascript;application/javascript;text/x-typescript;application/x-yaml;text/html;text/css;text/x-java;text/x-go;application/x-php;text/markdown;
+StartupNotify=true
+StartupWMClass=io.github.macaco.Editor
+Keywords=text;editor;code;diff;markdown;

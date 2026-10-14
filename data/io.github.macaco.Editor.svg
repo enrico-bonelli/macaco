@@ -1,0 +1,42 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#3a4150"/>
+      <stop offset="1" stop-color="#21252b"/>
+    </linearGradient>
+  </defs>
+  <!-- editor window -->
+  <rect x="8" y="12" width="112" height="104" rx="14" fill="url(#bg)"/>
+  <rect x="8" y="12" width="20" height="104" rx="14" fill="#2c313a"/>
+  <rect x="20" y="12" width="8" height="104" fill="#2c313a"/>
+  <g fill="#5c6370">
+    <rect x="13" y="27" width="10" height="4" rx="2"/>
+    <rect x="13" y="41" width="10" height="4" rx="2"/>
+    <rect x="13" y="55" width="10" height="4" rx="2"/>
+    <rect x="13" y="69" width="10" height="4" rx="2"/>
+  </g>
+  <!-- syntax highlighted code lines -->
+  <rect x="36" y="26" width="18" height="6" rx="3" fill="#c678dd"/>
+  <rect x="58" y="26" width="30" height="6" rx="3" fill="#61afef"/>
+  <rect x="44" y="40" width="14" height="6" rx="3" fill="#e5c07b"/>
+  <rect x="62" y="40" width="38" height="6" rx="3" fill="#98c379"/>
+  <rect x="44" y="54" width="22" height="6" rx="3" fill="#c678dd"/>
+  <rect x="70" y="54" width="16" height="6" rx="3" fill="#d19a66"/>
+  <rect x="36" y="68" width="10" height="6" rx="3" fill="#abb2bf"/>
+  <!-- macaque face -->
+  <g transform="translate(84 86)">
+    <circle cx="-21" cy="-2" r="9" fill="#8a5a3c"/>
+    <circle cx="21" cy="-2" r="9" fill="#8a5a3c"/>
+    <circle cx="-21" cy="-2" r="5" fill="#e8a98c"/>
+    <circle cx="21" cy="-2" r="5" fill="#e8a98c"/>
+    <circle cx="0" cy="0" r="22" fill="#9c6a48"/>
+    <path d="M -15 -4 C -15 -16 -2 -16 0 -9 C 2 -16 15 -16 15 -4 C 15 8 9 17 0 17 C -9 17 -15 8 -15 -4 Z" fill="#f0bfa0"/>
+    <circle cx="-6" cy="-5" r="3" fill="#2b1d16"/>
+    <circle cx="6" cy="-5" r="3" fill="#2b1d16"/>
+    <circle cx="-5" cy="-6" r="1" fill="#ffffff"/>
+    <circle cx="7" cy="-6" r="1" fill="#ffffff"/>
+    <ellipse cx="-2.5" cy="4" rx="1.4" ry="1" fill="#7a4a35"/>
+    <ellipse cx="2.5" cy="4" rx="1.4" ry="1" fill="#7a4a35"/>
+    <path d="M -5 10 Q 0 13 5 10" stroke="#7a4a35" stroke-width="1.6" fill="none" stroke-linecap="round"/>
+  </g>
+</svg>
