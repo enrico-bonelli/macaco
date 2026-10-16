@@ -9,8 +9,10 @@ mod format;
 mod git;
 mod lang;
 mod lexer;
+mod lsp;
 mod search;
 mod sidebar;
+mod symbols;
 mod terminal;
 mod window;
 

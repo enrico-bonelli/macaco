@@ -357,9 +357,49 @@ pub fn read_text(path: &Path) -> Option<String> {
     Some(encoding::normalize_eol(encoding::decode(&bytes, encoding::detect(&bytes))).0)
 }
 
+/// Part of a line to show for a match at bytes `start..end` of `line`:
+/// (snippet, match inside it in characters, column of the match).
+pub fn snippet(line: &str, start: usize, end: usize) -> (String, (u32, u32), u32) {
+    let before: Vec<char> = line[..start].chars().collect();
+    let found: Vec<char> = line[start..end.max(start)].chars().collect();
+    let after = &line[end.max(start)..];
+    // Some text around the match, without leading blanks.
+    let skip = before.iter().take_while(|c| c.is_whitespace()).count().max(before.len().saturating_sub(SNIPPET_BEFORE));
+    let mut snippet = String::new();
+    if skip > 0 && before[..skip].iter().any(|c| !c.is_whitespace()) {
+        snippet.push('…');
+    }
+    snippet.extend(&before[skip..]);
+    let hl_start = snippet.chars().count() as u32;
+    snippet.extend(&found);
+    let mut tail = after.chars();
+    snippet.extend(tail.by_ref().take(SNIPPET_AFTER));
+    if tail.next().is_some() {
+        snippet.push('…');
+    }
+    (snippet, (hl_start, found.len() as u32), before.len() as u32)
+}
+
+/// Byte ranges of comments and strings in `text` (sorted).
+fn comments_and_strings(lang: crate::lang::Lang, text: &str) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    let mut state = crate::lexer::initial_state(lang);
+    let mut toks = Vec::new();
+    let mut offset = 0;
+    for line in text.split('\n') {
+        state = crate::lexer::lex_line(lang, state, line, &mut toks);
+        for t in toks.iter().filter(|t| matches!(t.kind, crate::lexer::Kind::Comment | crate::lexer::Kind::Str)) {
+            out.push((offset + t.start as usize, offset + t.end as usize));
+        }
+        offset += line.len() + 1;
+    }
+    out
+}
+
 /// Searches `q` in the files of `root` (same files as the quick search).
+/// With `code_only`, matches inside comments and strings are skipped.
 /// Slow: to be run in a thread; `progress.cancel` stops it.
-pub fn grep(root: &Path, q: &Query, progress: &Progress) -> TextResults {
+pub fn grep(root: &Path, q: &Query, code_only: bool, progress: &Progress) -> TextResults {
     let paths = scan(root);
     progress.total.store(paths.len(), Ordering::Relaxed);
     let mut res = TextResults::default();
@@ -373,12 +413,27 @@ pub fn grep(root: &Path, q: &Query, progress: &Progress) -> TextResults {
         let rel = paths.get(i);
         let Some(text) = read_text(&root.join(rel)) else { continue };
         let mut file: Option<u32> = None;
+        // Comments and strings, computed for files that match.
+        let mut skip_ranges: Option<Vec<(usize, usize)>> = None;
         // Line of the last match, to report each line once.
         let (mut line, mut line_start, mut counted_to) = (0u32, 0usize, 0usize);
         let mut last_line = u32::MAX;
         for m in q.re.find_iter(&text) {
             if m.start() == m.end() {
                 continue;
+            }
+            if code_only {
+                let ranges = skip_ranges.get_or_insert_with(|| {
+                    let head: String = text.chars().take(256).collect();
+                    match crate::lang::detect(Some(Path::new(rel)), &head) {
+                        crate::lang::Lang::Plain => Vec::new(),
+                        lang => comments_and_strings(lang, &text),
+                    }
+                });
+                let i = ranges.partition_point(|r| r.1 <= m.start());
+                if ranges.get(i).is_some_and(|r| r.0 <= m.start()) {
+                    continue;
+                }
             }
             for (j, b) in text.as_bytes()[counted_to..m.start()].iter().enumerate() {
                 if *b == b'\n' {
@@ -392,34 +447,12 @@ pub fn grep(root: &Path, q: &Query, progress: &Progress) -> TextResults {
             }
             last_line = line;
             let line_end = text[line_start..].find('\n').map_or(text.len(), |e| line_start + e);
-            let before: Vec<char> = text[line_start..m.start()].chars().collect();
-            let found: Vec<char> = text[m.start()..m.end().min(line_end).max(m.start())].chars().collect();
-            let after = &text[m.end().min(line_end)..line_end];
-            // Snippet: some text around the match, without leading blanks.
-            let skip = before.iter().take_while(|c| c.is_whitespace()).count().max(before.len().saturating_sub(SNIPPET_BEFORE));
-            let mut snippet = String::new();
-            if skip > 0 && before[..skip].iter().any(|c| !c.is_whitespace()) {
-                snippet.push('…');
-            }
-            snippet.extend(&before[skip..]);
-            let hl_start = snippet.chars().count() as u32;
-            snippet.extend(&found);
-            let mut tail = after.chars();
-            snippet.extend(tail.by_ref().take(SNIPPET_AFTER));
-            if tail.next().is_some() {
-                snippet.push('…');
-            }
+            let (snippet, hl, col) = snippet(&text[line_start..line_end], m.start() - line_start, m.end().min(line_end) - line_start);
             let idx = *file.get_or_insert_with(|| {
                 res.files.push(rel.to_string());
                 (res.files.len() - 1) as u32
             });
-            res.matches.push(TextMatch {
-                file: idx,
-                line,
-                col: before.len() as u32,
-                snippet,
-                hl: (hl_start, found.len() as u32),
-            });
+            res.matches.push(TextMatch { file: idx, line, col, snippet, hl });
             if res.matches.len() >= MAX_TEXT_MATCHES {
                 res.truncated = true;
                 return res;
@@ -502,7 +535,7 @@ mod tests {
         fs::write(dir.join(".git/x"), "ciao").unwrap();
         fs::write(dir.join("bin.dat"), b"ciao\0\0").unwrap();
         let q = Query::new("ciao", Options::default()).unwrap();
-        let res = grep(&dir, &q, &Progress::default());
+        let res = grep(&dir, &q, false, &Progress::default());
         assert_eq!(res.files, vec!["a.txt"]);
         assert_eq!(res.matches.len(), 2);
         let m = &res.matches[0];
@@ -510,6 +543,13 @@ mod tests {
         assert_eq!(m.snippet, "Ciao mondo, ciao");
         assert_eq!(m.hl, (0, 4));
         assert_eq!(res.matches[1].line, 3);
+        // Only code: the match in the comment is skipped.
+        fs::write(dir.join("b.rs"), "fn ciao() {}\n// ciao\nlet s = \"ciao\"; ciao();\n").unwrap();
+        let res = grep(&dir, &q, true, &Progress::default());
+        let in_b: Vec<u32> = res.matches.iter().filter(|m| res.files[m.file as usize] == "b.rs").map(|m| m.line).collect();
+        assert_eq!(in_b, vec![0, 2]);
+        let m = res.matches.iter().find(|m| res.files[m.file as usize] == "b.rs" && m.line == 2).unwrap();
+        assert_eq!(m.col, 16);
         let _ = fs::remove_dir_all(&dir);
     }
 

@@ -20,6 +20,8 @@ use std::rc::{Rc, Weak};
 use std::time::{Duration, Instant};
 
 mod gitui;
+mod inspect;
+mod lspui;
 mod quickopen;
 mod textsearch;
 
@@ -53,6 +55,8 @@ struct StatusUi {
     diff: gtk::Label,
     /// Current git branch; opens the branch dialog.
     branch: gtk::Button,
+    /// Language servers running.
+    lsp: gtk::Label,
     mem: gtk::Label,
 }
 
@@ -113,6 +117,20 @@ pub struct Editor {
     quick: RefCell<Option<Rc<quickopen::QuickOpen>>>,
     /// Open "search in files" window.
     text_search: RefCell<Option<Rc<textsearch::TextSearch>>>,
+    /// Definitions found in the indexed working folder.
+    symbols: RefCell<Option<Rc<inspect::Symbols>>>,
+    symbols_building: Cell<bool>,
+    /// Completion popup.
+    completion: RefCell<Option<Rc<inspect::Completion>>>,
+    /// Running language servers.
+    lsp_clients: RefCell<Vec<Rc<crate::lsp::Client>>>,
+    /// Servers that could not start in this folder (not tried again).
+    lsp_failed: RefCell<std::collections::HashSet<&'static str>>,
+    /// Progress text of each server.
+    lsp_status: RefCell<std::collections::HashMap<&'static str, String>>,
+    /// Documents with changes not yet sent to their server.
+    lsp_dirty: RefCell<std::collections::HashSet<String>>,
+    lsp_flush_scheduled: Cell<bool>,
 }
 
 /// Shortcuts that keep working while the terminal has the focus; all the
@@ -270,6 +288,14 @@ impl Editor {
             index: RefCell::new(None),
             quick: RefCell::new(None),
             text_search: RefCell::new(None),
+            symbols: RefCell::new(None),
+            symbols_building: Cell::new(false),
+            completion: RefCell::new(None),
+            lsp_clients: RefCell::new(Vec::new()),
+            lsp_failed: RefCell::new(Default::default()),
+            lsp_status: RefCell::new(Default::default()),
+            lsp_dirty: RefCell::new(Default::default()),
+            lsp_flush_scheduled: Cell::new(false),
         });
         ed.apply_font();
         ed.apply_theme();
@@ -281,6 +307,7 @@ impl Editor {
             ed.set_sidebar(true);
         }
         ed.sync_index();
+        ed.sync_lsp();
         ed.git_refresh();
         ed.start_timers();
         ed
@@ -377,6 +404,11 @@ impl Editor {
         diff.add_css_class("diff-info");
         diff.set_visible(false);
         diff.set_tooltip_text(Some("F9: attiva/disattiva il confronto · Alt+↓ / Alt+↑: differenza successiva / precedente"));
+        let lsp = gtk::Label::new(None);
+        lsp.add_css_class("dim-label");
+        lsp.set_margin_start(6);
+        lsp.set_margin_end(6);
+        lsp.set_visible(false);
         let branch = gtk::Button::new();
         branch.add_css_class("flat");
         branch.add_css_class("git-branch");
@@ -388,6 +420,7 @@ impl Editor {
         mem.set_margin_end(6);
         bar.append(&message);
         bar.append(&diff);
+        bar.append(&lsp);
         bar.append(&branch);
         for b in [&pos, &lang, &enc, &eol] {
             b.add_css_class("flat");
@@ -395,7 +428,7 @@ impl Editor {
             bar.append(b);
         }
         bar.append(&mem);
-        (bar, StatusUi { message, pos, goto, lang, enc, eol, diff, branch, mem })
+        (bar, StatusUi { message, pos, goto, lang, enc, eol, diff, branch, lsp, mem })
     }
 
     fn build_menu(recent: &gio::Menu) -> gio::Menu {
@@ -411,6 +444,7 @@ impl Editor {
         sw.append(Some("Apri cartella di lavoro…"), Some("win.open-folder"));
         sw.append(Some("Cerca file nella cartella di lavoro…"), Some("win.quick-open"));
         sw.append(Some("Indicizza la cartella di lavoro"), Some("win.index-folder"));
+        sw.append(Some("Analisi del codice con language server"), Some("win.lsp-folder"));
         sw.append(Some("Chiudi cartella di lavoro"), Some("win.close-folder"));
         file.append_section(None, &sw);
         let s2 = gio::Menu::new();
@@ -456,6 +490,11 @@ impl Editor {
         find.append(Some("Trova precedente"), Some("win.find-prev"));
         find.append(Some("Vai alla riga…"), Some("win.goto"));
         find.append(Some("Cerca nei file della cartella di lavoro…"), Some("win.find-in-folder"));
+        let code = gio::Menu::new();
+        code.append(Some("Vai alla definizione"), Some("win.goto-definition"));
+        code.append(Some("Trova utilizzi"), Some("win.find-usages"));
+        code.append(Some("Completa"), Some("win.complete"));
+        find.append_section(None, &code);
         bar.append_submenu(Some("_Cerca"), &find);
 
         let view = gio::Menu::new();
@@ -756,6 +795,8 @@ impl Editor {
         self.setup_git_actions();
         self.setup_quickopen_actions();
         self.setup_textsearch_actions();
+        self.setup_inspect_actions();
+        self.setup_lsp_actions();
     }
 
     fn connect_ui(self: &Rc<Self>) {
@@ -778,6 +819,8 @@ impl Editor {
                     ed.update_status_for(&d);
                     ed.sync_sidebar();
                     ed.git_refresh();
+                    ed.hide_completion();
+                    ed.lsp_open(&d);
                     if ed.search.revealer.reveals_child() {
                         ed.highlight_matches(&d);
                     }
@@ -929,6 +972,7 @@ impl Editor {
 
     /// Window-level signal handlers of a document.
     fn wire_doc(self: &Rc<Self>, d: &Rc<Doc>) {
+        self.wire_inspect(d);
         let ed = Rc::downgrade(self);
         let wd = d.weak();
         d.close_button.connect_clicked(move |_| {
@@ -1105,6 +1149,7 @@ impl Editor {
         self.add_recent(&path);
         self.update_status_for(&d);
         self.sync_sidebar();
+        self.lsp_open(&d);
         if !path.exists() {
             self.message(&format!("Nuovo file: {}", path.display()));
         }
@@ -1220,6 +1265,8 @@ impl Editor {
                 self.update_status_for(d);
                 self.sync_sidebar();
                 self.git_refresh();
+                self.symbols_saved(d);
+                self.lsp_saved(d);
                 self.message(&format!("Salvato {} ({})", path.display(), d.encoding.get().label()));
                 self.schedule_layout();
                 self.schedule_autosave();
@@ -1314,6 +1361,8 @@ impl Editor {
     }
 
     fn remove_doc(self: &Rc<Self>, d: &Rc<Doc>) {
+        self.forget_completion(d);
+        self.lsp_closed(d);
         if let Some(p) = self.pane_of(d) {
             let nb = &self.notebooks[p];
             if let Some(i) = nb.page_num(&d.scroller) {
@@ -2219,6 +2268,7 @@ impl Editor {
             }
         }
         self.sync_index();
+        self.sync_lsp();
         self.sync_sidebar();
         self.git_refresh();
         self.schedule_autosave();
@@ -2343,12 +2393,16 @@ impl Editor {
             .find_map(|l| l.strip_prefix("VmRSS:"))
             .and_then(|v| v.split_whitespace().next()?.parse().ok())
             .unwrap_or(0);
-        let mb = kb as f64 / 1024.0;
-        self.status.mem.set_text(&if mb >= 1024.0 { format!("RAM {:.2} GB", mb / 1024.0) } else { format!("RAM {mb:.0} MB") });
+        let fmt = |kb: u64| {
+            let mb = kb as f64 / 1024.0;
+            if mb >= 1024.0 { format!("{:.2} GB", mb / 1024.0) } else { format!("{mb:.0} MB") }
+        };
+        let lsp_kb = self.lsp_memory_kb();
+        self.status.mem.set_text(&if lsp_kb > 0 { format!("RAM {} + LSP {}", fmt(kb), fmt(lsp_kb)) } else { format!("RAM {}", fmt(kb)) });
         let docs = self.docs.borrow();
         let loaded = docs.iter().filter(|d| d.is_loaded()).count();
         self.status.mem.set_tooltip_text(Some(&format!(
-            "Memoria residente del processo (RSS): {kb} kB\nSchede caricate in memoria: {loaded} di {}",
+            "Memoria residente del processo (RSS): {kb} kB\nLanguage server: {lsp_kb} kB\nSchede caricate in memoria: {loaded} di {}",
             docs.len()
         )));
     }
@@ -2590,8 +2644,9 @@ impl Editor {
         let dark = switch(s.dark);
         let bell = switch(s.bell);
         let blink = switch(s.cursor_blink);
+        let autocomplete = switch(s.autocomplete);
 
-        let rows: [(&str, &gtk::Widget); 11] = [
+        let rows: [(&str, &gtk::Widget); 12] = [
             ("Carattere", font_btn.upcast_ref()),
             ("", mono_only.upcast_ref()),
             ("Dimensione (pt)", size.upcast_ref()),
@@ -2603,6 +2658,7 @@ impl Editor {
             ("Tema scuro", dark.upcast_ref()),
             ("Avviso sonoro (terminale, tasti non validi)", bell.upcast_ref()),
             ("Cursore lampeggiante (usa più CPU)", blink.upcast_ref()),
+            ("Completamento automatico durante la digitazione", autocomplete.upcast_ref()),
         ];
         for (i, (t, w)) in rows.iter().enumerate() {
             grid.attach(&label(t), 0, i as i32, 1, 1);
@@ -2644,6 +2700,7 @@ impl Editor {
         bind(&dark, |s, v| s.dark = v);
         bind(&bell, |s, v| s.bell = v);
         bind(&blink, |s, v| s.cursor_blink = v);
+        bind(&autocomplete, |s, v| s.autocomplete = v);
 
         let esc = gtk::EventControllerKey::new();
         let d2 = dlg.downgrade();
@@ -2794,6 +2851,10 @@ impl Editor {
         }
         self.persist();
         self.shut_down.set(true);
+        // No language server must outlive the editor.
+        for c in self.lsp_clients.borrow_mut().drain(..) {
+            c.kill();
+        }
         let mut s = self.shared.settings.borrow_mut();
         if self.sidebar_visible() {
             s.sidebar_width = self.hpaned.position();
@@ -2846,6 +2907,7 @@ impl Editor {
                 }
                 "key" => {
                     if let (Some(d), Some(k)) = (ed.active_doc(), gdk::Key::from_name(arg.unwrap_or("")))
+                        && !d.key_hook.borrow().as_ref().is_some_and(|h| h(k, gdk::ModifierType::empty()))
                         && !d.handle_key(k, gdk::ModifierType::empty())
                         && let Some(c) = k.to_unicode()
                     {
@@ -2918,6 +2980,19 @@ impl Editor {
                     let (a, n) = arg.unwrap_or("").split_once('@').unwrap_or((arg.unwrap_or(""), "0"));
                     ed.debug_text_search(a, n.parse().unwrap_or(0));
                 }
+                // cursor:LINE.COL (from 1)
+                "cursor" => {
+                    if let Some(d) = ed.active_doc() {
+                        let (l, c) = arg.unwrap_or("1.1").split_once('.').unwrap_or((arg.unwrap_or("1"), "1"));
+                        let (l, c): (i32, i32) = (l.parse().unwrap_or(1), c.parse().unwrap_or(1));
+                        if let Some(mut it) = d.buffer.iter_at_line(l - 1) {
+                            it.set_line_offset(c - 1);
+                            d.buffer.place_cursor(&it);
+                        }
+                    }
+                }
+                "inspect" => ed.debug_inspect(),
+                "shot-popup" => ed.debug_shot_popup(arg.unwrap_or("/tmp/popup.png")),
                 "qo-open" => ed.debug_quick_open(arg.and_then(|a| a.parse().ok()).unwrap_or(0)),
                 "term-feed" => {
                     if let Some(t) = ed.terminal.borrow().as_ref() {

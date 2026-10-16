@@ -7,6 +7,7 @@
 //! * `git-excluded`          files hidden from the list of git changes
 //! * `indexed`               folders indexed for the quick file search
 //! * `index/<hash>.paths`    their list of files
+//! * `lsp-folders`           folders where language servers are enabled
 
 use crate::encoding::{Encoding, Eol};
 use crate::lang::Lang;
@@ -60,6 +61,8 @@ pub struct Settings {
     /// Audible bell (terminal, invalid key presses).
     pub bell: bool,
     pub cursor_blink: bool,
+    /// Completion list while typing (Ctrl+Space always works).
+    pub autocomplete: bool,
     pub sidebar: bool,
     pub sidebar_width: i32,
     pub width: i32,
@@ -81,6 +84,7 @@ impl Default for Settings {
             dark: false,
             bell: true,
             cursor_blink: false,
+            autocomplete: true,
             sidebar: false,
             sidebar_width: 240,
             width: 1000,
@@ -118,6 +122,7 @@ impl Settings {
                 "dark" => s.dark = flag(v),
                 "bell" => s.bell = flag(v),
                 "cursor_blink" => s.cursor_blink = flag(v),
+                "autocomplete" => s.autocomplete = flag(v),
                 "sidebar" => s.sidebar = flag(v),
                 "sidebar_width" => s.sidebar_width = v.parse().unwrap_or(s.sidebar_width).max(120),
                 "width" => s.width = v.parse().unwrap_or(s.width).max(300),
@@ -131,7 +136,7 @@ impl Settings {
 
     pub fn save(&self) {
         let text = format!(
-            "# macaco settings\nfont_family={}\nfont_size={}\ntab_width={}\ninsert_spaces={}\nwrap={}\nline_numbers={}\nhighlight_line={}\ndark={}\nbell={}\ncursor_blink={}\nsidebar={}\nsidebar_width={}\nwidth={}\nheight={}\n# renderer: cairo (lightest) | gl | vulkan | auto\nrenderer={}\n",
+            "# macaco settings\nfont_family={}\nfont_size={}\ntab_width={}\ninsert_spaces={}\nwrap={}\nline_numbers={}\nhighlight_line={}\ndark={}\nbell={}\ncursor_blink={}\nautocomplete={}\nsidebar={}\nsidebar_width={}\nwidth={}\nheight={}\n# renderer: cairo (lightest) | gl | vulkan | auto\nrenderer={}\n",
             self.font_family,
             self.font_size,
             self.tab_width,
@@ -142,6 +147,7 @@ impl Settings {
             self.dark,
             self.bell,
             self.cursor_blink,
+            self.autocomplete,
             self.sidebar,
             self.sidebar_width,
             self.width,
@@ -202,6 +208,22 @@ pub fn save_indexed(list: &[PathBuf]) {
         text.push('\n');
     }
     let _ = write_atomic(&indexed_path(), text.as_bytes());
+}
+
+/// Folders where the language servers are enabled.
+pub fn load_lsp_folders() -> Vec<PathBuf> {
+    fs::read_to_string(base_dir().join("lsp-folders"))
+        .map(|t| t.lines().filter(|l| !l.is_empty()).map(PathBuf::from).collect())
+        .unwrap_or_default()
+}
+
+pub fn save_lsp_folders(list: &[PathBuf]) {
+    let mut text = String::new();
+    for p in list {
+        text.push_str(&p.to_string_lossy());
+        text.push('\n');
+    }
+    let _ = write_atomic(&base_dir().join("lsp-folders"), text.as_bytes());
 }
 
 // ------------------------------------------------------------ git excluded

@@ -26,6 +26,8 @@ pub(super) struct TextSearch {
     case: gtk::ToggleButton,
     word: gtk::ToggleButton,
     regex: gtk::ToggleButton,
+    /// Skip matches in comments and strings.
+    code_only: gtk::ToggleButton,
     button: gtk::Button,
     status: gtk::Label,
     store: gtk::StringList,
@@ -83,6 +85,51 @@ impl Editor {
         }
         t.win.present();
         t.entry.grab_focus();
+    }
+
+    /// The search window for `root` (opened if needed).
+    fn text_search_window(self: &Rc<Self>, root: &Path) -> Rc<TextSearch> {
+        let open = self.text_search.borrow().clone();
+        match open {
+            Some(t) if t.root == root => t,
+            other => {
+                if let Some(t) = other {
+                    t.win.close();
+                }
+                let t = TextSearch::new(self, root.to_path_buf());
+                *self.text_search.borrow_mut() = Some(t.clone());
+                t
+            }
+        }
+    }
+
+    /// "Find usages" by name: whole word, case sensitive, outside comments
+    /// and strings, in the files of `root`.
+    pub(super) fn search_usages(self: &Rc<Self>, root: &Path, word: &str) {
+        let t = self.text_search_window(root);
+        t.entry.set_text(word);
+        t.case.set_active(true);
+        t.word.set_active(true);
+        t.regex.set_active(false);
+        t.code_only.set_active(true);
+        t.win.set_title(Some(&format!("Utilizzi di «{word}»")));
+        t.win.present();
+        t.start();
+    }
+
+    /// Shows ready results (definitions, references from a language server)
+    /// in the search window; `word` is highlighted in the preview.
+    pub(super) fn show_text_results(self: &Rc<Self>, root: &Path, title: &str, word: &str, res: TextResults) {
+        let t = self.text_search_window(root);
+        t.stop();
+        t.entry.set_text(word);
+        t.case.set_active(true);
+        t.word.set_active(true);
+        t.regex.set_active(false);
+        t.win.set_title(Some(title));
+        let q = Query::new(word, t.options()).ok();
+        t.show(res, q);
+        t.win.present();
     }
 
     /// Opens `path` in a tab with the cursor at `line`, `col` (from 0).
@@ -145,11 +192,19 @@ impl TextSearch {
         let case = toggle("Aa", "Distingui maiuscole e minuscole");
         let word = toggle("Parola", "Solo parole intere");
         let regex = toggle(".*", "Espressione regolare");
+        let code_only = toggle("Solo codice", "Esclude le occorrenze nei commenti e nelle stringhe");
         let button = gtk::Button::with_label("Ricerca");
         button.add_css_class("suggested-action");
         button.set_sensitive(false);
         let top = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-        for w in [entry.upcast_ref::<gtk::Widget>(), case.upcast_ref(), word.upcast_ref(), regex.upcast_ref(), button.upcast_ref()] {
+        for w in [
+            entry.upcast_ref::<gtk::Widget>(),
+            case.upcast_ref(),
+            word.upcast_ref(),
+            regex.upcast_ref(),
+            code_only.upcast_ref(),
+            button.upcast_ref(),
+        ] {
             top.append(w);
         }
         let status = gtk::Label::new(Some("Scrivi il testo da cercare e premi «Ricerca»"));
@@ -220,6 +275,7 @@ impl TextSearch {
             case,
             word,
             regex,
+            code_only,
             button,
             status,
             store,
@@ -404,12 +460,13 @@ impl TextSearch {
         let root = self.root.clone();
         let query = text.clone();
         let opts = self.options();
+        let code_only = self.code_only.is_active();
         glib::spawn_future_local(async move {
             let p = progress.clone();
             // The query is compiled again in the thread (a Regex is cheap to
             // build and keeps this code simple).
             let res = gio::spawn_blocking(move || match Query::new(&query, opts) {
-                Ok(q) => finder::grep(&root, &q, &p),
+                Ok(q) => finder::grep(&root, &q, code_only, &p),
                 Err(_) => TextResults::default(),
             })
             .await
@@ -426,13 +483,20 @@ impl TextSearch {
     }
 
     fn finish(self: &Rc<Self>, res: TextResults, q: Query) {
+        self.show(res, Some(q));
+    }
+
+    fn show(self: &Rc<Self>, res: TextResults, q: Option<Query>) {
         *self.running.borrow_mut() = None;
         self.button.set_label("Ricerca");
         self.button.set_sensitive(!self.entry.text().trim().is_empty());
-        let secs = self.started.get().map_or(0.0, |t| t.elapsed().as_secs_f64());
-        let mut status = match res.matches.len() {
-            0 => format!("Nessun risultato ({} file cercati in {secs:.1} s)", res.searched),
-            n => format!("{n} righe trovate in {} file ({} file cercati in {secs:.1} s)", res.files.len(), res.searched),
+        let secs = self.started.take().map(|t| t.elapsed().as_secs_f64());
+        let mut status = match (res.matches.len(), secs) {
+            (0, Some(secs)) => format!("Nessun risultato ({} file cercati in {secs:.1} s)", res.searched),
+            (n, Some(secs)) => format!("{n} righe trovate in {} file ({} file cercati in {secs:.1} s)", res.files.len(), res.searched),
+            // Ready results (definitions, references).
+            (0, None) => "Nessun risultato".to_string(),
+            (n, None) => format!("{n} risultati in {} file", res.files.len()),
         };
         if res.truncated {
             status.push_str(&format!(" · risultati limitati a {}", finder::MAX_TEXT_MATCHES));
@@ -444,7 +508,7 @@ impl TextSearch {
         let n = res.matches.len();
         // Results first: binding the rows reads them.
         *self.results.borrow_mut() = res;
-        *self.query.borrow_mut() = Some(q);
+        *self.query.borrow_mut() = q;
         let rows: Vec<String> = (0..n).map(|i| i.to_string()).collect();
         let refs: Vec<&str> = rows.iter().map(String::as_str).collect();
         self.store.splice(0, self.store.n_items(), &refs);

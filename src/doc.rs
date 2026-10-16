@@ -192,6 +192,10 @@ pub struct Doc {
     edit_gen: Cell<u64>,
     cache_gen: Cell<u64>,
     pub hidden_since: Cell<Option<Instant>>,
+    /// Called first for every key press (completion popup); returns true
+    /// if it handled the key.
+    #[allow(clippy::type_complexity)]
+    pub key_hook: RefCell<Option<Box<dyn Fn(gdk::Key, gdk::ModifierType) -> bool>>>,
     title: RefCell<String>,
     label_budget: Cell<usize>,
     hl: RefCell<Highlighter>,
@@ -288,6 +292,7 @@ impl Doc {
             edit_gen: Cell::new(0),
             cache_gen: Cell::new(0),
             hidden_since: Cell::new(None),
+            key_hook: RefCell::new(None),
             title: RefCell::new(String::new()),
             label_budget: Cell::new(10),
             hl: RefCell::new(Highlighter { states: vec![State::Normal], lo: NO_DIRTY, hi: 0, scheduled: false, enabled: true }),
@@ -372,7 +377,8 @@ impl Doc {
         let w = Rc::downgrade(self);
         keys.connect_key_pressed(move |_, key, _, state| {
             let Some(d) = w.upgrade() else { return glib::Propagation::Proceed };
-            if d.handle_key(key, state) { glib::Propagation::Stop } else { glib::Propagation::Proceed }
+            let hooked = d.key_hook.borrow().as_ref().is_some_and(|h| h(key, state));
+            if hooked || d.handle_key(key, state) { glib::Propagation::Stop } else { glib::Propagation::Proceed }
         });
         self.view.add_controller(keys);
     }

@@ -95,6 +95,7 @@ impl Editor {
         }
         let Some(root) = workdir.filter(|_| indexed) else {
             *self.index.borrow_mut() = None;
+            self.drop_symbols();
             return;
         };
         if self.index.borrow().as_ref().is_some_and(|i| i.root == root) {
@@ -144,16 +145,28 @@ impl Editor {
             .await
             .unwrap_or_default();
             let Some(ed) = ed.upgrade() else { return };
-            if let Some(i) = ed.index.borrow_mut().as_mut().filter(|i| i.root == root) {
+            let files: Vec<String> = (0..paths.len()).map(|i| paths.get(i).to_string()).collect();
+            let current = if let Some(i) = ed.index.borrow_mut().as_mut().filter(|i| i.root == root) {
                 i.paths = Rc::new(paths);
                 i.scanning.set(false);
                 i.loaded.set(true);
                 i.scanned_at.set(Some(std::time::Instant::now()));
+                true
+            } else {
+                false
+            };
+            // Definitions for "go to definition" and the completion.
+            if current {
+                ed.rebuild_symbols(root.clone(), files);
             }
             ed.refresh_quick();
             // The scan allocated a lot in its thread.
             ed.release_memory();
         });
+    }
+
+    pub(super) fn index_active(&self) -> bool {
+        self.index.borrow().is_some()
     }
 
     fn set_indexed(self: &Rc<Self>, on: bool) {
@@ -421,7 +434,8 @@ impl QuickOpen {
         let mut text = if paths.is_empty() && (scanning || !loaded) {
             "Indicizzazione in corso…".to_string()
         } else if query.trim().is_empty() {
-            format!("{} file indicizzati", paths.len())
+            let syms = ed.symbols.borrow().as_ref().map_or(0, |s| if s.project.borrow().is_empty() { 0 } else { s.project.borrow().len() });
+            if syms > 0 { format!("{} file indicizzati · {syms} simboli", paths.len()) } else { format!("{} file indicizzati", paths.len()) }
         } else {
             format!("{} risultati su {} file", rels.len(), paths.len())
         };

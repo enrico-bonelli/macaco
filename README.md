@@ -9,12 +9,14 @@ ogni giorno a chi lavora su progetti:
 - formattazione del codice;
 - confronto tra file;
 - pannello dei file, ricerca veloce dei file e ricerca di testo nel progetto;
+- analisi del codice: vai alla definizione, trova utilizzi, completamento
+  (anche con i language server);
 - integrazione con git;
 - terminale integrato.
 
 Tutto questo senza rinunciare alla leggerezza: all'avvio occupa circa
-**65 MB** di memoria, il binario pesa **2,7 MB** e le funzioni più pesanti
-(terminale, indice dei file) si caricano solo quando le usi.
+**65 MB** di memoria, il binario pesa **3,5 MB** e le funzioni più pesanti
+(terminale, indice dei file, language server) si caricano solo quando le usi.
 
 ---
 
@@ -32,6 +34,7 @@ Tutto questo senza rinunciare alla leggerezza: all'avvio occupa circa
   - [Cartella di lavoro e pannello file](#cartella-di-lavoro-e-pannello-file)
   - [Ricerca veloce dei file](#ricerca-veloce-dei-file)
   - [Cerca nei file](#cerca-nei-file)
+  - [Analisi del codice](#analisi-del-codice)
   - [Git](#git)
   - [Terminale integrato](#terminale-integrato)
   - [Aspetto e preferenze](#aspetto-e-preferenze)
@@ -59,13 +62,14 @@ Tutto questo senza rinunciare alla leggerezza: all'avvio occupa circa
     l'interfaccia.
 - **Senza dipendenze pesanti:**
   - lexer scritti da zero e formattatore interno di riserva;
-  - gli strumenti esterni (formattatori, `git`, VTE per il terminale) sono
-    facoltativi e vengono usati solo se presenti.
+  - gli strumenti esterni (formattatori, `git`, VTE per il terminale,
+    language server) sono facoltativi e vengono usati solo se presenti.
 - **Non perde il lavoro:** il contenuto non salvato finisce in una cache su
   disco poco dopo ogni modifica, e alla riapertura tutte le schede vengono
   ripristinate.
 - **Pensato per i progetti:** cartella di lavoro, albero dei file, ricerca
-  veloce, ricerca nei file, git e terminale nella stessa finestra.
+  veloce, ricerca nei file, analisi del codice, git e terminale nella stessa
+  finestra.
 - **Interfaccia in italiano.**
 
 ---
@@ -280,6 +284,99 @@ cartella di lavoro.
 - **Chiusura:** la finestra si chiude a mano, e chiudendola risultati e
   anteprima vengono liberati dalla memoria.
 
+### Analisi del codice
+
+macaco "conosce" il codice su due livelli, entrambi facoltativi e attivati
+per cartella di lavoro.
+
+**Comandi**, dal menu *Cerca*, dal clic destro su un nome o con la tastiera:
+
+| Comando | Tasto | Cosa fa |
+|---|---|---|
+| **Vai alla definizione** | `F4` o `Ctrl`+clic | apre il file nel punto in cui il nome sotto il cursore è definito; se le definizioni sono più di una le elenca con anteprima |
+| **Trova utilizzi** | `Maiusc+F4` | elenca, con anteprima, tutte le righe del progetto che usano quel nome |
+| **Completa** | `Ctrl+Spazio` | apre l'elenco dei completamenti |
+
+**Completamento:**
+- Mentre scrivi, dopo due caratteri di un nome compare un elenco di
+  proposte, con il tipo di ciascuna (funzione, classe, campo…) e il file da
+  cui viene.
+- Su/Giù per scegliere, Invio o Tab per inserire, Esc per chiudere. Il focus
+  resta nell'editor, quindi puoi continuare a scrivere.
+- Si disattiva dalle Preferenze ("Completamento automatico"); `Ctrl+Spazio`
+  funziona sempre.
+
+#### Livello base: indice dei simboli
+
+Disponibile nelle **cartelle indicizzate** (vedi [Ricerca veloce dei
+file](#ricerca-veloce-dei-file)), senza programmi esterni.
+- **Indice:** quando la cartella viene scansionata, macaco estrae le
+  definizioni di ogni file (funzioni, metodi, classi, struct, enum,
+  interfacce, tipi, costanti, macro, tabelle SQL) con i suoi lexer, ignorando
+  commenti e stringhe. L'indice si aggiorna a ogni salvataggio.
+- **Vai alla definizione** cerca il nome tra le definizioni del documento e
+  del progetto.
+- **Trova utilizzi** cerca il nome come parola intera, distinguendo
+  maiuscole e minuscole, solo nel codice (esclusi commenti e stringhe). Usa
+  la finestra "Cerca nei file", che ha l'opzione **Solo codice**.
+- **Completamento:** propone definizioni e parole del documento, simboli del
+  progetto e parole chiave del linguaggio.
+- **Limite:** conosce i nomi, non i tipi. Un metodo `save` trova anche i
+  `save` di altre classi, e dopo `oggetto.` non sa quali membri abbia
+  l'oggetto.
+- **Peso:** su un progetto di 4.400 file l'indice dei file più quello dei
+  simboli (55.000 definizioni) occupa circa 11 MB.
+
+#### Livello avanzato: language server
+
+Si attiva per la cartella con File → **Analisi del codice con language
+server**. macaco usa allora i *language server* installati (lo stesso
+protocollo LSP di VS Code e altri editor), che capiscono davvero il codice:
+- completamento consapevole del tipo: dopo `oggetto.` propone i membri di
+  quell'oggetto;
+- definizioni e utilizzi precisi, che distinguono gli omonimi.
+
+**Funzionamento:**
+- Il server di un linguaggio parte solo quando apri un file di quel
+  linguaggio nella cartella, e si ferma quando chiudi la cartella o
+  disattivi l'opzione. All'uscita dall'editor non resta nessun processo.
+- La barra di stato mostra i server attivi e il loro stato (avvio,
+  indicizzazione con percentuale, pronto ✓). L'indicatore della memoria
+  aggiunge quella dei server: `RAM 72 MB + LSP 140 MB`.
+- Se un server non risponde, non trova nulla o non è installato, macaco usa
+  automaticamente il livello base. Se un server termina con un errore, un
+  messaggio ne spiega la causa e suggerisce il pacchetto da installare.
+
+**Server supportati:**
+
+| Linguaggio | Server (il primo installato) | Pacchetto Arch |
+|---|---|---|
+| Rust | `rust-analyzer` | `rust-analyzer` (o `rustup component add rust-analyzer`) |
+| C, C++ | `clangd` | `clang` |
+| Python | `basedpyright`, `pyright`, `pylsp`, `jedi-language-server` | `pyright`, `python-lsp-server` |
+| JavaScript, TypeScript | `typescript-language-server` | `typescript-language-server` |
+| Go | `gopls` | `gopls` |
+| PHP | `intelephense` (consigliato), `phpactor` | `npm install -g intelephense` (serve Node.js); `phpactor` (AUR, serve PHP) |
+| Java | `jdtls` | `jdtls` (AUR) |
+| Bash | `bash-language-server` | `bash-language-server` |
+| Markdown | `marksman` | `marksman` |
+| SQL | `sqls` | `sqls` (AUR) |
+
+I server vanno cercati nel `PATH` della sessione. Se uno è installato in
+una cartella aggiunta solo da `~/.bashrc` (es. con npm in una cartella
+personale), avviando macaco dal menu delle applicazioni non viene trovato:
+aggiungi la cartella a `~/.config/environment.d/*.conf`.
+
+**Peso:** il costo vero sono i server, che girano come processi separati.
+Valori tipici:
+- `clangd` su un piccolo progetto: circa 140 MB (misurato);
+- `rust-analyzer`: da 300 MB a oltre 1 GB, secondo le dipendenze;
+- `jdtls`: 500 MB – 1 GB.
+
+Per questo il livello avanzato è da attivare solo dove serve. Per C e C++,
+`clangd` dà risultati completi tra più file se il progetto ha un
+`compile_commands.json`, altrimenti con un `compile_flags.txt`.
+
 ### Git
 
 macaco usa il comando `git` installato. Il repository è quello della
@@ -366,13 +463,15 @@ cartella di lavoro o, se non c'è, del file attivo.
 - a capo automatico, numeri di riga, evidenziazione della riga corrente;
 - tema chiaro/scuro (al primo avvio segue quello di sistema);
 - avviso sonoro;
-- cursore lampeggiante (disattivato per risparmiare CPU).
+- cursore lampeggiante (disattivato per risparmiare CPU);
+- completamento automatico durante la digitazione.
 
 **Barra di stato:**
 - posizione del cursore (clic: vai alla riga), linguaggio, codifica e fine
   riga (cliccabili);
-- ramo git e riepilogo del confronto;
-- memoria in uso dal processo, aggiornata ogni 2 secondi.
+- ramo git, language server attivi e riepilogo del confronto;
+- memoria in uso dal processo (più quella dei language server), aggiornata
+  ogni 2 secondi.
 
 ---
 
@@ -405,6 +504,9 @@ cartella di lavoro o, se non c'è, del file attivo.
 | `Ctrl+Maiusc+F` | cerca nei file della cartella di lavoro |
 | `Ctrl+Alt+G` | modifiche git della cartella |
 | `Ctrl+Alt+C` | commit |
+| `F4`, `Ctrl`+clic | vai alla definizione |
+| `Maiusc+F4` | trova utilizzi |
+| `Ctrl+Spazio` | completamento |
 | `F12`, ``Ctrl+` `` | terminale |
 | `Maiusc+F12` | terminale nella cartella del file |
 | `F2` / `Canc` (nel pannello file) | rinomina / sposta nel cestino |
@@ -419,7 +521,7 @@ cartella di lavoro o, se non c'è, del file attivo.
 - renderer GTK `cairo` predefinito, invece dei circa 350 MB con GL/Vulkan.
   Si può cambiare con `renderer=gl|vulkan|auto` in `settings.conf` o con la
   variabile `GSK_RENDERER`.
-- Binario di 2,7 MB (LTO, strip).
+- Binario di 3,5 MB (LTO, strip).
 
 **Colorazione della sintassi:**
 - incrementale: per ogni riga si memorizza lo stato del lexer, e dopo una
@@ -463,6 +565,7 @@ Tutto si trova in `~/.macaco/`:
 | `cache/<id>.txt`, `.meta` | contenuto delle schede non salvate |
 | `recent` | file recenti |
 | `indexed` | cartelle indicizzate per la ricerca veloce |
+| `lsp-folders` | cartelle con l'analisi del codice tramite language server |
 | `index/<id>.paths` | elenco dei file di ogni cartella indicizzata |
 | `git-excluded` | file esclusi dall'elenco delle modifiche git, per repository |
 
@@ -478,6 +581,7 @@ Tutto si trova in `~/.macaco/`:
 | Pacchetto (Arch) | Funzione |
 |---|---|
 | `vte4` | terminale integrato |
+| `clang`, `rust-analyzer`, `pyright`, `gopls`, `typescript-language-server`… | analisi del codice con language server (vedi [sopra](#livello-avanzato-language-server)) |
 | `git` | integrazione git |
 | `rust` (rustfmt), `clang`, `go`, `ruff` / `python-black`, `shfmt`, `prettier`, `pgformatter` | formattazione dei rispettivi linguaggi |
 
@@ -490,6 +594,7 @@ Le librerie Rust usate sono:
 - `gtk4` (con `pangocairo`) per l'interfaccia;
 - `regex` per la ricerca;
 - `similar` per il confronto;
+- `serde_json` per i messaggi dei language server;
 - `libc` per le chiamate di sistema.
 
 ---
@@ -525,7 +630,7 @@ e `/usr/share/metainfo`.
 ## Sviluppo
 
 ```sh
-cargo test                     # lexer, codifiche, formattazione, ricerca, git, indice
+cargo test                     # lexer, codifiche, formattazione, ricerca, git, indice, simboli, LSP
 cargo build --profile perf     # ottimizzato, con gli strumenti di debug attivi
 ```
 
@@ -547,6 +652,10 @@ cargo build --profile perf     # ottimizzato, con gli strumenti di debug attivi
 | `git.rs` | esecuzione di git e lettura dello stato |
 | `finder.rs` | elenco dei file, corrispondenza fuzzy, indice, ricerca nei file |
 | `terminal.rs` | terminale (VTE caricata dinamicamente) |
+| `symbols.rs` | definizioni estratte con i lexer, indice dei simboli del progetto |
+| `lsp.rs` | client del Language Server Protocol |
+| `window/inspect.rs` | vai alla definizione, trova utilizzi, completamento |
+| `window/lspui.rs` | language server della cartella di lavoro: avvio, sincronizzazione, richieste |
 | `config.rs` | preferenze, sessione, cache, file in `~/.macaco/` |
 
 **Script di prova:** nelle build di debug la variabile `MACACO_DEBUG` esegue
