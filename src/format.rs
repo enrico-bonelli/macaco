@@ -64,6 +64,7 @@ fn external(lang: Lang, path: Option<&Path>, tab: u32) -> Vec<(&'static str, Vec
         Lang::TypeScript => "ts",
         Lang::Css => "css",
         Lang::Html => "html",
+        Lang::Vue => "vue",
         Lang::Yaml => "yaml",
         Lang::Markdown => "md",
         _ => "txt",
@@ -84,7 +85,7 @@ fn external(lang: Lang, path: Option<&Path>, tab: u32) -> Vec<(&'static str, Vec
         Lang::Rust => vec![("rustfmt", vec!["--edition".into(), "2024".into()])],
         Lang::C | Lang::Cpp | Lang::Java => vec![clang()],
         Lang::JavaScript | Lang::TypeScript => vec![prettier(), clang()],
-        Lang::Css | Lang::Html | Lang::Yaml | Lang::Markdown => vec![prettier()],
+        Lang::Css | Lang::Html | Lang::Vue | Lang::Yaml | Lang::Markdown => vec![prettier()],
         Lang::Go => vec![("gofmt", vec![])],
         Lang::Python => vec![("ruff", vec!["format".into(), "-".into()]), ("black", vec!["-q".into(), "-".into()])],
         Lang::Bash => vec![("shfmt", vec!["-i".into(), tab.to_string()])],
@@ -108,7 +109,7 @@ pub fn format(lang: Lang, path: Option<&Path>, text: &str, tab: u32, spaces: boo
         Lang::C | Lang::Cpp | Lang::Rust | Lang::Java | Lang::JavaScript | Lang::TypeScript | Lang::Go
         | Lang::Php | Lang::Css => reindent_braces(lang, text, &unit),
         Lang::Bash => reindent_shell(text, &unit),
-        Lang::Html => reindent_html(text, &unit),
+        Lang::Html | Lang::Vue => reindent_html(text, &unit),
         Lang::Markdown => tidy_markdown(text),
         _ => tidy(text, (lang == Lang::Python || lang == Lang::Yaml).then_some(tab)),
     };
@@ -444,6 +445,30 @@ pub fn reindent_html(text: &str, unit: &str) -> String {
 }
 
 /// Comment or uncomment the given lines (all commented -> uncomment).
+/// Language at the end of `before` in an HTML or Vue document: the script
+/// (TypeScript with `lang="ts"`), the style, or the markup.
+pub fn embedded_lang(lang: Lang, before: &str) -> Lang {
+    if !matches!(lang, Lang::Html | Lang::Vue) {
+        return lang;
+    }
+    let lower = before.to_ascii_lowercase();
+    let open = |tag: &str| lower.rfind(&format!("<{tag}"));
+    let close = |tag: &str| lower.rfind(&format!("</{tag}"));
+    if let Some(s) = open("script")
+        && close("script").is_none_or(|e| e < s)
+    {
+        let tag = &lower[s..lower[s..].find('>').map_or(lower.len(), |e| s + e)];
+        let ts = ["lang=\"ts\"", "lang='ts'", "lang=\"tsx\"", "lang='tsx'"].iter().any(|p| tag.contains(p));
+        return if ts { Lang::TypeScript } else { Lang::JavaScript };
+    }
+    if let Some(s) = open("style")
+        && close("style").is_none_or(|e| e < s)
+    {
+        return Lang::Css;
+    }
+    lang
+}
+
 pub fn toggle_comment(lang: Lang, lines: &[&str]) -> Option<Vec<String>> {
     let (pre, post) = lang.comment_tokens()?;
     let nonempty = lines.iter().filter(|l| !l.trim().is_empty());
@@ -569,6 +594,20 @@ mod tests {
                 }
             }
         }
+    }
+
+
+    #[test]
+    fn vue_regions() {
+        let doc = "<template>\n  <p>{{ a }}</p>\n</template>\n<script setup lang=\"ts\">\nconst a = 1\n";
+        assert_eq!(embedded_lang(Lang::Vue, doc), Lang::TypeScript);
+        assert_eq!(embedded_lang(Lang::Vue, "<template>\n<p>"), Lang::Vue);
+        assert_eq!(embedded_lang(Lang::Vue, "<script>\nx\n</script>\n<style scoped>\n"), Lang::Css);
+        assert_eq!(embedded_lang(Lang::Html, "<script>\nlet x;\n"), Lang::JavaScript);
+        assert_eq!(embedded_lang(Lang::Rust, "<script>"), Lang::Rust);
+        let c = toggle_comment(embedded_lang(Lang::Vue, doc), &["const a = 1"]).unwrap();
+        assert_eq!(c, vec!["// const a = 1"]);
+        assert_eq!(toggle_comment(Lang::Vue, &["<p>x</p>"]).unwrap(), vec!["<!-- <p>x</p> -->"]);
     }
 
 }

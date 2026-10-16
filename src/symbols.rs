@@ -113,6 +113,12 @@ fn js_arrow() -> &'static Regex {
     })
 }
 
+/// `const name =` at the start of a line (module level bindings).
+fn js_top_const() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"^(?:export\s+)?(?:const|let|var)\s+([\p{L}_$][\w$]*)\s*(?::[^=]+)?=").unwrap())
+}
+
 fn sql_def() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
@@ -153,8 +159,62 @@ fn mask(line: &str, toks: &[lexer::Token]) -> String {
     String::from_utf8(out).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned())
 }
 
+/// Definitions in the `<script>` blocks of an HTML or Vue file.
+fn extract_scripts(text: &str) -> Vec<Symbol> {
+    let mut out = Vec::new();
+    let lines: Vec<&str> = text.lines().collect();
+    let mut i = 0;
+    while i < lines.len() {
+        let lower = lines[i].to_ascii_lowercase();
+        let Some(open) = lower.find("<script") else {
+            i += 1;
+            continue;
+        };
+        let tag = &lower[open..lower[open..].find('>').map_or(lower.len(), |e| open + e)];
+        let ts = ["lang=\"ts\"", "lang='ts'", "lang=\"tsx\"", "lang='tsx'"].iter().any(|p| tag.contains(p));
+        let first = i + 1;
+        let mut last = first;
+        while last < lines.len() && !lines[last].to_ascii_lowercase().contains("</script") {
+            last += 1;
+        }
+        let block = lines[first..last].join("\n");
+        for mut s in extract(if ts { Lang::TypeScript } else { Lang::JavaScript }, &block) {
+            s.line += first as u32;
+            out.push(s);
+        }
+        i = last + 1;
+    }
+    out
+}
+
+/// `carrello-riga` → `CarrelloRiga`.
+pub fn pascal_case(stem: &str) -> String {
+    stem.split(['-', '_', '.'])
+        .filter(|p| !p.is_empty())
+        .map(|p| {
+            let mut c = p.chars();
+            c.next().map(|f| f.to_uppercase().chain(c).collect::<String>()).unwrap_or_default()
+        })
+        .collect()
+}
+
+/// Definitions of a file: those of `extract` and, for a Vue component,
+/// the component itself (named after the file, in PascalCase).
+pub fn extract_file(lang: Lang, path: &std::path::Path, text: &str) -> Vec<Symbol> {
+    let mut out = extract(lang, text);
+    if lang == Lang::Vue
+        && let Some(stem) = path.file_stem().and_then(|s| s.to_str())
+    {
+        out.insert(0, Symbol { name: pascal_case(stem), kind: SymKind::Class, line: 0, col: 0 });
+    }
+    out
+}
+
 /// Definitions found in `text`.
 pub fn extract(lang: Lang, text: &str) -> Vec<Symbol> {
+    if matches!(lang, Lang::Vue | Lang::Html) {
+        return extract_scripts(text);
+    }
     let keywords = def_keywords(lang);
     let reserved = lang.spec();
     let is_reserved = |w: &str| reserved.keywords.contains(&w) || reserved.types.contains(&w);
@@ -228,6 +288,11 @@ pub fn extract(lang: Lang, text: &str) -> Vec<Symbol> {
             for c in js_arrow().captures_iter(&m) {
                 let g = c.get(1).unwrap();
                 push(g.as_str(), g.start(), SymKind::Function);
+            }
+            // Module level constants (Vue <script setup> bindings…).
+            if let Some(c) = js_top_const().captures(&m) {
+                let g = c.get(1).unwrap();
+                push(g.as_str(), g.start(), SymKind::Constant);
             }
         }
         if lang == Lang::Bash
@@ -396,6 +461,21 @@ mod tests {
         assert_eq!(sql.iter().map(|x| (x.0.as_str(), x.1)).collect::<Vec<_>>(), vec![("utenti", SymKind::Table), ("conta_ordini", SymKind::Function)]);
         let sh = names(Lang::Bash, "build() {\n  echo\n}\nfunction pulisci {\n}\n");
         assert_eq!(sh.iter().map(|x| x.0.as_str()).collect::<Vec<_>>(), vec!["build", "pulisci"]);
+    }
+
+    #[test]
+    fn vue_component() {
+        let src = "<template>\n  <p @click=\"aggiungi\">{{ conteggio }}</p>\n</template>\n<script setup lang=\"ts\">\nimport { ref } from 'vue'\nconst conteggio = ref(0)\nfunction aggiungi() {\n  conteggio.value++\n}\n</script>\n<style scoped>\np { color: red }\n</style>\n";
+        let n: Vec<(String, SymKind, u32)> =
+            extract_file(Lang::Vue, std::path::Path::new("src/carrello-riga.vue"), src).into_iter().map(|s| (s.name, s.kind, s.line)).collect();
+        assert_eq!(
+            n,
+            vec![
+                ("CarrelloRiga".into(), SymKind::Class, 0),
+                ("conteggio".into(), SymKind::Constant, 5),
+                ("aggiungi".into(), SymKind::Function, 6)
+            ]
+        );
     }
 
     #[test]

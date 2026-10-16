@@ -69,6 +69,34 @@ pub(super) fn word_at_cursor(d: &Doc) -> Option<(String, i32, i32)> {
     (!w.is_empty() && !w.starts_with(|c: char| c.is_ascii_digit())).then(|| (w, a.offset(), b.offset()))
 }
 
+/// Name of the component whose tag is under the cursor in a Vue or HTML
+/// template (`<carrello-riga` or `</CarrelloRiga`), in PascalCase.
+fn component_tag_at_cursor(d: &Doc) -> Option<String> {
+    if !matches!(d.lang.get(), Lang::Vue | Lang::Html) {
+        return None;
+    }
+    let buf = &d.buffer;
+    let it = buf.iter_at_mark(&buf.get_insert());
+    let tag_char = |c: char| symbols::is_ident_char(c) || c == '-';
+    let mut a = it;
+    while a.backward_char() {
+        if !tag_char(a.char()) {
+            break;
+        }
+    }
+    // `a` is on the character before the name: '<' or '/' of '</'.
+    let lt = a.char() == '<' || (a.char() == '/' && { let mut p = a; p.backward_char() && p.char() == '<' });
+    if !lt {
+        return None;
+    }
+    a.forward_char();
+    let mut b = it;
+    while tag_char(b.char()) && b.forward_char() {}
+    let name = buf.text(&a, &b, false).to_string();
+    // Components have an upper case letter or a dash (HTML tags have neither).
+    (name.contains('-') || name.starts_with(|c: char| c.is_uppercase())).then(|| symbols::pascal_case(&name))
+}
+
 /// Text of the word being typed before the cursor and its start offset.
 fn prefix_at_cursor(d: &Doc) -> (String, i32) {
     let buf = &d.buffer;
@@ -228,7 +256,7 @@ impl Editor {
                         if l == Lang::Plain || std::fs::metadata(&path).map_or(true, |m| m.len() > MAX_SYMBOL_FILE) {
                             return Vec::new();
                         }
-                        finder::read_text(&path).map(|t| symbols::extract(l, &t)).unwrap_or_default()
+                        finder::read_text(&path).map(|t| symbols::extract_file(l, &path, &t)).unwrap_or_default()
                     })
                     .collect();
                 ProjectSymbols::build(files, per_file)
@@ -261,7 +289,7 @@ impl Editor {
         let Some(s) = self.symbols.borrow().clone() else { return };
         let Some(path) = d.path.borrow().clone() else { return };
         let Ok(rel) = path.strip_prefix(&s.root) else { return };
-        let syms = symbols::extract(d.lang.get(), &d.text());
+        let syms = symbols::extract_file(d.lang.get(), &path, &d.text());
         s.project.borrow_mut().update_file(&rel.to_string_lossy(), syms);
     }
 
@@ -278,6 +306,13 @@ impl Editor {
 
     pub(super) fn goto_definition(self: &Rc<Self>) {
         let Some(d) = self.active_doc() else { return };
+        // A component in a Vue template: <carrello-riga> → CarrelloRiga.
+        if let Some(name) = component_tag_at_cursor(&d) {
+            if !self.lsp_definition(&d, &name) {
+                self.local_definition(&d, &name);
+            }
+            return;
+        }
         let Some((word, _, _)) = word_at_cursor(&d) else {
             self.message("Nessun nome sotto il cursore");
             return;
@@ -292,7 +327,8 @@ impl Editor {
     pub(super) fn local_definition(self: &Rc<Self>, d: &Rc<Doc>, word: &str) {
         let doc_path = d.path.borrow().clone();
         // (path, symbol, line text)
-        let mut found: Vec<(Option<PathBuf>, Symbol)> = symbols::extract(d.lang.get(), &d.text())
+        let doc_file = doc_path.clone().unwrap_or_default();
+        let mut found: Vec<(Option<PathBuf>, Symbol)> = symbols::extract_file(d.lang.get(), &doc_file, &d.text())
             .into_iter()
             .filter(|s| s.name == word)
             .map(|s| (doc_path.clone(), s))

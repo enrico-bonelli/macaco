@@ -20,9 +20,10 @@ pub enum Lang {
     Go,
     Markdown,
     Sql,
+    Vue,
 }
 
-pub const ALL: [Lang; 16] = [
+pub const ALL: [Lang; 17] = [
     Lang::Plain,
     Lang::C,
     Lang::Cpp,
@@ -39,6 +40,7 @@ pub const ALL: [Lang; 16] = [
     Lang::Go,
     Lang::Markdown,
     Lang::Sql,
+    Lang::Vue,
 ];
 
 /// Lexical description used by the generic lexer.
@@ -382,6 +384,7 @@ static SQL: Spec = Spec {
     case_insensitive_words: true,
     ..BASE
 };
+static VUE: Spec = Spec { block_comment: Some(("<!--", "-->")), ..BASE };
 static MARKDOWN: Spec = Spec { block_comment: Some(("<!--", "-->")), ..BASE };
 
 impl Lang {
@@ -403,6 +406,7 @@ impl Lang {
             Lang::Go => "go",
             Lang::Markdown => "markdown",
             Lang::Sql => "sql",
+            Lang::Vue => "vue",
         }
     }
 
@@ -424,6 +428,7 @@ impl Lang {
             Lang::Go => "Go",
             Lang::Markdown => "Markdown",
             Lang::Sql => "SQL",
+            Lang::Vue => "Vue",
         }
     }
 
@@ -449,6 +454,7 @@ impl Lang {
             Lang::Go => &GO,
             Lang::Markdown => &MARKDOWN,
             Lang::Sql => &SQL,
+            Lang::Vue => &VUE,
         }
     }
 
@@ -482,6 +488,7 @@ impl Lang {
             "md" | "markdown" => Lang::Markdown,
             "sql" | "pgsql" | "postgresql" | "postgres" | "psql" | "mysql" | "sqlite" | "plsql" | "plpgsql"
             | "tsql" | "mssql" | "mariadb" => Lang::Sql,
+            "vue" => Lang::Vue,
             _ => Lang::Plain,
         }
     }
@@ -520,7 +527,8 @@ pub fn detect(path: Option<&Path>, head: &str) -> Lang {
                 "js" | "mjs" | "cjs" | "jsx" | "json" | "jsonc" => Lang::JavaScript,
                 "ts" | "tsx" | "mts" | "cts" => Lang::TypeScript,
                 "yml" | "yaml" => Lang::Yaml,
-                "html" | "htm" | "xhtml" | "xml" | "svg" | "vue" => Lang::Html,
+                "html" | "htm" | "xhtml" | "xml" | "svg" => Lang::Html,
+                "vue" => Lang::Vue,
                 "css" | "scss" | "less" => Lang::Css,
                 "java" => Lang::Java,
                 "go" => Lang::Go,
@@ -583,5 +591,6 @@ mod tests {
         assert_eq!(Lang::from_fence("sh"), Lang::Bash);
         assert_eq!(detect(Some(Path::new("schema.SQL")), ""), Lang::Sql);
         assert_eq!(Lang::from_fence("postgresql"), Lang::Sql);
+        assert_eq!(detect(Some(Path::new("src/App.vue")), ""), Lang::Vue);
     }
 }

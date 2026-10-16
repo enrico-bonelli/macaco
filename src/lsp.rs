@@ -61,7 +61,22 @@ pub const SERVERS: &[ServerSpec] = &[
     },
     ServerSpec { name: "marksman", langs: &[Lang::Markdown], commands: &[("marksman", &["server"])], package: "marksman" },
     ServerSpec { name: "sqls", langs: &[Lang::Sql], commands: &[("sqls", &[])], package: "sqls (AUR)" },
+    ServerSpec {
+        name: VUE_SERVER,
+        langs: &[Lang::Vue],
+        commands: &[("vue-language-server", &["--stdio"])],
+        package: "vue-language-server typescript-language-server typescript",
+    },
 ];
+
+/// The Vue server works together with the TypeScript one, which loads the
+/// Vue plugin and answers the `tsserver/request` of the Vue server.
+pub const VUE_SERVER: &str = "Vue";
+pub const TS_SERVER: &str = "typescript-language-server";
+
+pub fn spec_named(name: &str) -> Option<&'static ServerSpec> {
+    SERVERS.iter().find(|s| s.name == name)
+}
 
 pub fn spec_for(lang: Lang) -> Option<&'static ServerSpec> {
     SERVERS.iter().find(|s| s.langs.contains(&lang))
@@ -88,6 +103,7 @@ pub fn language_id(lang: Lang, path: &Path) -> &'static str {
         Lang::Html => "html",
         Lang::Css => "css",
         Lang::Yaml => "yaml",
+        Lang::Vue => "vue",
         Lang::Plain => "plaintext",
     }
 }
@@ -257,6 +273,8 @@ fn take_message(buf: &mut Vec<u8>) -> Option<Value> {
 
 type Reply = Box<dyn FnOnce(Result<Value, String>)>;
 
+pub type NotificationHandler = Box<dyn Fn(&str, &Value)>;
+
 /// What the client tells the editor.
 pub struct Events {
     /// The server finished starting.
@@ -265,6 +283,8 @@ pub struct Events {
     pub status: Box<dyn Fn(&str)>,
     /// The server stopped; the text explains why when it failed.
     pub exited: Box<dyn Fn(String)>,
+    /// Other notifications from the server (method, params).
+    pub notification: NotificationHandler,
 }
 
 pub struct Client {
@@ -292,9 +312,17 @@ pub struct Client {
 }
 
 impl Client {
-    /// Starts `spec` with root folder `root`.
-    pub fn start(spec: &'static ServerSpec, root: &Path, events: Events) -> Result<Rc<Client>, String> {
-        let (cmd, args) = find_command(spec).ok_or_else(|| format!("{} non è installato (pacchetto {})", spec.name, spec.package))?;
+    /// Starts `spec` with root folder `root`, extra command line arguments
+    /// and initialization options (`Value::Null` for none).
+    pub fn start(
+        spec: &'static ServerSpec,
+        root: &Path,
+        extra_args: &[String],
+        init_options: Value,
+        events: Events,
+    ) -> Result<Rc<Client>, String> {
+        let (cmd, mut args) = find_command(spec).ok_or_else(|| format!("{} non è installato ({})", spec.name, spec.package))?;
+        args.extend(extra_args.iter().cloned());
         let launcher = gio::SubprocessLauncher::new(
             gio::SubprocessFlags::STDIN_PIPE | gio::SubprocessFlags::STDOUT_PIPE | gio::SubprocessFlags::STDERR_PIPE,
         );
@@ -325,7 +353,7 @@ impl Client {
         });
         c.read_loop(stdout);
         c.stderr_loop(stderr);
-        c.initialize();
+        c.initialize(init_options);
         Ok(c)
     }
 
@@ -459,7 +487,7 @@ impl Client {
         self.write(&json!({"jsonrpc": "2.0", "id": id, "result": result}));
     }
 
-    fn initialize(self: &Rc<Self>) {
+    fn initialize(self: &Rc<Self>, init_options: Value) {
         let root_uri = path_to_uri(&self.root);
         let name = self.root.file_name().map_or_else(|| "root".into(), |n| n.to_string_lossy().into_owned());
         let params = json!({
@@ -483,6 +511,10 @@ impl Client {
                 "window": {"workDoneProgress": true},
             },
         });
+        let mut params = params;
+        if !init_options.is_null() {
+            params["initializationOptions"] = init_options;
+        }
         let w = Rc::downgrade(self);
         self.request_inner(
             "initialize",
@@ -533,6 +565,7 @@ impl Client {
             }
             // Notifications.
             (Some(m), None) if m == "$/progress" => self.progress_event(msg.get("params").unwrap_or(&Value::Null)),
+            (Some(m), None) => (self.events.notification)(&m, msg.get("params").unwrap_or(&Value::Null)),
             _ => {}
         }
     }

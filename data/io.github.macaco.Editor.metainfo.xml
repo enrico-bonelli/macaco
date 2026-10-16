@@ -6,13 +6,24 @@
   <summary>Editor di testo leggero e minimale</summary>
   <description>
     <p>
-      Editor di testo GTK 4 scritto in Rust: evidenziazione della sintassi per
-      14 linguaggi e Markdown, schede affiancate con confronto (diff),
-      conversione tra codifiche (UTF-8, UTF-16, ISO-8859-1/15, Windows-1252),
-      cerca e sostituisci con espressioni regolari, recupero automatico dei
-      documenti non salvati.
+      Editor di testo GTK 4 scritto in Rust: leggero e veloce come un editor
+      minimale, ma con gli strumenti che servono a chi lavora su progetti.
+      Le funzioni più pesanti si attivano solo quando servono.
     </p>
+    <ul>
+      <li>Evidenziazione della sintassi per 16 linguaggi, tra cui Rust, C/C++, Python, PHP, JavaScript/TypeScript, Vue, Go, Java, SQL e Markdown</li>
+      <li>Formattazione del codice, schede affiancate con confronto (diff), conversione tra codifiche</li>
+      <li>Cartella di lavoro con pannello file, ricerca veloce dei file e ricerca nel testo del progetto</li>
+      <li>Analisi del codice: vai alla definizione, trova utilizzi e completamento, anche tramite language server</li>
+      <li>Integrazione con git e terminale integrato</li>
+      <li>Recupero automatico dei documenti non salvati</li>
+    </ul>
   </description>
+  <developer id="io.github.enrico-bonelli">
+    <name>enrico-bonelli</name>
+  </developer>
+  <url type="homepage">https://github.com/enrico-bonelli/macaco</url>
+  <url type="bugtracker">https://github.com/enrico-bonelli/macaco/issues</url>
   <launchable type="desktop-id">io.github.macaco.Editor.desktop</launchable>
   <provides>
     <binary>macaco</binary>
@@ -23,6 +34,11 @@
   </categories>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="0.3.0" date="2026-10-16">
+      <description>
+        <p>Analisi del codice (definizioni, utilizzi, completamento, language server), supporto per Vue e SQL, ricerca veloce dei file e ricerca nei file, pannello file, git, terminale integrato.</p>
+      </description>
+    </release>
     <release version="0.2.0" date="2026-10-11"/>
   </releases>
 </component>

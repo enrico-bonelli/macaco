@@ -1470,7 +1470,10 @@ impl Editor {
         let (mut a, mut b) = Self::line_block(&d);
         let text = d.buffer.text(&a, &b, true);
         let lines: Vec<&str> = text.split('\n').collect();
-        let Some(new) = format::toggle_comment(d.lang.get(), &lines) else {
+        // HTML and Vue: the comment syntax of the script or style block.
+        let before = d.buffer.text(&d.buffer.start_iter(), &a, false);
+        let lang = format::embedded_lang(d.lang.get(), &before);
+        let Some(new) = format::toggle_comment(lang, &lines) else {
             self.message("Nessuna sintassi di commento per questo linguaggio");
             return;
         };

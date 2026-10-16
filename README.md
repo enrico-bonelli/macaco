@@ -5,7 +5,7 @@ GTK 4.
 
 macaco unisce la reattività di un editor minimale agli strumenti che servono
 ogni giorno a chi lavora su progetti:
-- evidenziazione della sintassi per 15 linguaggi;
+- evidenziazione della sintassi per 16 linguaggi, Vue compreso;
 - formattazione del codice;
 - confronto tra file;
 - pannello dei file, ricerca veloce dei file e ricerca di testo nel progetto;
@@ -121,10 +121,22 @@ costanti, funzioni, stringhe, numeri, commenti e direttive.
 | YAML | `.yml` `.yaml`, `---` iniziale |
 | Markdown | `.md` `.markdown` `.mdx` … |
 | SQL (PostgreSQL, MySQL/MariaDB, SQLite) | `.sql` `.pgsql` `.psql` `.mysql` `.ddl` `.dml` |
+| Vue (componenti a file singolo) | `.vue` |
 
 - **Markdown** colora titoli, grassetto/corsivo/barrato, codice, link,
   immagini, elenchi, task, citazioni e HTML. I blocchi ```` ```lang ```` sono
   colorati con il linguaggio indicato (`rust`, `sql`, `bash`, `json`…).
+- **Vue:**
+  - il template è colorato come HTML, con le interpolazioni `{{ … }}` e i
+    valori delle direttive colorati come codice;
+  - le direttive (`v-if`, `v-for`, `:prop`, `@evento`, `#slot`) sono
+    evidenziate;
+  - lo `<script>` è JavaScript, o TypeScript con `lang="ts"`;
+  - lo `<style>` è CSS.
+
+  *Commenta/decommenta* usa `<!-- -->` nel template, `//` nello script e
+  `/* */` nello stile; lo stesso vale per gli script e gli stili delle
+  pagine HTML.
 - **SQL** riconosce parole chiave, tipi e funzioni senza distinguere
   maiuscole e minuscole, i commenti `--` e `/* */` e le stringhe su più
   righe.
@@ -141,7 +153,7 @@ linguaggio, se è installato:
 | Rust | `rustfmt` |
 | C, C++, Java | `clang-format` (rispetta un eventuale `.clang-format` del progetto) |
 | JavaScript, TypeScript | `prettier`, poi `clang-format` |
-| CSS, HTML, YAML, Markdown | `prettier` |
+| CSS, HTML, Vue, YAML, Markdown | `prettier` |
 | Go | `gofmt` |
 | Python | `ruff`, poi `black` |
 | Bash | `shfmt` |
@@ -313,7 +325,10 @@ file](#ricerca-veloce-dei-file)), senza programmi esterni.
 - **Indice:** quando la cartella viene scansionata, macaco estrae le
   definizioni di ogni file (funzioni, metodi, classi, struct, enum,
   interfacce, tipi, costanti, macro, tabelle SQL) con i suoi lexer, ignorando
-  commenti e stringhe. L'indice si aggiorna a ogni salvataggio.
+  commenti e stringhe. Nei file Vue e HTML legge gli `<script>`; ogni
+  componente Vue è anche un simbolo col nome del file in PascalCase.
+  "Vai alla definizione" su un tag come `<carrello-riga>` apre quindi
+  `carrello-riga.vue`. L'indice si aggiorna a ogni salvataggio.
 - **Vai alla definizione** cerca il nome tra le definizioni del documento e
   del progetto.
 - **Trova utilizzi** cerca il nome come parola intera, distinguendo
@@ -361,6 +376,7 @@ protocollo LSP di VS Code e altri editor), che capiscono davvero il codice:
 | Bash | `bash-language-server` | `bash-language-server` |
 | Markdown | `marksman` | `marksman` |
 | SQL | `sqls` | `sqls` (AUR) |
+| Vue | `vue-language-server` insieme a `typescript-language-server` | `vue-language-server`, `typescript-language-server`, `typescript` |
 
 I server vanno cercati nel `PATH` della sessione. Se uno è installato in
 una cartella aggiunta solo da `~/.bashrc` (es. con npm in una cartella
@@ -370,10 +386,29 @@ aggiungi la cartella a `~/.config/environment.d/*.conf`.
 **Peso:** il costo vero sono i server, che girano come processi separati.
 Valori tipici:
 - `clangd` su un piccolo progetto: circa 140 MB (misurato);
+- Intelephense (PHP): circa 270 MB (misurato);
+- Vue: circa 520 MB in tutto, 140 MB il server Vue e 380 MB quello
+  TypeScript (misurato);
 - `rust-analyzer`: da 300 MB a oltre 1 GB, secondo le dipendenze;
 - `jdtls`: 500 MB – 1 GB.
 
-Per questo il livello avanzato è da attivare solo dove serve. Per C e C++,
+Per questo il livello avanzato è da attivare solo dove serve.
+
+**Vue** usa due server che lavorano insieme, come in VS Code:
+- il server TypeScript carica il plugin Vue e risponde su script, tipi ed
+  espressioni del template;
+- il server Vue risponde su tag, direttive ed eventi, e chiede a TypeScript
+  le informazioni sui tipi; macaco fa da tramite tra i due.
+
+Dopo `{{ titolo.` propone i metodi di una stringa, se `titolo` è un
+`Ref<string>`; su `@rim…` propone gli eventi dichiarati dal componente
+figlio; "Vai alla definizione" su `ref` apre la sua dichiarazione nei tipi di
+Vue.
+
+Per contenere la memoria, il server TypeScript gira con un solo tsserver
+(niente server sintattico separato) e senza lo scaricamento automatico dei
+pacchetti `@types`: nei progetti JavaScript senza `node_modules` alcuni tipi
+di librerie esterne possono mancare. Per C e C++,
 `clangd` dà risultati completi tra più file se il progetto ha un
 `compile_commands.json`, altrimenti con un `compile_flags.txt`.
 

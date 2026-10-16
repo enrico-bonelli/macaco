@@ -8,11 +8,14 @@ use super::Editor;
 use super::inspect::Item;
 use crate::config;
 use crate::doc::Doc;
+use crate::format;
+use crate::lang::Lang;
 use crate::finder::{self, TextMatch, TextResults};
 use crate::lsp::{self, Client, Location};
 use gtk::prelude::*;
 use gtk::{gio, glib};
 use serde_json::{Value, json};
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -31,6 +34,17 @@ fn cursor_position(d: &Doc) -> (u32, u32) {
     start.set_line_offset(0);
     let line = buf.text(&start, &it, false);
     (it.line() as u32, lsp::utf16_col(&line, it.line_offset() as usize))
+}
+
+/// Folder of the installed Vue language server: the Vue TypeScript plugin
+/// is found from there.
+fn vue_plugin_location() -> Option<String> {
+    let spec = lsp::spec_named(lsp::VUE_SERVER)?;
+    let (cmd, _) = lsp::find_command(spec)?;
+    // …/node_modules/@vue/language-server/bin/vue-language-server.js
+    let real = std::fs::canonicalize(cmd).ok()?;
+    let pkg = real.parent()?.parent()?;
+    Some(pkg.to_string_lossy().into_owned())
 }
 
 /// Text of line `n` of `path`: from the open document if any.
@@ -106,26 +120,52 @@ impl Editor {
         self.update_lsp_status();
     }
 
-    /// The running server for `d` (started if needed).
+    /// Servers of a document: Vue files use the Vue server and the
+    /// TypeScript one (which loads the Vue plugin).
+    fn lsp_specs_for(&self, d: &Doc) -> Vec<&'static lsp::ServerSpec> {
+        match d.lang.get() {
+            Lang::Vue => [lsp::VUE_SERVER, lsp::TS_SERVER].iter().filter_map(|n| lsp::spec_named(n)).collect(),
+            l => lsp::spec_for(l).into_iter().collect(),
+        }
+    }
+
+    /// Whether `d` belongs to the working folder with servers enabled.
+    fn lsp_applies(&self, d: &Doc) -> bool {
+        let Some(root) = self.workdir.borrow().clone() else { return false };
+        self.lsp_enabled() && d.path.borrow().as_ref().is_some_and(|p| p.starts_with(&root))
+    }
+
+    /// The main server for `d` (started if needed).
     fn lsp_client(self: &Rc<Self>, d: &Doc) -> Option<Rc<Client>> {
-        if !self.lsp_enabled() {
+        if !self.lsp_applies(d) {
             return None;
         }
-        let root = self.workdir.borrow().clone()?;
-        let path = d.path.borrow().clone()?;
-        if !path.starts_with(&root) {
-            return None;
+        let spec = *self.lsp_specs_for(d).first()?;
+        self.lsp_start(spec)
+    }
+
+    /// All the servers for `d` (started if needed).
+    fn lsp_clients_for(self: &Rc<Self>, d: &Doc) -> Vec<Rc<Client>> {
+        if !self.lsp_applies(d) {
+            return Vec::new();
         }
-        let spec = lsp::spec_for(d.lang.get())?;
+        self.lsp_specs_for(d).into_iter().filter_map(|s| self.lsp_start(s)).collect()
+    }
+
+    /// The running server `spec`, started if needed.
+    fn lsp_start(self: &Rc<Self>, spec: &'static lsp::ServerSpec) -> Option<Rc<Client>> {
         if let Some(c) = self.lsp_clients.borrow().iter().find(|c| std::ptr::eq(c.spec, spec) && !c.stopping.get()) {
             return Some(c.clone());
         }
         if self.lsp_failed.borrow().contains(spec.name) {
             return None;
         }
+        let root = self.workdir.borrow().clone()?;
+        let (args, init) = self.lsp_options(spec, &root);
         let w = Rc::downgrade(self);
         let w2 = w.clone();
         let w3 = w.clone();
+        let w4 = w.clone();
         let name = spec.name;
         let events = lsp::Events {
             ready: Box::new(move || {
@@ -156,8 +196,15 @@ impl Editor {
                 ed.update_lsp_status();
                 ed.release_memory();
             }),
+            notification: Box::new(move |method, params| {
+                if method == "tsserver/request"
+                    && let Some(ed) = w4.upgrade()
+                {
+                    ed.vue_tsserver_request(params);
+                }
+            }),
         };
-        match Client::start(spec, &root, events) {
+        match Client::start(spec, &root, &args, init, events) {
             Ok(c) => {
                 self.lsp_status.borrow_mut().insert(name, "avvio…".into());
                 self.lsp_clients.borrow_mut().push(c.clone());
@@ -172,15 +219,110 @@ impl Editor {
         }
     }
 
-    /// Tells the server of `d` that the document is open.
+    /// Extra arguments and initialization options of a server.
+    fn lsp_options(&self, spec: &lsp::ServerSpec, root: &Path) -> (Vec<String>, Value) {
+        // The TypeScript of the project, when it has one.
+        let project_ts = root.join("node_modules/typescript/lib");
+        match spec.name {
+            lsp::VUE_SERVER if project_ts.join("typescript.js").exists() => (vec![format!("--tsdk={}", project_ts.display())], Value::Null),
+            lsp::TS_SERVER => {
+                // Lighter: one tsserver instead of two (no separate syntax
+                // server) and no automatic download of @types packages.
+                let mut init = json!({
+                    "tsserver": {"useSyntaxServer": "never"},
+                    "disableAutomaticTypingAcquisition": true,
+                });
+                // With the Vue plugin when the project has Vue components.
+                if let Some(loc) = vue_plugin_location()
+                    && self.project_has_vue(root)
+                {
+                    init["plugins"] = json!([{
+                        "name": "@vue/typescript-plugin",
+                        "location": loc,
+                        "languages": ["vue"],
+                        "configNamespace": "typescript"
+                    }]);
+                }
+                (Vec::new(), init)
+            }
+            _ => (Vec::new(), Value::Null),
+        }
+    }
+
+    fn project_has_vue(&self, root: &Path) -> bool {
+        if self.docs.borrow().iter().any(|d| d.lang.get() == Lang::Vue) {
+            return true;
+        }
+        // A quick look at the folder (without dependencies and hidden folders).
+        let mut stack = vec![root.to_path_buf()];
+        let mut seen = 0;
+        while let Some(dir) = stack.pop() {
+            let Ok(rd) = std::fs::read_dir(&dir) else { continue };
+            for e in rd.flatten() {
+                seen += 1;
+                if seen > 20_000 {
+                    return false;
+                }
+                let name = e.file_name();
+                let name = name.to_string_lossy();
+                match e.file_type() {
+                    Ok(t) if t.is_dir() => {
+                        if !name.starts_with('.') && name != "node_modules" && name != "target" && name != "dist" {
+                            stack.push(e.path());
+                        }
+                    }
+                    Ok(_) if name.ends_with(".vue") => return true,
+                    _ => {}
+                }
+            }
+        }
+        false
+    }
+
+    /// The Vue server asks the TypeScript one (through its Vue plugin):
+    /// `[[id, command, args]]`, answered with `tsserver/response`
+    /// `[[id, body]]` (the JSON-RPC library of the Vue server wraps the
+    /// array in another one).
+    fn vue_tsserver_request(self: &Rc<Self>, params: &Value) {
+        let params = match params.get(0) {
+            Some(inner) if inner.is_array() => inner,
+            _ => params,
+        };
+        let (Some(id), Some(command)) = (params.get(0).cloned(), params.get(1).and_then(Value::as_str)) else { return };
+        let args = params.get(2).cloned().unwrap_or(Value::Null);
+        let vue = self.lsp_clients.borrow().iter().find(|c| c.spec.name == lsp::VUE_SERVER).cloned();
+        let Some(vue) = vue else { return };
+        let ts = lsp::spec_named(lsp::TS_SERVER).and_then(|s| self.lsp_start(s));
+        let Some(ts) = ts else {
+            vue.notify("tsserver/response", json!([[id, null]]));
+            return;
+        };
+        let vue = Rc::downgrade(&vue);
+        ts.request(
+            "workspace/executeCommand",
+            json!({"command": "typescript.tsserverRequest", "arguments": [command, args]}),
+            move |res| {
+                let body = match res {
+                    Ok(v) => v.get("body").cloned().unwrap_or(v),
+                    Err(_) => Value::Null,
+                };
+                if let Some(vue) = vue.upgrade() {
+                    vue.notify("tsserver/response", json!([[id, body]]));
+                }
+            },
+        );
+    }
+
+    /// Tells the servers of `d` that the document is open.
     pub(super) fn lsp_open(self: &Rc<Self>, d: &Rc<Doc>) {
         if !d.is_loaded() {
             return;
         }
-        let Some(c) = self.lsp_client(d) else { return };
         let Some(path) = d.path.borrow().clone() else { return };
-        if c.ready.get() {
-            c.did_open(&lsp::path_to_uri(&path), lsp::language_id(d.lang.get(), &path), &d.text());
+        for c in self.lsp_clients_for(d) {
+            if c.ready.get() {
+                c.did_open(&lsp::path_to_uri(&path), lsp::language_id(d.lang.get(), &path), &d.text());
+            }
         }
     }
 
@@ -207,25 +349,33 @@ impl Editor {
         let dirty: Vec<String> = self.lsp_dirty.borrow_mut().drain().collect();
         for id in dirty {
             let Some(d) = self.docs.borrow().iter().find(|d| *d.id.borrow() == id).cloned() else { continue };
-            let (Some(path), Some(c)) = (d.path.borrow().clone(), self.lsp_client(&d)) else { continue };
+            let Some(path) = d.path.borrow().clone() else { continue };
             let uri = lsp::path_to_uri(&path);
-            if c.docs.borrow().contains_key(&uri) {
-                c.did_change(&uri, &d.text());
-            } else if c.ready.get() {
-                c.did_open(&uri, lsp::language_id(d.lang.get(), &path), &d.text());
+            let text = d.text();
+            for c in self.lsp_clients_for(&d) {
+                if c.docs.borrow().contains_key(&uri) {
+                    c.did_change(&uri, &text);
+                } else if c.ready.get() {
+                    c.did_open(&uri, lsp::language_id(d.lang.get(), &path), &text);
+                }
             }
         }
     }
 
     pub(super) fn lsp_saved(self: &Rc<Self>, d: &Rc<Doc>) {
         self.lsp_flush();
-        if let (Some(path), Some(c)) = (d.path.borrow().clone(), self.lsp_client(d)) {
-            let uri = lsp::path_to_uri(&path);
+        let Some(path) = d.path.borrow().clone() else { return };
+        let uri = lsp::path_to_uri(&path);
+        let mut missing = false;
+        for c in self.lsp_clients_for(d) {
             if c.docs.borrow().contains_key(&uri) {
                 c.did_save(&uri);
             } else {
-                self.lsp_open(d);
+                missing = true;
             }
+        }
+        if missing {
+            self.lsp_open(d);
         }
     }
 
@@ -286,9 +436,26 @@ impl Editor {
 
     // ------------------------------------------------------------- requests
 
-    /// Server and text position for a request about the cursor of `d`.
-    fn lsp_target(self: &Rc<Self>, d: &Rc<Doc>) -> Option<(Rc<Client>, Value)> {
-        let c = self.lsp_client(d)?;
+    /// The server to ask about the cursor of `d`: in Vue files the
+    /// TypeScript one for definitions, references and the script, the Vue
+    /// one for completions in the template.
+    fn lsp_server_for(self: &Rc<Self>, d: &Rc<Doc>, completion: bool) -> Option<Rc<Client>> {
+        if d.lang.get() != Lang::Vue {
+            return self.lsp_client(d);
+        }
+        let clients = self.lsp_clients_for(d);
+        let named = |n: &str| clients.iter().find(|c| c.spec.name == n).cloned();
+        let in_script = {
+            let buf = &d.buffer;
+            let before = buf.text(&buf.start_iter(), &buf.iter_at_mark(&buf.get_insert()), false);
+            matches!(format::embedded_lang(Lang::Vue, &before), Lang::JavaScript | Lang::TypeScript)
+        };
+        if completion && !in_script { named(lsp::VUE_SERVER) } else { named(lsp::TS_SERVER).or_else(|| named(lsp::VUE_SERVER)) }
+    }
+
+    /// Text position of the cursor of `d` for a request to `c` (which
+    /// gets the current text first).
+    fn lsp_target(self: &Rc<Self>, c: &Rc<Client>, d: &Rc<Doc>) -> Option<Value> {
         let path = d.path.borrow().clone()?;
         // The server must see the current text.
         if d.is_unsaved() || self.lsp_dirty.borrow().contains(&*d.id.borrow()) {
@@ -302,19 +469,19 @@ impl Editor {
             self.lsp_open(d);
         }
         let (line, character) = cursor_position(d);
-        Some((c, json!({"textDocument": {"uri": lsp::path_to_uri(&path)}, "position": {"line": line, "character": character}})))
+        Some(json!({"textDocument": {"uri": lsp::path_to_uri(&path)}, "position": {"line": line, "character": character}}))
     }
 
     pub(super) fn lsp_trigger_char(&self, d: &Doc, text: &str) -> bool {
-        let Some(spec) = lsp::spec_for(d.lang.get()) else { return false };
-        self.lsp_clients
-            .borrow()
-            .iter()
-            .any(|c| std::ptr::eq(c.spec, spec) && c.ready.get() && c.trigger_chars.borrow().iter().any(|t| t.ends_with(text)))
+        let specs = self.lsp_specs_for(d);
+        self.lsp_clients.borrow().iter().any(|c| {
+            specs.iter().any(|s| std::ptr::eq(c.spec, *s)) && c.ready.get() && c.trigger_chars.borrow().iter().any(|t| t.ends_with(text))
+        })
     }
 
     pub(super) fn lsp_definition(self: &Rc<Self>, d: &Rc<Doc>, word: &str) -> bool {
-        let Some((c, params)) = self.lsp_target(d) else { return false };
+        let Some(c) = self.lsp_server_for(d, false) else { return false };
+        let Some(params) = self.lsp_target(&c, d) else { return false };
         self.message(&format!("{}: ricerca della definizione…", c.spec.name));
         let ed = Rc::downgrade(self);
         let (d, word) = (d.clone(), word.to_string());
@@ -342,7 +509,8 @@ impl Editor {
     }
 
     pub(super) fn lsp_references(self: &Rc<Self>, d: &Rc<Doc>, word: &str) -> bool {
-        let Some((c, mut params)) = self.lsp_target(d) else { return false };
+        let Some(c) = self.lsp_server_for(d, false) else { return false };
+        let Some(mut params) = self.lsp_target(&c, d) else { return false };
         params["context"] = json!({"includeDeclaration": true});
         self.message(&format!("{}: ricerca degli utilizzi…", c.spec.name));
         let ed = Rc::downgrade(self);
@@ -363,44 +531,85 @@ impl Editor {
         true
     }
 
+    /// Servers asked for completions: in the template of a Vue file both
+    /// (TypeScript completes the expressions through the Vue plugin, Vue
+    /// the tags, directives and events), otherwise one.
+    fn lsp_completion_servers(self: &Rc<Self>, d: &Rc<Doc>) -> Vec<Rc<Client>> {
+        let servers: Vec<Rc<Client>> = if d.lang.get() == Lang::Vue {
+            let in_script = {
+                let buf = &d.buffer;
+                let before = buf.text(&buf.start_iter(), &buf.iter_at_mark(&buf.get_insert()), false);
+                matches!(format::embedded_lang(Lang::Vue, &before), Lang::JavaScript | Lang::TypeScript)
+            };
+            self.lsp_clients_for(d).into_iter().filter(|c| !in_script || c.spec.name == lsp::TS_SERVER).collect()
+        } else {
+            self.lsp_client(d).into_iter().collect()
+        };
+        servers.into_iter().filter(|c| c.ready.get()).collect()
+    }
+
     pub(super) fn lsp_completion(self: &Rc<Self>, d: &Rc<Doc>, generation: u32) -> bool {
-        let Some(c) = self.lsp_client(d) else { return false };
-        if !c.ready.get() {
+        let servers = self.lsp_completion_servers(d);
+        if servers.is_empty() {
             return false;
         }
-        let Some((c, mut params)) = self.lsp_target(d) else { return false };
         // Typed a trigger character (`.`, `::`…)?
         let buf = &d.buffer;
         let it = buf.iter_at_mark(&buf.get_insert());
         let mut before = it;
         before.backward_char();
         let prev = buf.text(&before, &it, false).to_string();
-        if c.trigger_chars.borrow().iter().any(|t| t.ends_with(prev.as_str())) {
-            params["context"] = json!({"triggerKind": 2, "triggerCharacter": prev});
-        } else {
-            params["context"] = json!({"triggerKind": 1});
-        }
-        let ed = Rc::downgrade(self);
-        let d = d.clone();
-        c.request("textDocument/completion", params, move |res| {
-            let Some(ed) = ed.upgrade() else { return };
-            // Typed something else meanwhile?
-            let current = ed.completion.borrow().as_ref().is_some_and(|c| c.generation.get() == generation);
-            if !current {
-                return;
-            }
-            let (prefix, _) = super::inspect::word_at_cursor(&d).map_or((String::new(), 0), |(w, a, _)| {
-                // Only the part before the cursor.
-                let cur = d.buffer.iter_at_mark(&d.buffer.get_insert()).offset();
-                (w.chars().take((cur - a).max(0) as usize).collect(), a)
+        // (answers still expected, answers received)
+        let answers: Rc<RefCell<(usize, Vec<Value>)>> = Rc::new(RefCell::new((0, Vec::new())));
+        for c in servers {
+            let Some(mut params) = self.lsp_target(&c, d) else { continue };
+            params["context"] = if c.trigger_chars.borrow().iter().any(|t| t.ends_with(prev.as_str())) {
+                json!({"triggerKind": 2, "triggerCharacter": prev})
+            } else {
+                json!({"triggerKind": 1})
+            };
+            answers.borrow_mut().0 += 1;
+            let ed = Rc::downgrade(self);
+            let (d, answers) = (d.clone(), answers.clone());
+            c.request("textDocument/completion", params, move |res| {
+                let all = {
+                    let mut a = answers.borrow_mut();
+                    a.0 -= 1;
+                    if let Ok(v) = res {
+                        a.1.push(v);
+                    }
+                    if a.0 > 0 {
+                        return;
+                    }
+                    std::mem::take(&mut a.1)
+                };
+                let Some(ed) = ed.upgrade() else { return };
+                // Typed something else meanwhile?
+                let current = ed.completion.borrow().as_ref().is_some_and(|c| c.generation.get() == generation);
+                if !current {
+                    return;
+                }
+                let prefix = super::inspect::word_at_cursor(&d).map_or(String::new(), |(w, a, _)| {
+                    // Only the part before the cursor.
+                    let cur = d.buffer.iter_at_mark(&d.buffer.get_insert()).offset();
+                    w.chars().take((cur - a).max(0) as usize).collect()
+                });
+                let mut items: Vec<Item> = Vec::new();
+                for v in &all {
+                    for it in completion_items(&d, v, &prefix) {
+                        if !items.iter().any(|x| x.label == it.label) {
+                            items.push(it);
+                        }
+                    }
+                }
+                items.truncate(MAX_ITEMS);
+                if items.is_empty() && !prefix.is_empty() {
+                    items = ed.local_items(&d, &prefix);
+                }
+                ed.show_completion(&d, items);
             });
-            let mut items = res.map(|v| completion_items(&d, &v, &prefix)).unwrap_or_default();
-            if items.is_empty() && !prefix.is_empty() {
-                items = ed.local_items(&d, &prefix);
-            }
-            ed.show_completion(&d, items);
-        });
-        true
+        }
+        answers.borrow().0 > 0
     }
 }
 

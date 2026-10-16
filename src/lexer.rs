@@ -61,7 +61,8 @@ pub enum State {
     RawStr(u8),
     /// HTML: inside a tag, between its name and '>'.
     HtmlTag,
-    /// HTML: inside <script>; payload is the encoded JS state.
+    /// HTML: inside <script>; payload is the encoded script state: 0-2
+    /// JavaScript, 3-5 TypeScript (`lang="ts"`).
     HtmlScript(u8),
     /// HTML: inside <style>; payload is the CSS state.
     HtmlStyle(u8),
@@ -88,7 +89,7 @@ fn pack(s: State) -> u8 {
         State::RawStr(n) => 7 + n.min(8),
         State::HtmlTag => 16,
         State::PhpHtml => 17,
-        State::HtmlScript(x) => 18 + x.min(2),
+        State::HtmlScript(x) => 18 + x.min(5),
         State::YamlBlock(i) => 32 + i.min(31),
         State::Css(c) => 64 + (c & 0x3F) + if c & 0x80 != 0 { 64 } else { 0 },
         State::HtmlStyle(c) => 192 + (c & 0x1F) + if c & 0x80 != 0 { 32 } else { 0 },
@@ -107,7 +108,7 @@ fn unpack(v: u8) -> State {
         7..=15 => State::RawStr(v - 7),
         16 => State::HtmlTag,
         17 => State::PhpHtml,
-        18..=20 => State::HtmlScript(v - 18),
+        18..=23 => State::HtmlScript(v - 18),
         32..=63 => State::YamlBlock(v - 32),
         64..=127 => State::Css(v - 64),
         128..=191 => State::Css((v - 128) | 0x80),
@@ -139,7 +140,7 @@ pub fn lex_line(lang: Lang, state: State, line: &str, out: &mut Vec<Token>) -> S
     let mut lx = Lexer { b, out, lang, words: word_table(lang), def_next: false };
     match lang {
         Lang::Plain => State::Normal,
-        Lang::Html => lx.html(state, 0, b.len()),
+        Lang::Html | Lang::Vue => lx.html(state, 0, b.len()),
         Lang::Css => {
             let st = if let State::Css(s) = state { s } else { 0 };
             State::Css(lx.css(st, 0, b.len()))
@@ -707,6 +708,8 @@ impl Lexer<'_> {
     fn html(&mut self, state: State, start: usize, end: usize) -> State {
         let b = self.b;
         let mut i = start;
+        // Vue single file components: `{{ … }}` and directives.
+        let vue = self.lang == Lang::Vue;
         match state {
             State::Comment => match find(b, i, end, b"-->") {
                 Some(p) => {
@@ -765,7 +768,11 @@ impl Lexer<'_> {
                             i = p;
                             let self_closed = b[p - 2] == b'/';
                             if script && !self_closed {
-                                match self.embedded_js(0, i, end) {
+                                let attrs = &b[ne..p];
+                                let ts = [&b"lang=\"ts\""[..], b"lang='ts'", b"lang=\"tsx\"", b"lang='tsx'"]
+                                    .iter()
+                                    .any(|pat| attrs.windows(pat.len()).any(|w| w == *pat));
+                                match self.embedded_js(if ts { 3 } else { 0 }, i, end) {
                                     Ok(p) => i = p,
                                     Err(st) => return st,
                                 }
@@ -777,6 +784,18 @@ impl Lexer<'_> {
                             }
                         }
                         None => return State::HtmlTag,
+                    }
+                }
+                b'{' if vue && self.at(i + 1) == b'{' => {
+                    // {{ expression }} (on one line).
+                    let stop = find(b, i + 2, end, b"}}").unwrap_or(end);
+                    self.tok(i, i + 2, Kind::Preproc);
+                    self.embedded_expr(i + 2, stop);
+                    if stop < end {
+                        self.tok(stop, stop + 2, Kind::Preproc);
+                        i = stop + 2;
+                    } else {
+                        i = end;
                     }
                 }
                 b'&' => {
@@ -797,12 +816,62 @@ impl Lexer<'_> {
         State::Normal
     }
 
+    /// A JavaScript expression inside a Vue template.
+    fn embedded_expr(&mut self, start: usize, stop: usize) {
+        let (saved_lang, saved_words) = (self.lang, self.words);
+        self.lang = Lang::JavaScript;
+        self.words = word_table(Lang::JavaScript);
+        self.code(Lang::JavaScript.spec(), State::Normal, start, stop);
+        self.lang = saved_lang;
+        self.words = saved_words;
+    }
+
     /// Attributes of a tag; returns the position after '>' if the tag
     /// closes on this line.
     fn tag_inner(&mut self, mut i: usize, end: usize) -> Option<usize> {
         let b = self.b;
+        let vue = self.lang == Lang::Vue;
         while i < end {
             let c = b[i];
+            // Vue directives: v-if, :prop, @event, #slot; their value is code.
+            let directive = vue
+                && (matches!(c, b':' | b'@' | b'#') && is_ident_start(self.at(i + 1))
+                    || (c == b'v' && self.at(i + 1) == b'-' && (i == 0 || !is_ident(b[i - 1]))));
+            if directive {
+                let mut e = i + 1;
+                while e < end && (is_ident(b[e]) || b"-:.@#[]".contains(&b[e])) {
+                    e += 1;
+                }
+                self.tok(i, e, Kind::Keyword);
+                let mut j = e;
+                while j < end && b[j] == b' ' {
+                    j += 1;
+                }
+                if j < end && b[j] == b'=' {
+                    j += 1;
+                    while j < end && b[j] == b' ' {
+                        j += 1;
+                    }
+                    if j < end && (b[j] == b'"' || b[j] == b'\'') {
+                        let q = b[j];
+                        match find(b, j + 1, end, &[q]) {
+                            Some(close) => {
+                                self.tok(j, j + 1, Kind::Str);
+                                self.embedded_expr(j + 1, close);
+                                self.tok(close, close + 1, Kind::Str);
+                                i = close + 1;
+                            }
+                            None => {
+                                self.tok(j, end, Kind::Str);
+                                i = end;
+                            }
+                        }
+                        continue;
+                    }
+                }
+                i = e;
+                continue;
+            }
             if c == b'>' {
                 let s = if i > 0 && b[i - 1] == b'/' { i - 1 } else { i };
                 self.tok(s, i + 1, Kind::Tag);
@@ -828,25 +897,29 @@ impl Lexer<'_> {
 
     fn embedded_js(&mut self, js: u8, i: usize, end: usize) -> Result<usize, State> {
         let stop = find_ci(self.b, i, end, b"</script").unwrap_or(end);
-        let st = match js {
+        // 0-2: JavaScript, 3-5: TypeScript.
+        let (base, lang) = if js >= 3 { (3, Lang::TypeScript) } else { (0, Lang::JavaScript) };
+        let st = match js - base {
             1 => State::Comment,
             2 => State::Str(b'`'),
             _ => State::Normal,
         };
         let (saved_lang, saved_words) = (self.lang, self.words);
-        self.lang = Lang::JavaScript;
-        self.words = word_table(Lang::JavaScript);
-        let (st, _) = self.code(Lang::JavaScript.spec(), st, i, stop);
+        self.lang = lang;
+        self.words = word_table(lang);
+        let (st, _) = self.code(lang.spec(), st, i, stop);
         self.lang = saved_lang;
         self.words = saved_words;
         if stop < end {
             return Ok(stop);
         }
-        Err(State::HtmlScript(match st {
-            State::Comment => 1,
-            State::Str(_) => 2,
-            _ => 0,
-        }))
+        Err(State::HtmlScript(
+            base + match st {
+                State::Comment => 1,
+                State::Str(_) => 2,
+                _ => 0,
+            },
+        ))
     }
 
     fn embedded_css(&mut self, css: u8, i: usize, end: usize) -> Result<usize, State> {
@@ -1463,6 +1536,35 @@ mod tests {
         let (t, s) = kinds(Lang::Sql, s, "line'); /* x");
         assert_eq!(t[0], ("line'".into(), Kind::Str));
         assert_eq!(s, State::Comment);
+    }
+
+    #[test]
+    fn vue() {
+        let (t, s) = kinds(
+            Lang::Vue,
+            State::Normal,
+            r#"<div v-if="ok && n > 1" :class="cls" @click="go(1)" #item>{{ msg.toUpperCase() }}</div>"#,
+        );
+        assert_eq!(s, State::Normal);
+        for d in ["v-if", ":class", "@click", "#item"] {
+            assert!(t.contains(&(d.into(), Kind::Keyword)), "{d}");
+        }
+        assert!(t.contains(&("go".into(), Kind::Function)));
+        assert!(t.contains(&("1".into(), Kind::Number)));
+        assert!(t.contains(&("{{".into(), Kind::Preproc)));
+        assert!(t.contains(&("toUpperCase".into(), Kind::Function)));
+        assert!(!t.iter().any(|x| x.0.contains("ok &&")));
+        let (_, s) = kinds(Lang::Vue, State::Normal, r#"<script setup lang="ts">"#);
+        assert_eq!(s, State::HtmlScript(3));
+        let (t, s) = kinds(Lang::Vue, s, "interface Props { n: number } // nota");
+        assert_eq!(s, State::HtmlScript(3));
+        assert!(t.contains(&("interface".into(), Kind::Keyword)));
+        assert!(t.contains(&("number".into(), Kind::Type)));
+        let (_, s) = kinds(Lang::Vue, s, "</script>");
+        assert_eq!(s, State::Normal);
+        // Plain HTML: no directives.
+        let (t, _) = kinds(Lang::Html, State::Normal, r#"<p :x="a">{{ b }}</p>"#);
+        assert!(!t.iter().any(|x| x.1 == Kind::Keyword));
     }
 
     #[test]
