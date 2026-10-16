@@ -25,6 +25,7 @@ Tutto questo senza rinunciare alla leggerezza: all'avvio occupa circa
 - [Punti di forza](#punti-di-forza)
 - [Funzionalità](#funzionalità)
   - [Scrittura e modifica](#scrittura-e-modifica)
+  - [Piegatura del codice](#piegatura-del-codice)
   - [Linguaggi supportati](#linguaggi-supportati)
   - [Formattazione del codice](#formattazione-del-codice)
   - [Cerca e sostituisci](#cerca-e-sostituisci)
@@ -100,6 +101,43 @@ Tutto questo senza rinunciare alla leggerezza: all'avvio occupa circa
 - **Vai alla riga** (`Ctrl+L`, anche nel formato `riga:colonna`).
 - **Apri trascinando** i file sulla finestra.
 - **File recenti** nel menu File.
+
+### Piegatura del codice
+
+Nei file di codice un blocco (funzione, classe, `if`, elenco di argomenti…)
+si può **piegare**: resta visibile solo la prima riga, la firma o
+l'intestazione, e le righe interne spariscono finché non lo si espande.
+Così non si rischia di scrivere nella funzione sbagliata.
+
+- **Nel margine** compare un triangolo ▾ accanto alle righe che aprono un
+  blocco quando il mouse è sopra il margine: un clic piega il blocco. I
+  blocchi piegati hanno un triangolo ▸ sempre visibile e la riga
+  d'intestazione evidenziata; un clic li espande. I numeri di riga saltano
+  le righe nascoste.
+- **Da tastiera** (o dal menu Visualizza):
+  - `Ctrl+Maiusc+-` piega il blocco che inizia sulla riga del cursore o,
+    se non ce n'è uno, il più interno che la contiene;
+  - `Ctrl+Maiusc++` espande il blocco piegato sulla riga del cursore;
+  - `Ctrl+Alt+-` **piega tutte le funzioni** (e classi, struct, …): resta
+    l'elenco delle firme; nei linguaggi senza definizioni (CSS, YAML, HTML)
+    piega i blocchi più esterni;
+  - `Ctrl+Alt++` espande tutto.
+- **I blocchi si trovano** con le parentesi `{}`, `()` e `[]` (ignorando
+  stringhe e commenti) in C, C++, Rust, PHP, Bash, JavaScript, TypeScript,
+  CSS, Java, Go e Vue, e con l'indentazione in Python, YAML e HTML. La
+  parentesi di chiusura resta visibile sotto l'intestazione; con lo stile
+  Allman (graffa da sola sulla riga) l'intestazione è la riga della firma.
+- **Il testo nascosto non si modifica per sbaglio:**
+  - il cursore salta le righe piegate;
+  - Backspace subito dopo un blocco piegato o Canc alla fine della sua
+    intestazione espandono il blocco invece di cancellare;
+  - Invio alla fine dell'intestazione, o una modifica che la unisce o la
+    divide, espande il blocco;
+  - se il cursore finisce dentro un blocco piegato (ricerca, vai alla
+    riga, vai alla definizione, …) il blocco si espande da solo.
+- Il testo piegato viene comunque **salvato, cercato e copiato** se fa
+  parte di una selezione; le pieghe restano anche quando una scheda
+  nascosta viene scaricata dalla memoria e ricaricata.
 
 ### Linguaggi supportati
 
@@ -349,7 +387,39 @@ server**. macaco usa allora i *language server* installati (lo stesso
 protocollo LSP di VS Code e altri editor), che capiscono davvero il codice:
 - completamento consapevole del tipo: dopo `oggetto.` propone i membri di
   quell'oggetto;
-- definizioni e utilizzi precisi, che distinguono gli omonimi.
+- definizioni e utilizzi precisi, che distinguono gli omonimi;
+- **verifica del file** su richiesta (sintassi e, secondo il server, tipi e
+  nomi non definiti).
+
+**Verifica il file** (`F5`, o menu Cerca):
+- Invia al server il testo attuale, anche se non è ancora salvato, e
+  aspetta la sua risposta. Se il server sta ancora indicizzando il progetto,
+  il pannello lo mostra e attende (al massimo 45 secondi).
+- Sotto l'editor si apre il pannello dei **problemi** con il riepilogo
+  ("2 errori, 1 avviso" oppure "nessun problema trovato ✓"). Ogni riga
+  riporta il tipo (errore, avviso, nota), la riga:colonna, il messaggio e il
+  codice dell'errore. Un clic porta il cursore sul punto, anche dentro un
+  blocco piegato.
+- Nel codice errori e avvisi sono **sottolineati** in rosso e in giallo.
+  Restano dove sono anche mentre modifichi il testo: per aggiornarli premi
+  di nuovo `F5` (o «Verifica di nuovo»). Chiudendo il pannello le
+  sottolineature spariscono.
+- Cosa controlla dipende dal server: `clangd`, `typescript-language-server`
+  e `pyright` trovano anche errori di tipo e nomi non definiti.
+- **Con `rust-analyzer`:**
+  - sul testo non salvato trova gli errori di sintassi;
+  - gli errori del compilatore (tipi, prestiti…) vengono da `cargo check`,
+    che rust-analyzer esegue sul file salvato. Salva e verifica: il pannello
+    aspetta la fine di `cargo check`.
+  - Se il testo è cambiato dopo l'ultimo salvataggio, quegli errori
+    riguarderebbero la versione vecchia: non vengono elencati e il pannello
+    dice quanti sono.
+- Il messaggio completo di un errore, con le note collegate (es. «expected
+  `i32`, found `&str`»), è nel suggerimento che compare passando il mouse
+  sulla riga.
+- Funziona solo per i file della cartella di lavoro con l'analisi attiva. Negli
+  altri casi un messaggio spiega cosa manca: aprire la cartella, attivare
+  l'analisi o installare il server.
 
 **Funzionamento:**
 - Il server di un linguaggio parte solo quando apri un file di quel
@@ -527,6 +597,8 @@ cartella di lavoro o, se non c'è, del file attivo.
 | `Ctrl+]` / `Ctrl+[` | aumenta / riduci rientro |
 | `Ctrl+Maiusc+D` / `Ctrl+Maiusc+K` | duplica / elimina riga |
 | `Ctrl+Maiusc+I` | formatta documento |
+| `Ctrl+Maiusc+-` / `Ctrl+Maiusc++` | piega / espandi il blocco |
+| `Ctrl+Alt+-` / `Ctrl+Alt++` | piega tutte le funzioni / espandi tutto |
 | `Alt+Z` | a capo automatico |
 | `Ctrl++` / `Ctrl+-` / `Ctrl+0` | zoom |
 | `Ctrl+\`, `F8` | affianca schede |
@@ -542,6 +614,7 @@ cartella di lavoro o, se non c'è, del file attivo.
 | `F4`, `Ctrl`+clic | vai alla definizione |
 | `Maiusc+F4` | trova utilizzi |
 | `Ctrl+Spazio` | completamento |
+| `F5` | verifica il file (language server) |
 | `F12`, ``Ctrl+` `` | terminale |
 | `Maiusc+F12` | terminale nella cartella del file |
 | `F2` / `Canc` (nel pannello file) | rinomina / sposta nel cestino |

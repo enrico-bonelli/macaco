@@ -32,7 +32,7 @@ fn cursor_position(d: &Doc) -> (u32, u32) {
     let it = buf.iter_at_mark(&buf.get_insert());
     let mut start = it;
     start.set_line_offset(0);
-    let line = buf.text(&start, &it, false);
+    let line = buf.text(&start, &it, true);
     (it.line() as u32, lsp::utf16_col(&line, it.line_offset() as usize))
 }
 
@@ -56,7 +56,7 @@ fn line_of(ed: &Editor, path: &Path, n: u32) -> String {
             if !b.ends_line() {
                 b.forward_to_line_end();
             }
-            d.buffer.text(&a, &b, false).to_string()
+            d.buffer.text(&a, &b, true).to_string()
         }),
         None => finder::read_text(path).and_then(|t| t.lines().nth(n as usize).map(str::to_string)).unwrap_or_default(),
     }
@@ -73,7 +73,7 @@ impl Editor {
         self.win.add_action(&a);
     }
 
-    fn lsp_enabled(&self) -> bool {
+    pub(super) fn lsp_enabled(&self) -> bool {
         self.workdir.borrow().as_ref().is_some_and(|w| config::load_lsp_folders().contains(w))
     }
 
@@ -122,7 +122,7 @@ impl Editor {
 
     /// Servers of a document: Vue files use the Vue server and the
     /// TypeScript one (which loads the Vue plugin).
-    fn lsp_specs_for(&self, d: &Doc) -> Vec<&'static lsp::ServerSpec> {
+    pub(super) fn lsp_specs_for(&self, d: &Doc) -> Vec<&'static lsp::ServerSpec> {
         match d.lang.get() {
             Lang::Vue => [lsp::VUE_SERVER, lsp::TS_SERVER].iter().filter_map(|n| lsp::spec_named(n)).collect(),
             l => lsp::spec_for(l).into_iter().collect(),
@@ -145,7 +145,7 @@ impl Editor {
     }
 
     /// All the servers for `d` (started if needed).
-    fn lsp_clients_for(self: &Rc<Self>, d: &Doc) -> Vec<Rc<Client>> {
+    pub(super) fn lsp_clients_for(self: &Rc<Self>, d: &Doc) -> Vec<Rc<Client>> {
         if !self.lsp_applies(d) {
             return Vec::new();
         }
@@ -189,6 +189,7 @@ impl Editor {
                 let Some(ed) = w3.upgrade() else { return };
                 ed.lsp_clients.borrow_mut().retain(|c| c.spec.name != name);
                 ed.lsp_status.borrow_mut().remove(name);
+                ed.forget_diagnostics(name);
                 if !why.is_empty() {
                     ed.lsp_failed.borrow_mut().insert(name);
                     ed.error_dialog("Language server terminato", &why);
@@ -197,10 +198,11 @@ impl Editor {
                 ed.release_memory();
             }),
             notification: Box::new(move |method, params| {
-                if method == "tsserver/request"
-                    && let Some(ed) = w4.upgrade()
-                {
-                    ed.vue_tsserver_request(params);
+                let Some(ed) = w4.upgrade() else { return };
+                match method {
+                    "tsserver/request" => ed.vue_tsserver_request(params),
+                    "textDocument/publishDiagnostics" => ed.lsp_diagnostics(name, params),
+                    _ => {}
                 }
             }),
         };
@@ -447,7 +449,7 @@ impl Editor {
         let named = |n: &str| clients.iter().find(|c| c.spec.name == n).cloned();
         let in_script = {
             let buf = &d.buffer;
-            let before = buf.text(&buf.start_iter(), &buf.iter_at_mark(&buf.get_insert()), false);
+            let before = buf.text(&buf.start_iter(), &buf.iter_at_mark(&buf.get_insert()), true);
             matches!(format::embedded_lang(Lang::Vue, &before), Lang::JavaScript | Lang::TypeScript)
         };
         if completion && !in_script { named(lsp::VUE_SERVER) } else { named(lsp::TS_SERVER).or_else(|| named(lsp::VUE_SERVER)) }
@@ -538,7 +540,7 @@ impl Editor {
         let servers: Vec<Rc<Client>> = if d.lang.get() == Lang::Vue {
             let in_script = {
                 let buf = &d.buffer;
-                let before = buf.text(&buf.start_iter(), &buf.iter_at_mark(&buf.get_insert()), false);
+                let before = buf.text(&buf.start_iter(), &buf.iter_at_mark(&buf.get_insert()), true);
                 matches!(format::embedded_lang(Lang::Vue, &before), Lang::JavaScript | Lang::TypeScript)
             };
             self.lsp_clients_for(d).into_iter().filter(|c| !in_script || c.spec.name == lsp::TS_SERVER).collect()
@@ -558,7 +560,7 @@ impl Editor {
         let it = buf.iter_at_mark(&buf.get_insert());
         let mut before = it;
         before.backward_char();
-        let prev = buf.text(&before, &it, false).to_string();
+        let prev = buf.text(&before, &it, true).to_string();
         // (answers still expected, answers received)
         let answers: Rc<RefCell<(usize, Vec<Value>)>> = Rc::new(RefCell::new((0, Vec::new())));
         for c in servers {
@@ -644,7 +646,7 @@ fn completion_items(d: &Doc, v: &Value, prefix: &str) -> Vec<Item> {
                 if !end.ends_line() {
                     end.forward_to_line_end();
                 }
-                let text = d.buffer.text(&start, &end, false);
+                let text = d.buffer.text(&start, &end, true);
                 Some(start.offset() + lsp::char_col(&text, u16) as i32)
             });
             let kind = it.get("kind").and_then(Value::as_u64).map_or("", lsp::completion_kind);

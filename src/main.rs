@@ -5,6 +5,7 @@ mod diff;
 mod doc;
 mod encoding;
 mod finder;
+mod fold;
 mod format;
 mod git;
 mod lang;

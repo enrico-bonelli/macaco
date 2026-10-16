@@ -44,12 +44,28 @@ pub(super) struct Item {
 pub(super) struct Completion {
     popover: gtk::Popover,
     list: gtk::ListBox,
+    scroll: gtk::ScrolledWindow,
     items: RefCell<Vec<Item>>,
     doc: RefCell<Weak<Doc>>,
     /// Offset where the word being completed starts.
     start: Cell<i32>,
     /// Requests started before this one are obsolete.
     pub(super) generation: Cell<u32>,
+}
+
+impl Completion {
+    /// Scroll the list so that `row` is visible (the focus stays in the
+    /// editor, so the list does not follow the selection by itself).
+    fn scroll_to(&self, row: &gtk::ListBoxRow) {
+        let Some(b) = row.compute_bounds(&self.list) else { return };
+        let adj = self.scroll.vadjustment();
+        let (top, bottom) = (b.y() as f64, (b.y() + b.height()) as f64);
+        if top < adj.value() {
+            adj.set_value(top);
+        } else if bottom > adj.value() + adj.page_size() {
+            adj.set_value(bottom - adj.page_size());
+        }
+    }
 }
 
 /// Identifier around the cursor: (text, start offset, end offset).
@@ -65,7 +81,7 @@ pub(super) fn word_at_cursor(d: &Doc) -> Option<(String, i32, i32)> {
     }
     let mut b = it;
     while symbols::is_ident_char(b.char()) && b.forward_char() {}
-    let w = buf.text(&a, &b, false).to_string();
+    let w = buf.text(&a, &b, true).to_string();
     (!w.is_empty() && !w.starts_with(|c: char| c.is_ascii_digit())).then(|| (w, a.offset(), b.offset()))
 }
 
@@ -92,7 +108,7 @@ fn component_tag_at_cursor(d: &Doc) -> Option<String> {
     a.forward_char();
     let mut b = it;
     while tag_char(b.char()) && b.forward_char() {}
-    let name = buf.text(&a, &b, false).to_string();
+    let name = buf.text(&a, &b, true).to_string();
     // Components have an upper case letter or a dash (HTML tags have neither).
     (name.contains('-') || name.starts_with(|c: char| c.is_uppercase())).then(|| symbols::pascal_case(&name))
 }
@@ -108,7 +124,7 @@ fn prefix_at_cursor(d: &Doc) -> (String, i32) {
             break;
         }
     }
-    (buf.text(&a, &it, false).to_string(), a.offset())
+    (buf.text(&a, &it, true).to_string(), a.offset())
 }
 
 /// Text of the document around the cursor (at most about 1 MB), for the
@@ -118,7 +134,7 @@ fn text_near_cursor(d: &Doc) -> String {
     let cur = buf.iter_at_mark(&buf.get_insert()).offset();
     let a = buf.iter_at_offset((cur - 500_000).max(0));
     let b = buf.iter_at_offset(cur + 500_000);
-    buf.text(&a, &b, false).to_string()
+    buf.text(&a, &b, true).to_string()
 }
 
 impl Editor {
@@ -419,6 +435,7 @@ impl Editor {
         let c = Rc::new(Completion {
             popover,
             list,
+            scroll,
             items: RefCell::new(Vec::new()),
             doc: RefCell::new(Weak::new()),
             start: Cell::new(0),
@@ -456,11 +473,7 @@ impl Editor {
         let select = |i: i32| {
             if let Some(row) = c.list.row_at_index(i.clamp(0, n - 1)) {
                 c.list.select_row(Some(&row));
-                row.grab_focus();
-                // Keep the focus in the editor.
-                if let Some(d) = c.doc.borrow().upgrade() {
-                    d.view.grab_focus();
-                }
+                c.scroll_to(&row);
             }
         };
         match key {
@@ -579,6 +592,7 @@ impl Editor {
         if let Some(r) = c.list.row_at_index(0) {
             c.list.select_row(Some(&r));
         }
+        c.scroll.vadjustment().set_value(0.0);
         // Under the cursor.
         let buf = &d.buffer;
         let it = buf.iter_at_mark(&buf.get_insert());

@@ -22,6 +22,7 @@ use std::time::{Duration, Instant};
 mod gitui;
 mod inspect;
 mod lspui;
+mod problems;
 mod quickopen;
 mod textsearch;
 
@@ -131,6 +132,12 @@ pub struct Editor {
     /// Documents with changes not yet sent to their server.
     lsp_dirty: RefCell<std::collections::HashSet<String>>,
     lsp_flush_scheduled: Cell<bool>,
+    /// Latest diagnostics of the servers, the running "Verifica il file"
+    /// and the problems listed in its panel.
+    lsp_diags: RefCell<problems::DiagStore>,
+    lsp_check: RefCell<Option<problems::Check>>,
+    problems: problems::ProblemsUi,
+    problems_shown: RefCell<problems::Shown>,
 }
 
 /// Shortcuts that keep working while the terminal has the focus; all the
@@ -225,6 +232,7 @@ impl Editor {
 
         let (search_box, search) = Self::build_search_bar();
         let (status_box, status) = Self::build_status_bar();
+        let problems = problems::build_panel();
 
         let recent_menu = gio::Menu::new();
         let menubar = gtk::PopoverMenuBar::from_model(Some(&Self::build_menu(&recent_menu)));
@@ -232,6 +240,7 @@ impl Editor {
         let vbox = gtk::Box::new(gtk::Orientation::Vertical, 0);
         vbox.append(&menubar);
         vbox.append(&hpaned);
+        vbox.append(&problems.revealer);
         vbox.append(&search_box);
         vbox.append(&status_box);
         win.set_child(Some(&vbox));
@@ -296,6 +305,10 @@ impl Editor {
             lsp_status: RefCell::new(Default::default()),
             lsp_dirty: RefCell::new(Default::default()),
             lsp_flush_scheduled: Cell::new(false),
+            lsp_diags: RefCell::new(Default::default()),
+            lsp_check: RefCell::new(None),
+            problems,
+            problems_shown: RefCell::new(Default::default()),
         });
         ed.apply_font();
         ed.apply_theme();
@@ -494,6 +507,7 @@ impl Editor {
         code.append(Some("Vai alla definizione"), Some("win.goto-definition"));
         code.append(Some("Trova utilizzi"), Some("win.find-usages"));
         code.append(Some("Completa"), Some("win.complete"));
+        code.append(Some("Verifica il file"), Some("win.check-file"));
         find.append_section(None, &code);
         bar.append_submenu(Some("_Cerca"), &find);
 
@@ -520,6 +534,12 @@ impl Editor {
         v3.append(Some("Evidenzia riga corrente"), Some("win.highlight-line"));
         v3.append(Some("Tema scuro"), Some("win.dark"));
         view.append_section(None, &v3);
+        let vf = gio::Menu::new();
+        vf.append(Some("Piega blocco"), Some("win.fold"));
+        vf.append(Some("Espandi blocco"), Some("win.unfold"));
+        vf.append(Some("Piega tutte le funzioni"), Some("win.fold-all"));
+        vf.append(Some("Espandi tutto"), Some("win.unfold-all"));
+        view.append_section(None, &vf);
         let v4 = gio::Menu::new();
         v4.append(Some("Pannello file"), Some("win.sidebar"));
         v4.append(Some("Terminale"), Some("win.terminal"));
@@ -698,6 +718,36 @@ impl Editor {
             ed.status.goto.grab_focus();
         });
 
+        act!("fold", ["<Control><Shift>minus", "<Control><Shift>KP_Subtract", "<Control><Shift>bracketleft"], |ed: &Rc<Editor>| {
+            if let Some(d) = ed.foldable_doc()
+                && !d.fold_at_cursor()
+            {
+                ed.message("Nessun blocco da piegare qui");
+            }
+        });
+        act!("unfold", ["<Control><Shift>plus", "<Control><Shift>equal", "<Control><Shift>KP_Add", "<Control><Shift>bracketright"], |ed: &Rc<Editor>| {
+            if let Some(d) = ed.foldable_doc()
+                && !d.unfold_at_cursor()
+            {
+                ed.message("Nessun blocco piegato sulla riga del cursore");
+            }
+        });
+        act!("fold-all", ["<Control><Alt>minus", "<Control><Alt>KP_Subtract"], |ed: &Rc<Editor>| {
+            if let Some(d) = ed.foldable_doc() {
+                let n = d.fold_all();
+                ed.message(&match n {
+                    0 => "Nessun blocco da piegare".to_string(),
+                    1 => "1 blocco piegato".to_string(),
+                    n => format!("{n} blocchi piegati"),
+                });
+            }
+        });
+        act!("unfold-all", ["<Control><Alt>plus", "<Control><Alt>equal", "<Control><Alt>KP_Add"], |ed: &Rc<Editor>| {
+            if let Some(d) = ed.active_doc() {
+                d.unfold_all();
+            }
+        });
+
         act!("split", ["<Control>backslash", "F8"], |ed: &Rc<Editor>| ed.toggle_split());
         {
             let a = gio::SimpleAction::new_stateful("diff", None, &false.to_variant());
@@ -797,6 +847,7 @@ impl Editor {
         self.setup_textsearch_actions();
         self.setup_inspect_actions();
         self.setup_lsp_actions();
+        self.setup_problems_actions();
     }
 
     fn connect_ui(self: &Rc<Self>) {
@@ -1465,13 +1516,24 @@ impl Editor {
         (a, b)
     }
 
+    /// The active document if its language supports folding.
+    fn foldable_doc(&self) -> Option<Rc<Doc>> {
+        let d = self.active_doc()?;
+        if crate::fold::supported(d.lang.get()) {
+            Some(d)
+        } else {
+            self.message(&format!("Piegatura del codice non disponibile per «{}»", d.lang.get().label()));
+            None
+        }
+    }
+
     fn toggle_comment(&self) {
         let Some(d) = self.active_doc() else { return };
         let (mut a, mut b) = Self::line_block(&d);
         let text = d.buffer.text(&a, &b, true);
         let lines: Vec<&str> = text.split('\n').collect();
         // HTML and Vue: the comment syntax of the script or style block.
-        let before = d.buffer.text(&d.buffer.start_iter(), &a, false);
+        let before = d.buffer.text(&d.buffer.start_iter(), &a, true);
         let lang = format::embedded_lang(d.lang.get(), &before);
         let Some(new) = format::toggle_comment(lang, &lines) else {
             self.message("Nessuna sintassi di commento per questo linguaggio");
@@ -1538,7 +1600,7 @@ impl Editor {
         if let Some(d) = self.active_doc()
             && let Some((a, b)) = d.buffer.selection_bounds()
                 && a.line() == b.line() {
-                    self.search.find.set_text(&d.buffer.text(&a, &b, false));
+                    self.search.find.set_text(&d.buffer.text(&a, &b, true));
                 }
         self.search.find.grab_focus();
         self.incremental_search();
@@ -2514,6 +2576,7 @@ impl Editor {
         let (bg, fg, sel) = if dark { ("#1e2127", "#abb2bf", "#3e4f6a") } else { ("#ffffff", "#24292e", "#b6d2f5") };
         let (git_new, git_staged, git_mod, git_conflict) =
             if dark { ("#98c379", "#61afef", "#e5c07b", "#e06c75") } else { ("#22863a", "#0366d6", "#b08800", "#d73a49") };
+        let (p_err, p_warn, p_info) = if dark { ("#ff6b6b", "#e5c07b", "#61afef") } else { ("#d32f2f", "#b08800", "#0366d6") };
         let mut desc = pango::FontDescription::new();
         desc.set_family(&family);
         desc.set_size(size as i32 * pango::SCALE);
@@ -2541,6 +2604,14 @@ impl Editor {
              .sidebar .git-staged label, .changes-list .git-staged label.git-mark {{ color: {git_staged}; }}\n\
              .sidebar .git-modified label, .changes-list .git-modified label.git-mark {{ color: {git_mod}; }}\n\
              .sidebar .git-conflict label, .changes-list .git-conflict label.git-mark, button.git-branch.git-conflict {{ color: {git_conflict}; }}\n\
+             .problems-panel {{ padding: 4px 6px; border-top: 1px solid alpha(currentColor, 0.12); }}\n\
+             .problems-title {{ font-weight: bold; }}\n\
+             .problems-list {{ background: transparent; }}\n\
+             .problems-list row {{ padding: 2px 4px; }}\n\
+             .problem-error {{ color: {p_err}; font-weight: bold; }}\n\
+             .problem-warning {{ color: {p_warn}; font-weight: bold; }}\n\
+             .problem-info {{ color: {p_info}; font-weight: bold; }}\n\
+             .problem-pos {{ font-family: monospace; opacity: 0.75; }}\n\
              paned > separator {{ background: alpha(currentColor, 0.15); }}"
         ));
     }
@@ -2994,6 +3065,19 @@ impl Editor {
                         }
                     }
                 }
+                // fold-line:LINE (from 1): click on the fold handle.
+                "fold-line" => {
+                    if let Some(d) = ed.active_doc() {
+                        d.toggle_fold_line(arg.and_then(|a| a.parse::<i32>().ok()).unwrap_or(1) - 1);
+                    }
+                }
+                "gutter-hover" => {
+                    if let Some(d) = ed.active_doc() {
+                        d.debug_gutter_hover(arg != Some("off"));
+                    }
+                }
+                "problems" => ed.debug_problems(),
+                "problem" => ed.jump_to_problem(arg.and_then(|a| a.parse().ok()).unwrap_or(0)),
                 "inspect" => ed.debug_inspect(),
                 "shot-popup" => ed.debug_shot_popup(arg.unwrap_or("/tmp/popup.png")),
                 "qo-open" => ed.debug_quick_open(arg.and_then(|a| a.parse().ok()).unwrap_or(0)),

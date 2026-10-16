@@ -3,6 +3,7 @@
 
 use crate::config::{self, CacheMeta, Settings};
 use crate::encoding::{self, Encoding, Eol};
+use crate::fold;
 use crate::lang::Lang;
 use crate::lexer::{self, KINDS, State};
 use gtk::prelude::*;
@@ -25,6 +26,12 @@ pub struct Tags {
     pub curline: gtk::TextTag,
     pub bracket: gtk::TextTag,
     pub search: gtk::TextTag,
+    /// Folding: the hidden lines of a collapsed block and its first line.
+    pub fold: gtk::TextTag,
+    pub fold_head: gtk::TextTag,
+    /// Problems found by a language server ("Verifica il file").
+    pub diag_error: gtk::TextTag,
+    pub diag_warning: gtk::TextTag,
     /// Diff view: whole lines added / removed / changed.
     pub diff_add: gtk::TextTag,
     pub diff_del: gtk::TextTag,
@@ -59,9 +66,21 @@ impl Tags {
         table.add(&bracket);
         let search = gtk::TextTag::new(Some("search"));
         table.add(&search);
-        let tags = Tags { table, syntax, curline, bracket, search, diff_add, diff_del, diff_chg, diff_word_del, diff_word_add };
+        let fold = gtk::TextTag::builder().name("fold").invisible(true).build();
+        table.add(&fold);
+        let fold_head = gtk::TextTag::new(Some("fold-head"));
+        table.add(&fold_head);
+        let diag_warning = gtk::TextTag::builder().name("diag-warning").underline(pango::Underline::Error).build();
+        table.add(&diag_warning);
+        let diag_error = gtk::TextTag::builder().name("diag-error").underline(pango::Underline::Error).build();
+        table.add(&diag_error);
+        let tags = Tags { table, syntax, curline, bracket, search, fold, fold_head, diag_error, diag_warning, diff_add, diff_del, diff_chg, diff_word_del, diff_word_add };
         tags.set_palette(dark);
         tags
+    }
+
+    pub fn diag_tags(&self) -> [&gtk::TextTag; 2] {
+        [&self.diag_error, &self.diag_warning]
     }
 
     pub fn diff_tags(&self) -> [&gtk::TextTag; 5] {
@@ -92,6 +111,12 @@ impl Tags {
         self.curline.set_paragraph_background(Some(if dark { "#2c313a" } else { "#f2f4f8" }));
         self.bracket.set_background(Some(if dark { "#3e4451" } else { "#d8e0ec" }));
         self.search.set_background(Some(if dark { "#7a6a1a" } else { "#fff176" }));
+        let rgba = |c: &str| gdk::RGBA::parse(c).ok();
+        self.diag_error.set_underline_rgba(rgba(if dark { "#ff6b6b" } else { "#d32f2f" }).as_ref());
+        self.diag_error.set_background_rgba(rgba(if dark { "rgba(255,107,107,0.18)" } else { "rgba(211,47,47,0.12)" }).as_ref());
+        self.diag_warning.set_underline_rgba(rgba(if dark { "#e5c07b" } else { "#c98a00" }).as_ref());
+        self.diag_warning.set_background_rgba(rgba(if dark { "rgba(229,192,123,0.16)" } else { "rgba(201,138,0,0.12)" }).as_ref());
+        self.fold_head.set_paragraph_background(Some(if dark { "#273349" } else { "#e5ecf9" }));
         let [add, del, chg, wdel, wadd] = if dark {
             ["#1f3a2a", "#45262b", "#2b3550", "#7a2f3a", "#2f6b45"]
         } else {
@@ -122,6 +147,33 @@ impl Shared {
 }
 
 const NO_DIRTY: usize = usize::MAX;
+
+/// A collapsed block: the lines from `start` (included) to `end` (excluded)
+/// are hidden below the header line starting at `head`.
+struct Fold {
+    head: gtk::TextMark,
+    start: gtk::TextMark,
+    end: gtk::TextMark,
+}
+
+/// Foldable blocks computed for one edit generation and language.
+type FoldCache = Option<(u64, Lang, Rc<Vec<fold::Range>>)>;
+
+/// Whether the cursor at `it` would be inside the hidden lines `start..end`.
+fn hides(start: &gtk::TextIter, end: &gtk::TextIter, it: &gtk::TextIter) -> bool {
+    it >= start && (it < end || (it == end && it.is_end() && !it.starts_line()))
+}
+
+/// Apply `tag` to `a..b` unless it already covers the whole range.
+fn ensure_tag(buf: &gtk::TextBuffer, tag: &gtk::TextTag, a: &gtk::TextIter, b: &gtk::TextIter) {
+    if a >= b {
+        return;
+    }
+    let mut t = *a;
+    if !(a.has_tag(tag) && (!t.forward_to_tag_toggle(Some(tag)) || t >= *b)) {
+        buf.apply_tag(tag, a, b);
+    }
+}
 
 /// Incremental highlighter bookkeeping: lexer state at the end of every
 /// line plus the range of lines that must be re-lexed.
@@ -200,6 +252,15 @@ pub struct Doc {
     label_budget: Cell<usize>,
     hl: RefCell<Highlighter>,
     bracket_on: Cell<bool>,
+    /// Collapsed blocks.
+    folds: RefCell<Vec<Fold>>,
+    fold_cache: RefCell<FoldCache>,
+    fold_pending: Cell<bool>,
+    /// Header lines of the collapsed blocks while the document is unloaded.
+    saved_folds: RefCell<Vec<u32>>,
+    gutter_hover: Cell<bool>,
+    /// Times the content was (re)loaded.
+    loads: Cell<u32>,
 }
 
 fn count_digits(mut n: i32) -> i32 {
@@ -297,6 +358,12 @@ impl Doc {
             label_budget: Cell::new(10),
             hl: RefCell::new(Highlighter { states: vec![State::Normal], lo: NO_DIRTY, hi: 0, scheduled: false, enabled: true }),
             bracket_on: Cell::new(false),
+            folds: RefCell::new(Vec::new()),
+            fold_cache: RefCell::new(None),
+            fold_pending: Cell::new(false),
+            saved_folds: RefCell::new(Vec::new()),
+            gutter_hover: Cell::new(false),
+            loads: Cell::new(0),
         });
         doc.connect_signals();
         doc.apply_settings();
@@ -326,6 +393,7 @@ impl Doc {
             if let Some(d) = w.upgrade()
                 && !d.loading.get() {
                     d.edit_gen.set(d.edit_gen.get() + 1);
+                    d.check_folds();
                     d.schedule_highlight();
                     d.update_gutter_width();
                     d.gutter.queue_draw();
@@ -345,6 +413,7 @@ impl Doc {
         self.buffer.connect_cursor_position_notify(move |_| {
             if let Some(d) = w.upgrade()
                 && !d.loading.get() {
+                    d.reveal_cursor();
                     d.update_cursor_decorations();
                     d.gutter.queue_draw();
                 }
@@ -357,6 +426,43 @@ impl Doc {
                 d.draw_gutter(da, cr, width, height);
             }
         });
+        // Fold handles: click to collapse or expand, shown on hover.
+        let click = gtk::GestureClick::new();
+        click.set_button(1);
+        let w = Rc::downgrade(self);
+        click.connect_pressed(move |g, _, _, y| {
+            if let Some(d) = w.upgrade()
+                && let Some(line) = d.gutter_line_at(y)
+                && d.toggle_fold_line(line)
+            {
+                g.set_state(gtk::EventSequenceState::Claimed);
+            }
+        });
+        self.gutter.add_controller(click);
+        let motion = gtk::EventControllerMotion::new();
+        let w = Rc::downgrade(self);
+        motion.connect_enter(move |_, _, y| {
+            if let Some(d) = w.upgrade() {
+                d.gutter_hover.set(true);
+                d.update_gutter_pointer(y);
+                d.gutter.queue_draw();
+            }
+        });
+        let w = Rc::downgrade(self);
+        motion.connect_motion(move |_, _, y| {
+            if let Some(d) = w.upgrade() {
+                d.update_gutter_pointer(y);
+            }
+        });
+        let w = Rc::downgrade(self);
+        motion.connect_leave(move |_| {
+            if let Some(d) = w.upgrade() {
+                d.gutter_hover.set(false);
+                d.gutter.queue_draw();
+            }
+        });
+        self.gutter.add_controller(motion);
+
         let vadj = self.scroller.vadjustment();
         let g = self.gutter.downgrade();
         vadj.connect_value_changed(move |_| {
@@ -388,7 +494,6 @@ impl Doc {
     pub fn apply_settings(&self) {
         let s = self.shared.settings.borrow();
         self.view.set_wrap_mode(if s.wrap { gtk::WrapMode::WordChar } else { gtk::WrapMode::None });
-        self.gutter.set_visible(s.line_numbers);
         let font = self.shared.font.borrow();
         let ctx = self.view.pango_context();
         let layout = pango::Layout::new(&ctx);
@@ -407,20 +512,36 @@ impl Doc {
         self.gutter.queue_draw();
     }
 
+    /// Width of the column of the fold handles (0 if the language cannot
+    /// be folded).
+    fn fold_width(&self) -> i32 {
+        if fold::supported(self.lang.get()) { self.shared.digit_width.get() + 8 } else { 0 }
+    }
+
     fn update_gutter_width(&self) {
-        let digits = count_digits(self.buffer.line_count()).max(2);
-        let w = digits * self.shared.digit_width.get() + 2 * GUTTER_PAD;
+        let numbers = self.shared.settings.borrow().line_numbers;
+        let fw = self.fold_width();
+        self.gutter.set_visible(numbers || fw > 0);
+        let w = if numbers {
+            let digits = count_digits(self.buffer.line_count()).max(2);
+            digits * self.shared.digit_width.get() + 2 * GUTTER_PAD + fw
+        } else {
+            fw + GUTTER_PAD / 2
+        };
         if self.gutter.content_width() != w {
             self.gutter.set_content_width(w);
         }
     }
 
-    fn draw_gutter(&self, da: &gtk::DrawingArea, cr: &gtk::cairo::Context, width: i32, height: i32) {
-        let dark = self.shared.settings.borrow().dark;
-        let (bg, fg, cur) = if dark {
-            ((0.15, 0.16, 0.18), (0.45, 0.47, 0.5), (0.85, 0.86, 0.88))
+    fn draw_gutter(self: &Rc<Self>, da: &gtk::DrawingArea, cr: &gtk::cairo::Context, width: i32, height: i32) {
+        let (dark, numbers) = {
+            let s = self.shared.settings.borrow();
+            (s.dark, s.line_numbers)
+        };
+        let (bg, fg, cur, accent) = if dark {
+            ((0.15, 0.16, 0.18), (0.45, 0.47, 0.5), (0.85, 0.86, 0.88), (0.38, 0.69, 0.94))
         } else {
-            ((0.96, 0.96, 0.97), (0.6, 0.62, 0.65), (0.15, 0.15, 0.2))
+            ((0.96, 0.96, 0.97), (0.6, 0.62, 0.65), (0.15, 0.15, 0.2), (0.16, 0.42, 0.85))
         };
         cr.set_source_rgb(bg.0, bg.1, bg.2);
         cr.rectangle(0.0, 0.0, width as f64, height as f64);
@@ -435,30 +556,385 @@ impl Doc {
         let (mut iter, _) = self.view.line_at_y(rect.y().max(0));
         let cur_line = self.buffer.iter_at_mark(&self.buffer.get_insert()).line();
         let bottom = rect.y() + rect.height();
+        let fw = self.fold_width();
+        // Collapsed blocks: (header line, first visible position after them).
+        let folded: Vec<(i32, gtk::TextIter)> = self
+            .folds
+            .borrow()
+            .iter()
+            .map(|f| (self.buffer.iter_at_mark(&f.head).line(), self.buffer.iter_at_mark(&f.end)))
+            .collect();
+        let foldable = if fw > 0 && self.gutter_hover.get() {
+            let r = self.cached_fold_ranges();
+            if r.is_none() {
+                self.schedule_fold_ranges();
+            }
+            r
+        } else {
+            None
+        };
+        let half = (self.shared.digit_width.get() as f64 * 0.42).max(3.0);
         let mut num = String::with_capacity(12);
         loop {
-            let (y, _) = self.view.line_yrange(&iter);
+            let (y, h) = self.view.line_yrange(&iter);
             if y > bottom {
                 break;
             }
             let (_, wy) = self.view.buffer_to_window_coords(gtk::TextWindowType::Left, 0, y);
             let line = iter.line();
-            num.clear();
-            use std::fmt::Write;
-            let _ = write!(num, "{}", line + 1);
-            layout.set_text(&num);
-            let tw = layout.pixel_size().0;
-            let c = if line == cur_line { cur } else { fg };
-            cr.set_source_rgb(c.0, c.1, c.2);
-            cr.move_to((width - GUTTER_PAD - tw) as f64, wy as f64);
-            pangocairo::functions::show_layout(cr, &layout);
+            if numbers {
+                num.clear();
+                use std::fmt::Write;
+                let _ = write!(num, "{}", line + 1);
+                layout.set_text(&num);
+                let tw = layout.pixel_size().0;
+                let c = if line == cur_line { cur } else { fg };
+                cr.set_source_rgb(c.0, c.1, c.2);
+                cr.move_to((width - GUTTER_PAD - fw - tw) as f64, wy as f64);
+                pangocairo::functions::show_layout(cr, &layout);
+            }
+            let fold_end = folded.iter().filter(|f| f.0 == line).map(|f| f.1).max_by_key(|e| e.offset());
+            if fw > 0 {
+                let (cx, cy) = ((width - fw / 2 - 2) as f64, wy as f64 + h as f64 / 2.0);
+                if fold_end.is_some() {
+                    // Collapsed: a triangle pointing right.
+                    cr.set_source_rgb(accent.0, accent.1, accent.2);
+                    cr.move_to(cx - half * 0.6, cy - half);
+                    cr.line_to(cx + half * 0.8, cy);
+                    cr.line_to(cx - half * 0.6, cy + half);
+                    cr.close_path();
+                    let _ = cr.fill();
+                } else if foldable.as_ref().is_some_and(|r| r.binary_search_by_key(&(line as u32), |r| r.header).is_ok()) {
+                    // Expanded: a triangle pointing down.
+                    cr.set_source_rgb(fg.0, fg.1, fg.2);
+                    cr.move_to(cx - half, cy - half * 0.6);
+                    cr.line_to(cx + half, cy - half * 0.6);
+                    cr.line_to(cx, cy + half * 0.8);
+                    cr.close_path();
+                    let _ = cr.fill();
+                }
+            }
+            // Skip the hidden lines.
+            if let Some(end) = fold_end
+                && end.line() > line
+            {
+                iter = end;
+                if iter.is_end() && !iter.starts_line() {
+                    break;
+                }
+                continue;
+            }
             if !iter.forward_line() {
                 break;
             }
         }
     }
 
+    /// Line whose row in the gutter contains the window coordinate `y`.
+    fn gutter_line_at(&self, y: f64) -> Option<i32> {
+        if !self.loaded.get() {
+            return None;
+        }
+        let (_, by) = self.view.window_to_buffer_coords(gtk::TextWindowType::Left, 0, y as i32);
+        let (it, top) = self.view.line_at_y(by);
+        let (_, h) = self.view.line_yrange(&it);
+        (by >= top && by < top + h).then(|| it.line())
+    }
+
+    fn update_gutter_pointer(&self, y: f64) {
+        let handle = self.gutter_line_at(y).is_some_and(|line| {
+            self.fold_index_at_line(line).is_some()
+                || self.cached_fold_ranges().is_some_and(|r| r.binary_search_by_key(&(line as u32), |r| r.header).is_ok())
+        });
+        self.gutter.set_cursor_from_name(Some(if handle { "pointer" } else { "default" }));
+    }
+
+    // ------------------------------------------------------------- folding
+
+    /// Foldable blocks of the current text.
+    pub fn fold_ranges(&self) -> Rc<Vec<fold::Range>> {
+        if let Some(r) = self.cached_fold_ranges() {
+            return r;
+        }
+        let lang = self.lang.get();
+        let r = if fold::supported(lang) && self.loaded.get() && self.buffer.char_count() < MAX_HIGHLIGHT_BYTES {
+            fold::ranges(lang, &self.text())
+        } else {
+            Vec::new()
+        };
+        let r = Rc::new(r);
+        *self.fold_cache.borrow_mut() = Some((self.edit_gen.get(), lang, r.clone()));
+        r
+    }
+
+    /// The foldable blocks if they are up to date with the text.
+    fn cached_fold_ranges(&self) -> Option<Rc<Vec<fold::Range>>> {
+        match &*self.fold_cache.borrow() {
+            Some((g, l, r)) if *g == self.edit_gen.get() && *l == self.lang.get() => Some(r.clone()),
+            _ => None,
+        }
+    }
+
+    /// Compute the foldable blocks shortly (after a pause in typing) and
+    /// redraw the handles.
+    fn schedule_fold_ranges(self: &Rc<Self>) {
+        if self.fold_pending.replace(true) {
+            return;
+        }
+        let w = Rc::downgrade(self);
+        glib::timeout_add_local_once(Duration::from_millis(150), move || {
+            if let Some(d) = w.upgrade() {
+                d.fold_pending.set(false);
+                d.fold_ranges();
+                d.gutter.queue_draw();
+            }
+        });
+    }
+
+    fn fold_iters(&self, f: &Fold) -> (gtk::TextIter, gtk::TextIter, gtk::TextIter) {
+        let b = &self.buffer;
+        (b.iter_at_mark(&f.head), b.iter_at_mark(&f.start), b.iter_at_mark(&f.end))
+    }
+
+    /// Index of the collapsed block whose header is `line`.
+    fn fold_index_at_line(&self, line: i32) -> Option<usize> {
+        self.folds.borrow().iter().position(|f| self.buffer.iter_at_mark(&f.head).line() == line)
+    }
+
+    /// Collapse a block (the cursor is moved out of it first).
+    fn fold_range(&self, r: fold::Range) {
+        let buf = &self.buffer;
+        if self.fold_index_at_line(r.header as i32).is_some() {
+            return;
+        }
+        let (Some(head), Some(start)) = (buf.iter_at_line(r.header as i32), buf.iter_at_line(r.header as i32 + 1)) else {
+            return;
+        };
+        let end = buf.iter_at_line(r.last as i32 + 1).unwrap_or_else(|| buf.end_iter());
+        if start >= end {
+            return;
+        }
+        let ins = buf.iter_at_mark(&buf.get_insert());
+        let sel = buf.iter_at_mark(&buf.selection_bound());
+        if hides(&start, &end, &ins) || hides(&start, &end, &sel) {
+            let mut it = head;
+            if !it.ends_line() {
+                it.forward_to_line_end();
+            }
+            buf.place_cursor(&it);
+        }
+        let tags = &self.shared.tags;
+        buf.apply_tag(&tags.fold, &start, &end);
+        buf.apply_tag(&tags.fold_head, &head, &start);
+        self.folds.borrow_mut().push(Fold {
+            head: buf.create_mark(None, &head, false),
+            start: buf.create_mark(None, &start, true),
+            end: buf.create_mark(None, &end, true),
+        });
+        self.gutter.queue_draw();
+    }
+
+    /// Remove the tags and marks of a block that is no longer collapsed.
+    fn drop_fold(&self, f: Fold) {
+        let buf = &self.buffer;
+        let tags = &self.shared.tags;
+        let (h, s, e) = self.fold_iters(&f);
+        buf.remove_tag(&tags.fold, &s.min(e), &s.max(e));
+        let mut a = h.min(s);
+        a.set_line_offset(0);
+        let mut b = h.max(s);
+        b.forward_line();
+        buf.remove_tag(&tags.fold_head, &a, &b);
+        for m in [&f.head, &f.start, &f.end] {
+            buf.delete_mark(m);
+        }
+    }
+
+    /// Make sure every collapsed block is hidden and its header marked
+    /// (after an expanded block or an edit removed some of the tags).
+    fn retag_folds(&self) {
+        let buf = &self.buffer;
+        let tags = &self.shared.tags;
+        for f in self.folds.borrow().iter() {
+            let (mut h, s, e) = self.fold_iters(f);
+            h.set_line_offset(0);
+            ensure_tag(buf, &tags.fold, &s, &e);
+            ensure_tag(buf, &tags.fold_head, &h, &s);
+        }
+    }
+
+    fn unfold_index(&self, i: usize) {
+        let f = self.folds.borrow_mut().remove(i);
+        self.drop_fold(f);
+        self.retag_folds();
+        self.gutter.queue_draw();
+    }
+
+    /// Collapse or expand the block starting at `line`; false if there is
+    /// none.
+    pub fn toggle_fold_line(&self, line: i32) -> bool {
+        if let Some(i) = self.fold_index_at_line(line) {
+            self.unfold_index(i);
+            return true;
+        }
+        let ranges = self.fold_ranges();
+        match ranges.binary_search_by_key(&(line as u32), |r| r.header) {
+            Ok(i) => {
+                self.fold_range(ranges[i]);
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
+    /// Collapse the block starting on the cursor line or else the innermost
+    /// one containing it; false if there is none.
+    pub fn fold_at_cursor(&self) -> bool {
+        let line = self.buffer.iter_at_mark(&self.buffer.get_insert()).line() as u32;
+        let ranges = self.fold_ranges();
+        let open = |r: &&fold::Range| self.fold_index_at_line(r.header as i32).is_none();
+        let pick = ranges.iter().filter(open).find(|r| r.header == line).or_else(|| {
+            ranges.iter().filter(open).filter(|r| r.header < line && line <= r.last).max_by_key(|r| r.header)
+        });
+        match pick {
+            Some(r) => {
+                self.fold_range(*r);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Expand the collapsed block on the cursor line; false if there is none.
+    pub fn unfold_at_cursor(&self) -> bool {
+        let line = self.buffer.iter_at_mark(&self.buffer.get_insert()).line();
+        match self.fold_index_at_line(line) {
+            Some(i) => {
+                self.unfold_index(i);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Collapse the body of every definition (functions, classes, …) or,
+    /// in languages without definitions, every outermost block. Returns
+    /// the number of blocks collapsed.
+    pub fn fold_all(&self) -> usize {
+        let ranges = self.fold_ranges();
+        let mut lines: Vec<u32> = crate::symbols::extract(self.lang.get(), &self.text()).iter().map(|s| s.line).collect();
+        lines.sort_unstable();
+        lines.dedup();
+        let mut targets: Vec<fold::Range> = Vec::new();
+        for (k, &d) in lines.iter().enumerate() {
+            // The body opens on the definition line or a few lines below
+            // (long signatures), never past the next definition.
+            let limit = lines.get(k + 1).copied().unwrap_or(u32::MAX).min(d + 6);
+            if let Some(r) = ranges.iter().find(|r| r.block && r.header >= d && r.header < limit) {
+                targets.push(*r);
+            }
+        }
+        if targets.is_empty() {
+            let mut outer_end = None;
+            for r in ranges.iter().filter(|r| r.block) {
+                if outer_end.is_none_or(|e| r.header > e) {
+                    targets.push(*r);
+                    outer_end = Some(r.last);
+                }
+            }
+        }
+        let before = self.folds.borrow().len();
+        for r in targets {
+            self.fold_range(r);
+        }
+        self.folds.borrow().len() - before
+    }
+
+    pub fn unfold_all(&self) {
+        if self.folds.borrow().is_empty() {
+            return;
+        }
+        let folds = std::mem::take(&mut *self.folds.borrow_mut());
+        for f in folds {
+            self.drop_fold(f);
+        }
+        self.gutter.queue_draw();
+    }
+
+    /// After an edit: expand the blocks whose header was changed into
+    /// something else (lines joined or split, header deleted) and hide
+    /// text inserted among hidden lines.
+    fn check_folds(&self) {
+        if self.folds.borrow().is_empty() {
+            return;
+        }
+        let broken: Vec<usize> = self
+            .folds
+            .borrow()
+            .iter()
+            .enumerate()
+            .filter(|(_, f)| {
+                let (h, s, e) = self.fold_iters(f);
+                !(h.line() + 1 == s.line() && s.starts_line() && s < e && (e.starts_line() || e.is_end()))
+            })
+            .map(|(i, _)| i)
+            .collect();
+        for &i in broken.iter().rev() {
+            let f = self.folds.borrow_mut().remove(i);
+            self.drop_fold(f);
+        }
+        self.retag_folds();
+    }
+
+    /// Expand the blocks hiding the cursor (moved by a search, "go to
+    /// line", a jump to a definition, …).
+    fn reveal_cursor(&self) {
+        loop {
+            let ins = self.buffer.iter_at_mark(&self.buffer.get_insert());
+            let hit = self.folds.borrow().iter().position(|f| {
+                let (_, s, e) = self.fold_iters(f);
+                hides(&s, &e, &ins)
+            });
+            match hit {
+                Some(i) => self.unfold_index(i),
+                None => break,
+            }
+        }
+    }
+
+    /// Backspace right after a collapsed block or Delete at the end of its
+    /// header would edit hidden text: expand the block instead.
+    fn unfold_at_edge(&self, backward: bool) -> bool {
+        let buf = &self.buffer;
+        if buf.has_selection() || self.folds.borrow().is_empty() {
+            return false;
+        }
+        let ins = buf.iter_at_mark(&buf.get_insert());
+        let hit = self.folds.borrow().iter().position(|f| {
+            let (h, _, e) = self.fold_iters(f);
+            if backward { e == ins && ins.starts_line() } else { h.line() == ins.line() && ins.ends_line() }
+        });
+        match hit {
+            Some(i) => {
+                self.unfold_index(i);
+                true
+            }
+            None => false,
+        }
+    }
+
+    #[cfg(debug_assertions)]
+    pub fn debug_gutter_hover(&self, on: bool) {
+        self.gutter_hover.set(on);
+        self.gutter.queue_draw();
+    }
+
     // ------------------------------------------------------------- content
+
+    /// Times the content was (re)loaded: marks set before a reload are lost.
+    pub fn loads(&self) -> u32 {
+        self.loads.get()
+    }
 
     pub fn is_loaded(&self) -> bool {
         self.loaded.get()
@@ -496,6 +972,8 @@ impl Doc {
 
     /// Replace the buffer content without recording undo history.
     pub fn set_content(self: &Rc<Self>, text: &str, modified: bool, cursor: i32) {
+        self.unfold_all();
+        self.loads.set(self.loads.get().wrapping_add(1));
         self.loading.set(true);
         self.buffer.begin_irreversible_action();
         self.buffer.set_text(text);
@@ -538,6 +1016,15 @@ impl Doc {
             }
             self.set_content(&text, false, cursor);
         }
+        let saved = std::mem::take(&mut *self.saved_folds.borrow_mut());
+        if !saved.is_empty() {
+            let ranges = self.fold_ranges();
+            for h in saved {
+                if let Ok(i) = ranges.binary_search_by_key(&h, |r| r.header) {
+                    self.fold_range(ranges[i]);
+                }
+            }
+        }
         Ok(())
     }
 
@@ -553,6 +1040,9 @@ impl Doc {
         self.saved_cursor.set(self.cursor_offset());
         self.unloaded_modified.set(self.buffer.is_modified());
         self.unloaded_nonempty.set(self.buffer.char_count() > 0);
+        *self.saved_folds.borrow_mut() = self.folds.borrow().iter().map(|f| self.buffer.iter_at_mark(&f.head).line() as u32).collect();
+        self.unfold_all();
+        *self.fold_cache.borrow_mut() = None;
         self.loading.set(true);
         self.buffer.begin_irreversible_action();
         self.buffer.set_text("");
@@ -673,7 +1163,7 @@ impl Doc {
             let mut end = start;
             // Skip leading blank space, then take a few characters.
             end.forward_chars(256);
-            let head = self.buffer.text(&start, &end, false);
+            let head = self.buffer.text(&start, &end, true);
             self.compute_title(&head)
         } else {
             self.compute_title("")
@@ -730,6 +1220,11 @@ impl Doc {
 
     pub fn set_lang(self: &Rc<Self>, lang: Lang) {
         self.lang.set(lang);
+        if !fold::supported(lang) {
+            self.unfold_all();
+        }
+        self.update_gutter_width();
+        self.gutter.queue_draw();
         self.reset_highlight();
     }
 
@@ -936,7 +1431,8 @@ impl Doc {
                 self.indent_lines(false);
                 true
             }
-            gdk::Key::BackSpace => self.smart_backspace(),
+            gdk::Key::BackSpace => self.unfold_at_edge(true) || self.smart_backspace(),
+            gdk::Key::Delete | gdk::Key::KP_Delete => self.unfold_at_edge(false),
             gdk::Key::braceright | gdk::Key::bracketright | gdk::Key::parenright => self.closing_bracket(key),
             _ => false,
         }
@@ -945,7 +1441,7 @@ impl Doc {
     fn line_prefix(&self, it: &gtk::TextIter) -> String {
         let mut s = *it;
         s.set_line_offset(0);
-        self.buffer.text(&s, it, false).into()
+        self.buffer.text(&s, it, true).into()
     }
 
     fn newline_with_indent(&self) -> bool {

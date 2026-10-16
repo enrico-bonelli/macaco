@@ -81,7 +81,7 @@ impl Editor {
             && let Some((a, b)) = d.buffer.selection_bounds()
             && a.line() == b.line()
         {
-            t.entry.set_text(&d.buffer.text(&a, &b, false));
+            t.entry.set_text(&d.buffer.text(&a, &b, true));
         }
         t.win.present();
         t.entry.grab_focus();

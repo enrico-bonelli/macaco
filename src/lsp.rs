@@ -174,6 +174,74 @@ pub fn parse_locations(v: &Value) -> Vec<Location> {
     }
 }
 
+/// Severity of a diagnostic (LSP values).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Severity {
+    Error = 1,
+    Warning = 2,
+    Info = 3,
+    Hint = 4,
+}
+
+/// A problem reported by a server: range (lines and UTF-16 columns),
+/// severity and message.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Diagnostic {
+    pub line: u32,
+    pub u16col: u32,
+    pub end_line: u32,
+    pub end_u16col: u32,
+    pub severity: Severity,
+    pub message: String,
+    /// Who found it (`rustc`, `clang`, `ts`…) and its code, if given.
+    pub source: String,
+}
+
+/// Parameters of `textDocument/publishDiagnostics`: the document URI and
+/// its problems.
+pub fn parse_diagnostics(params: &Value) -> Option<(String, Vec<Diagnostic>)> {
+    let uri = params.get("uri")?.as_str()?.to_string();
+    let pos = |v: Option<&Value>| -> Option<(u32, u32)> {
+        let v = v?;
+        Some((v.get("line")?.as_u64()? as u32, v.get("character")?.as_u64()? as u32))
+    };
+    let items = params.get("diagnostics").and_then(Value::as_array).map(Vec::as_slice).unwrap_or_default();
+    let diags = items
+        .iter()
+        .filter_map(|d| {
+            let range = d.get("range")?;
+            let (line, u16col) = pos(range.get("start"))?;
+            let (end_line, end_u16col) = pos(range.get("end")).unwrap_or((line, u16col));
+            let severity = match d.get("severity").and_then(Value::as_u64) {
+                Some(2) => Severity::Warning,
+                Some(3) => Severity::Info,
+                Some(4) => Severity::Hint,
+                _ => Severity::Error,
+            };
+            let mut source = d.get("source").and_then(Value::as_str).unwrap_or("").to_string();
+            let code = match d.get("code") {
+                Some(Value::String(c)) => c.clone(),
+                Some(Value::Number(n)) => n.to_string(),
+                _ => String::new(),
+            };
+            if !code.is_empty() {
+                source = if source.is_empty() { code } else { format!("{source} {code}") };
+            }
+            let mut message = d.get("message")?.as_str()?.trim().to_string();
+            // Notes ("expected `i32`, found `&str`", "declared here") on
+            // the following lines.
+            for r in d.get("relatedInformation").and_then(Value::as_array).map(Vec::as_slice).unwrap_or_default() {
+                if let Some(m) = r.get("message").and_then(Value::as_str).map(str::trim).filter(|m| !m.is_empty()) {
+                    message.push('\n');
+                    message.push_str(m);
+                }
+            }
+            Some(Diagnostic { line, u16col, end_line, end_u16col, severity, message, source })
+        })
+        .collect();
+    Some((uri, diags))
+}
+
 /// Text of a snippet (`${1:name}`, `$0`…) without its placeholders.
 pub fn strip_snippet(s: &str) -> String {
     let mut out = String::new();
@@ -506,6 +574,8 @@ impl Client {
                     },
                     "definition": {"linkSupport": true},
                     "references": {},
+                    // Notes ("declared here") stay attached to their problem.
+                    "publishDiagnostics": {"relatedInformation": true},
                 },
                 "workspace": {"configuration": true, "workspaceFolders": true},
                 "window": {"workDoneProgress": true},
@@ -694,5 +764,22 @@ mod tests {
         let locs = parse_locations(&json!([{"targetUri": "file:///tmp/a%20b.rs", "targetSelectionRange": {"start": {"line": 3, "character": 4}, "end": {"line": 3, "character": 8}}}]));
         assert_eq!(locs, vec![Location { path: PathBuf::from("/tmp/a b.rs"), line: 3, u16col: 4 }]);
         assert_eq!(parse_locations(&json!({"uri": "file:///x", "range": {"start": {"line": 1, "character": 2}}})).len(), 1);
+    }
+
+    #[test]
+    fn diagnostics() {
+        let (uri, d) = parse_diagnostics(&json!({"uri": "file:///a.c", "version": 3, "diagnostics": [
+            {"range": {"start": {"line": 2, "character": 4}, "end": {"line": 2, "character": 9}}, "severity": 1,
+             "source": "clang", "code": "expected_semi", "message": "expected ';'\n"},
+            {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 1}}, "severity": 2, "code": 6133, "message": "unused"},
+            {"range": {"start": {"line": 1, "character": 0}}, "message": "no severity",
+             "relatedInformation": [{"location": {"uri": "file:///a.c", "range": {}}, "message": "declared here"}]}
+        ]}))
+        .unwrap();
+        assert_eq!(uri, "file:///a.c");
+        assert_eq!(d.len(), 3);
+        assert_eq!((d[0].severity, d[0].source.as_str(), d[0].message.as_str(), d[0].end_u16col), (Severity::Error, "clang expected_semi", "expected ';'", 9));
+        assert_eq!((d[1].severity, d[1].source.as_str()), (Severity::Warning, "6133"));
+        assert_eq!((d[2].severity, d[2].end_line, d[2].message.as_str()), (Severity::Error, 1, "no severity\ndeclared here"));
     }
 }
