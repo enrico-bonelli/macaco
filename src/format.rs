@@ -503,9 +503,59 @@ pub fn toggle_comment(lang: Lang, lines: &[&str]) -> Option<Vec<String>> {
     )
 }
 
+/// Join `lines` into one: the indentation of the following lines and
+/// trailing spaces become a single space, blank lines disappear. No space
+/// is added inside brackets or before `,` `;` `.`, and consecutive line
+/// comments become one comment.
+pub fn join_lines(lang: Lang, lines: &[&str]) -> String {
+    fn comment_body<'a>(comments: &[&str], t: &'a str) -> Option<&'a str> {
+        comments.iter().find_map(|c| t.strip_prefix(c)).map(str::trim_start)
+    }
+    let comments = lang.spec().line_comment;
+    let mut out = String::new();
+    let mut in_comment = false;
+    for (i, line) in lines.iter().enumerate() {
+        if i == 0 {
+            out.push_str(line.trim_end());
+            in_comment = comment_body(comments, line.trim_start()).is_some();
+            continue;
+        }
+        let mut t = line.trim();
+        if t.is_empty() {
+            continue;
+        }
+        match comment_body(comments, t) {
+            Some(body) if in_comment => t = body,
+            Some(_) => in_comment = true,
+            None => in_comment = false,
+        }
+        if t.is_empty() {
+            continue;
+        }
+        let tight = out.trim().is_empty()
+            || out.ends_with(['(', '['])
+            || t.starts_with([')', ']', ',', ';', '.']);
+        if !tight {
+            out.push(' ');
+        }
+        out.push_str(t);
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn join() {
+        let j = |lang, s: &str| join_lines(lang, &s.split('\n').collect::<Vec<_>>());
+        assert_eq!(j(Lang::Rust, "    let x = foo(\n        a,\n\n        b,  \n    );"), "    let x = foo(a, b,);");
+        assert_eq!(j(Lang::JavaScript, "items\n  .map(f)\n  .filter(g)"), "items.map(f).filter(g)");
+        assert_eq!(j(Lang::Python, "# una frase\n#   che continua\nx = 1"), "# una frase che continua x = 1");
+        assert_eq!(j(Lang::Plain, "Una riga   \ne un'altra\n   e l'ultima"), "Una riga e un'altra e l'ultima");
+        assert_eq!(j(Lang::C, "\n  a"), "a");
+    }
 
     #[test]
     fn braces() {

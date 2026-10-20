@@ -91,6 +91,13 @@ Tutto questo senza rinunciare alla leggerezza: all'avvio occupa circa
 - **Commenta/decommenta** le righe selezionate (`Ctrl+/`), con il commento
   giusto per ogni linguaggio (`//`, `#`, `--`, `<!-- -->`, `/* */`).
 - **Duplica** (`Ctrl+Maiusc+D`) ed **elimina** (`Ctrl+Maiusc+K`) la riga.
+- **Unisci righe** (`Ctrl+J`): mette su una sola riga le righe selezionate
+  o, senza selezione, unisce la riga corrente con la successiva:
+  - il rientro diventa un solo spazio e le righe vuote spariscono;
+  - nessuno spazio dentro le parentesi né prima di `,` `;` `.`, quindi
+    `foo(` / `a,` / `b` / `)` diventa `foo(a, b)`;
+  - righe di commento consecutive diventano un solo commento
+    (`// uno` / `// due` → `// uno due`).
 - **Evidenziazione della parentesi corrispondente.**
 - **Rimuovi spazi finali** (menu Modifica).
 - **A capo automatico** attivabile (`Alt+Z`).
@@ -596,6 +603,7 @@ cartella di lavoro o, se non c'è, del file attivo.
 | `Ctrl+/` | commenta / decommenta |
 | `Ctrl+]` / `Ctrl+[` | aumenta / riduci rientro |
 | `Ctrl+Maiusc+D` / `Ctrl+Maiusc+K` | duplica / elimina riga |
+| `Ctrl+J` | unisci righe |
 | `Ctrl+Maiusc+I` | formatta documento |
 | `Ctrl+Maiusc+-` / `Ctrl+Maiusc++` | piega / espandi il blocco |
 | `Ctrl+Alt+-` / `Ctrl+Alt++` | piega tutte le funzioni / espandi tutto |

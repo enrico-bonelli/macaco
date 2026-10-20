@@ -488,6 +488,7 @@ impl Editor {
         e3.append(Some("Riduci rientro"), Some("win.unindent"));
         e3.append(Some("Duplica riga"), Some("win.duplicate-line"));
         e3.append(Some("Elimina riga"), Some("win.delete-line"));
+        e3.append(Some("Unisci righe"), Some("win.join-lines"));
         e3.append(Some("Formatta documento"), Some("win.format"));
         e3.append(Some("Rimuovi spazi finali"), Some("win.trim"));
         edit.append_section(None, &e3);
@@ -693,6 +694,7 @@ impl Editor {
         });
         act!("duplicate-line", ["<Control><Shift>d"], |ed: &Rc<Editor>| ed.duplicate_line());
         act!("delete-line", ["<Control><Shift>k"], |ed: &Rc<Editor>| ed.delete_line());
+        act!("join-lines", ["<Control>j"], |ed: &Rc<Editor>| ed.join_lines());
         act!("format", ["<Control><Shift>i"], |ed: &Rc<Editor>| ed.format_doc());
         act!("trim", [], |ed: &Rc<Editor>| {
             if let Some(d) = ed.active_doc() {
@@ -1569,6 +1571,45 @@ impl Editor {
         d.buffer.begin_user_action();
         d.buffer.delete(&mut a, &mut b);
         d.buffer.end_user_action();
+    }
+
+    /// Put the selected lines (or the cursor line and the next one) on one
+    /// line.
+    fn join_lines(&self) {
+        let Some(d) = self.active_doc() else { return };
+        let buf = &d.buffer;
+        let selected = buf.has_selection();
+        let (mut a, mut b) = Self::line_block(&d);
+        if a.line() == b.line() {
+            // One line: join it with the next one.
+            if !b.forward_line() {
+                self.message("Non ci sono righe da unire");
+                return;
+            }
+            if !b.ends_line() {
+                b.forward_to_line_end();
+            }
+        }
+        let text = buf.text(&a, &b, true);
+        let lines: Vec<&str> = text.split('\n').collect();
+        let before = buf.text(&buf.start_iter(), &a, true);
+        let lang = format::embedded_lang(d.lang.get(), &before);
+        let joined = format::join_lines(lang, &lines);
+        // Without a selection the cursor goes where the lines met.
+        let meet = lines[0].trim_end().chars().count() as i32;
+        let start = a.offset();
+        buf.begin_user_action();
+        buf.delete(&mut a, &mut b);
+        buf.insert(&mut a, &joined);
+        buf.end_user_action();
+        let s = buf.iter_at_offset(start);
+        if selected {
+            buf.select_range(&s, &a);
+        } else {
+            buf.place_cursor(&buf.iter_at_offset(start + meet));
+        }
+        let n = lines.iter().skip(1).filter(|l| !l.trim().is_empty()).count() + 1;
+        self.message(&if n > 1 { format!("{n} righe unite") } else { "Righe vuote rimosse".to_string() });
     }
 
     fn format_doc(&self) {
@@ -3078,6 +3119,26 @@ impl Editor {
                 }
                 "problems" => ed.debug_problems(),
                 "problem" => ed.jump_to_problem(arg.and_then(|a| a.parse().ok()).unwrap_or(0)),
+                // sel:LINE.COL-LINE.COL[@action] (from 1): the action runs
+                // at once, before the desktop can take the selection away.
+                "sel" => {
+                    if let Some(d) = ed.active_doc() {
+                        let at = |p: &str| {
+                            let (l, c) = p.split_once('.').unwrap_or((p, "1"));
+                            let mut it = d.buffer.iter_at_line(l.parse::<i32>().unwrap_or(1) - 1)?;
+                            it.set_line_offset(c.parse::<i32>().unwrap_or(1) - 1);
+                            Some(it)
+                        };
+                        let (range, action) = arg.unwrap_or("").split_once('@').map_or((arg.unwrap_or(""), None), |(r, a)| (r, Some(a)));
+                        let (a, b) = range.split_once('-').unwrap_or(("1", "1"));
+                        if let (Some(a), Some(b)) = (at(a), at(b)) {
+                            d.buffer.select_range(&a, &b);
+                        }
+                        if let Some(action) = action {
+                            let _ = WidgetExt::activate_action(&ed.win, &format!("win.{action}"), None);
+                        }
+                    }
+                }
                 "inspect" => ed.debug_inspect(),
                 "shot-popup" => ed.debug_shot_popup(arg.unwrap_or("/tmp/popup.png")),
                 "qo-open" => ed.debug_quick_open(arg.and_then(|a| a.parse().ok()).unwrap_or(0)),
