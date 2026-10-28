@@ -25,6 +25,9 @@ const REPO_ACTIONS: &[&str] = &[
     "git-branches",
     "git-merge-abort",
     "git-changes",
+    "git-history",
+    "git-credentials",
+    "git-resolve",
 ];
 
 type AfterSave = Box<dyn FnOnce(&Rc<Editor>)>;
@@ -58,7 +61,7 @@ fn dir_of(path: &Path) -> PathBuf {
     if path.is_dir() { path.to_path_buf() } else { path.parent().map_or_else(|| PathBuf::from("/"), Path::to_path_buf) }
 }
 
-fn dialog_window(parent: &gtk::ApplicationWindow, title: &str) -> gtk::Window {
+fn dialog_window(parent: &impl IsA<gtk::Window>, title: &str) -> gtk::Window {
     let w = gtk::Window::builder().title(title).transient_for(parent).modal(true).default_width(520).build();
     let esc = gtk::EventControllerKey::new();
     let wk = w.downgrade();
@@ -117,11 +120,7 @@ impl Editor {
         add("git-unstage-file", &[], |ed| ed.with_active_file(|ed, p| ed.git_path_action("unstage", &p)));
         add("git-restore-file", &[], |ed| ed.with_active_file(|ed, p| ed.git_path_action("restore", &p)));
         add("git-commit", &["<Control><Alt>c"], |ed| ed.save_all_then(|ed| ed.commit_dialog()));
-        add("git-pull", &[], |ed| {
-            if let Some(root) = ed.git_root() {
-                ed.git_op(&root, os(&["pull"]), "pull", true);
-            }
-        });
+        add("git-pull", &[], |ed| ed.git_pull());
         add("git-push", &[], |ed| ed.git_push());
         add("git-fetch", &[], |ed| {
             if let Some(root) = ed.git_root() {
@@ -135,6 +134,9 @@ impl Editor {
             let folder = ed.workdir.borrow().clone().filter(|w| w.starts_with(&st.root)).unwrap_or_else(|| st.root.clone());
             ed.changes_dialog(folder);
         });
+        add("git-history", &["<Control><Alt>h"], |ed| ed.active_file_history());
+        add("git-credentials", &[], |ed| ed.credentials_dialog());
+        add("git-resolve", &[], |ed| ed.resolve_active_conflict());
         add("git-merge-abort", &[], |ed| {
             if let Some(root) = ed.git_root() {
                 ed.git_op(&root, os(&["merge", "--abort"]), "merge --abort", true);
@@ -154,14 +156,17 @@ impl Editor {
         let s2 = gio::Menu::new();
         s2.append(Some("Modifiche, commit e push della cartella di lavoro…"), Some("win.git-changes"));
         s2.append(Some("Commit…"), Some("win.git-commit"));
+        s2.append(Some("Cronologia del file corrente…"), Some("win.git-history"));
         m.append_section(None, &s2);
         let s3 = gio::Menu::new();
         s3.append(Some("Pull"), Some("win.git-pull"));
         s3.append(Some("Push"), Some("win.git-push"));
         s3.append(Some("Fetch"), Some("win.git-fetch"));
+        s3.append(Some("Credenziali e chiavi SSH…"), Some("win.git-credentials"));
         m.append_section(None, &s3);
         let s4 = gio::Menu::new();
         s4.append(Some("Rami e merge…"), Some("win.git-branches"));
+        s4.append(Some("Risolvi il conflitto del file corrente…"), Some("win.git-resolve"));
         s4.append(Some("Interrompi il merge"), Some("win.git-merge-abort"));
         m.append_section(None, &s4);
         let s5 = gio::Menu::new();
@@ -320,18 +325,23 @@ impl Editor {
         self.message(&format!("git {what}…"));
         let ed = self.clone();
         let what = what.to_string();
+        let dir2 = dir.to_path_buf();
+        // Network commands: questions of git and ssh go to a dialog.
+        self.prepare_git(dir, args, move |args, env| {
         let argv: Vec<&OsStr> = args.iter().map(|a| a.as_os_str()).collect();
-        git::run(dir, &argv, move |out| {
+        git::run_with(&dir2, &argv, &env, None, move |out| {
             ed.git_busy.set(false);
             if out.ok {
                 let s = out.summary();
                 ed.message(&if s.is_empty() { format!("git {what}: fatto") } else { format!("git {what}: {s}") });
+            } else if ed.askpass_was_cancelled() {
+                ed.message(&format!("git {what}: annullato"));
             } else {
                 let mut detail = tail(&out.text(), 25);
                 if needs_credentials(&out.stderr) {
                     detail.push_str(
-                        "\n\nGit ha bisogno di una password o di una passphrase: usa ssh-agent o un \
-                         credential helper, oppure esegui il comando nel terminale integrato (F12).",
+                        "\n\nAccesso non riuscito: controlla nome utente, password o token, oppure la chiave \
+                         SSH del repository in Git → Credenziali e chiavi SSH.",
                     );
                 }
                 ed.message(&format!("git {what}: errore"));
@@ -342,6 +352,7 @@ impl Editor {
             }
             ed.git_refresh();
             then(&ed, out.ok);
+        });
         });
     }
 
@@ -397,29 +408,182 @@ impl Editor {
             }
             "refresh" => self.git_refresh(),
             "changes" => self.changes_dialog(dir),
+            "resolve" => self.resolve_conflict(path),
             _ => {}
         }
     }
 
+    /// Pull. When the current branch is linked to no remote branch, the
+    /// branches of the server are fetched and the user chooses one.
+    fn git_pull(self: &Rc<Self>) {
+        let Some(st) = self.git_status() else {
+            self.message("Nessun repository git");
+            return;
+        };
+        if st.upstream.is_some() {
+            self.git_op(&st.root, os(&["pull"]), "pull", true);
+            return;
+        }
+        let Some(branch) = st.branch.clone() else {
+            self.message("Non sei su un ramo (HEAD staccato): passa a un ramo per fare pull");
+            return;
+        };
+        let root = st.root.clone();
+        let ed = self.clone();
+        git::run_str(&root.clone(), &["remote"], move |out| {
+            if String::from_utf8_lossy(&out.stdout).trim().is_empty() {
+                ed.error_dialog("git pull non riuscito", "Nessun repository remoto configurato (git remote add …).");
+                return;
+            }
+            // The branches on the server are needed: fetch them first.
+            ed.git_op_then(&root.clone(), os(&["fetch", "--all", "--prune"]), "fetch", false, move |ed, ok| {
+                if !ok {
+                    return;
+                }
+                let (ed, root2) = (ed.clone(), root.clone());
+                git::run_str(&root, &["for-each-ref", "--format=%(refname:short)", "refs/remotes"], move |out| {
+                    let refs: Vec<String> = String::from_utf8_lossy(&out.stdout)
+                        .lines()
+                        .filter(|l| l.contains('/') && !l.ends_with("/HEAD"))
+                        .map(str::to_string)
+                        .collect();
+                    if refs.is_empty() {
+                        ed.error_dialog("git pull", "Sul server non c'è ancora nessun ramo: pubblica prima il tuo con Push.");
+                        return;
+                    }
+                    ed.upstream_dialog(true, root2, branch, refs);
+                });
+            });
+        });
+    }
+
+    /// Push. The first time for a branch, the user chooses the remote and
+    /// the name of the branch there.
     fn git_push(self: &Rc<Self>) {
-        let Some(st) = self.git_status() else { return };
+        let Some(st) = self.git_status() else {
+            self.message("Nessun repository git");
+            return;
+        };
         if st.upstream.is_some() || st.branch.is_none() {
             self.git_op(&st.root, os(&["push"]), "push", false);
             return;
         }
-        // First push of the branch: track it on the first remote
-        // (preferably "origin").
+        let branch = st.branch.clone().unwrap_or_default();
         let ed = self.clone();
         let root = st.root.clone();
-        git::run_str(&root, &["remote"], move |out| {
-            let text = String::from_utf8_lossy(&out.stdout).into_owned();
-            let remotes: Vec<&str> = text.lines().filter(|l| !l.is_empty()).collect();
-            let Some(remote) = remotes.iter().find(|r| **r == "origin").or(remotes.first()) else {
+        git::run_str(&root.clone(), &["remote"], move |out| {
+            let remotes: Vec<String> = String::from_utf8_lossy(&out.stdout).lines().filter(|l| !l.is_empty()).map(str::to_string).collect();
+            if remotes.is_empty() {
                 ed.error_dialog("git push non riuscito", "Nessun repository remoto configurato (git remote add …).");
                 return;
-            };
-            ed.git_op(&st.root, os(&["push", "-u", remote, "HEAD"]), "push", false);
+            }
+            ed.upstream_dialog(false, root, branch, remotes);
         });
+    }
+
+    /// Which remote branch to pull from (`choices`: "remote/branch") or
+    /// which remote to push to (`choices`: remotes), and whether to link
+    /// the current branch to it for the next times.
+    fn upstream_dialog(self: &Rc<Self>, pull: bool, root: PathBuf, branch: String, choices: Vec<String>) {
+        // The same name on the server, preferably on "origin".
+        let default = if pull {
+            let same = |r: &str| r.split_once('/').is_some_and(|(_, b)| b == branch);
+            choices
+                .iter()
+                .position(|r| same(r) && r.starts_with("origin/"))
+                .or_else(|| choices.iter().position(|r| same(r)))
+                .or_else(|| choices.iter().position(|r| r == "origin/main" || r == "origin/master"))
+                .unwrap_or(0)
+        } else {
+            choices.iter().position(|r| r == "origin").unwrap_or(0)
+        };
+        let parent = gtk::Window::list_toplevels()
+            .into_iter()
+            .filter_map(|w| w.downcast::<gtk::Window>().ok())
+            .find(|w| w.is_active())
+            .unwrap_or_else(|| self.win.clone().upcast());
+        let title = if pull { "Pull: da quale ramo remoto?" } else { "Push: su quale ramo remoto?" };
+        let win = dialog_window(&parent, title);
+        let b = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(10).margin_top(14).margin_bottom(14).margin_start(14).margin_end(14).build();
+        let text = if pull {
+            format!("Il ramo locale «{branch}» non è collegato a nessun ramo del server. Scegli quello da cui scaricare e unire le modifiche.")
+        } else {
+            format!("Il ramo locale «{branch}» non è ancora sul server. Scegli dove pubblicarlo.")
+        };
+        let l = gtk::Label::new(Some(&text));
+        l.set_wrap(true);
+        l.set_xalign(0.0);
+        l.set_max_width_chars(60);
+        b.append(&l);
+        let items: Vec<&str> = choices.iter().map(String::as_str).collect();
+        let drop = gtk::DropDown::from_strings(&items);
+        drop.set_selected(default as u32);
+        let grid = gtk::Grid::builder().row_spacing(6).column_spacing(10).build();
+        let label = |t: &str| {
+            let l = gtk::Label::new(Some(t));
+            l.set_xalign(0.0);
+            l
+        };
+        grid.attach(&label(if pull { "Ramo remoto" } else { "Repository remoto" }), 0, 0, 1, 1);
+        grid.attach(&drop, 1, 0, 1, 1);
+        let name = gtk::Entry::builder().text(&branch).hexpand(true).activates_default(true).build();
+        if !pull {
+            grid.attach(&label("Nome del ramo sul server"), 0, 1, 1, 1);
+            grid.attach(&name, 1, 1, 1, 1);
+        }
+        b.append(&grid);
+        let link = gtk::CheckButton::with_label(&format!("Collega «{branch}» a questo ramo per i prossimi pull e push"));
+        link.set_active(true);
+        b.append(&link);
+        let buttons = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        buttons.set_halign(gtk::Align::End);
+        let cancel = gtk::Button::with_label("Annulla");
+        let ok = gtk::Button::with_label(if pull { "Pull" } else { "Push" });
+        ok.add_css_class("suggested-action");
+        buttons.append(&cancel);
+        buttons.append(&ok);
+        b.append(&buttons);
+        win.set_child(Some(&b));
+        win.set_default_widget(Some(&ok));
+        let w = win.downgrade();
+        cancel.connect_clicked(move |_| {
+            if let Some(w) = w.upgrade() {
+                w.close();
+            }
+        });
+        let (ed, w) = (self.clone(), win.downgrade());
+        ok.connect_clicked(move |_| {
+            let Some(choice) = choices.get(drop.selected() as usize).cloned() else { return };
+            let linked = link.is_active();
+            if let Some(w) = w.upgrade() {
+                w.close();
+            }
+            if pull {
+                if linked {
+                    let r = root.clone();
+                    ed.git_op_then(&root, os(&["branch", "--set-upstream-to", &choice]), "branch --set-upstream-to", false, move |ed, ok| {
+                        if ok {
+                            ed.git_op(&r, os(&["pull"]), "pull", true);
+                        }
+                    });
+                } else {
+                    let (remote, rb) = choice.split_once('/').unwrap_or((&choice, ""));
+                    ed.git_op(&root, os(&["pull", remote, rb]), "pull", true);
+                }
+            } else {
+                let target = name.text().trim().to_string();
+                let target = if target.is_empty() { branch.clone() } else { target };
+                let refspec = format!("HEAD:{target}");
+                let mut args = vec!["push"];
+                if linked {
+                    args.push("-u");
+                }
+                args.push(&choice);
+                args.push(&refspec);
+                ed.git_op(&root, os(&args), "push", false);
+            }
+        });
+        win.present();
     }
 
     /// Reads again the open documents changed on disk; documents with
@@ -951,7 +1115,7 @@ impl Changes {
         c.view.set_factory(Some(&c.factory()));
 
         let group = gio::SimpleActionGroup::new();
-        for name in ["exclude", "restore", "open"] {
+        for name in ["exclude", "restore", "open", "resolve"] {
             let a = gio::SimpleAction::new(name, Some(glib::VariantTy::STRING));
             let w = Rc::downgrade(&c);
             a.connect_activate(move |a, v| {
@@ -959,6 +1123,11 @@ impl Changes {
                 match a.name().as_str() {
                     "exclude" => c.set_excluded(&arg, true),
                     "restore" => c.set_excluded(&arg, false),
+                    "resolve" => {
+                        if let Some(ed) = c.ed.upgrade() {
+                            ed.resolve_conflict(Path::new(&arg));
+                        }
+                    }
                     _ => {
                         if let Some(ed) = c.ed.upgrade() {
                             ed.open_path(Path::new(&arg));
@@ -1073,10 +1242,8 @@ impl Changes {
         c.msg.add_controller(keys);
         let w = Rc::downgrade(&c);
         pull.connect_clicked(move |_| {
-            if let Some(ed) = w.upgrade().and_then(|c| c.ed.upgrade())
-                && let Some(root) = ed.git_root()
-            {
-                ed.git_op(&root, os(&["pull"]), "pull", true);
+            if let Some(ed) = w.upgrade().and_then(|c| c.ed.upgrade()) {
+                ed.git_pull();
             }
         });
         let w = Rc::downgrade(&c);
@@ -1338,6 +1505,9 @@ impl Changes {
         };
         if path.is_file() {
             m.append_item(&item("Apri", "chg.open", &path.to_string_lossy()));
+        }
+        if self.items.borrow().get(rel).is_some_and(|i| i.entry.mark() == Mark::Conflict) {
+            m.append_item(&item("Risolvi il conflitto…", "chg.resolve", &path.to_string_lossy()));
         }
         let s = gio::Menu::new();
         if excluded {

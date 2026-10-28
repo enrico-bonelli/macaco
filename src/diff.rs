@@ -72,6 +72,16 @@ impl DiffResult {
     }
 }
 
+/// Unified diff (`git diff` style, 3 lines of context) from `old` to `new`;
+/// empty if the texts are equal.
+pub fn unified(old: &str, new: &str, old_name: &str, new_name: &str) -> String {
+    let diff = TextDiff::configure().algorithm(Algorithm::Histogram).timeout(Duration::from_millis(500)).diff_lines(old, new);
+    if diff.ratio() == 1.0 {
+        return String::new();
+    }
+    diff.unified_diff().context_radius(3).header(old_name, new_name).to_string()
+}
+
 /// Compare two texts line by line.
 pub fn compute(old: &str, new: &str) -> DiffResult {
     let old_lines: Vec<&str> = old.split('\n').collect();
@@ -112,6 +122,126 @@ pub fn compute(old: &str, new: &str) -> DiffResult {
     res
 }
 
+/// A region of a three-way merge, as line ranges of the three texts.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MergeChunk {
+    pub kind: MergeKind,
+    pub base: Range<usize>,
+    pub ours: Range<usize>,
+    pub theirs: Range<usize>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MergeKind {
+    /// Unchanged on both sides.
+    Same,
+    /// Changed only in ours / only in theirs: that version is taken.
+    Ours,
+    Theirs,
+    /// The same change on both sides.
+    Both,
+    /// Different changes to the same lines: to be resolved.
+    Conflict,
+}
+
+/// Result of `merge3`: the regions and the merged text, where conflicts
+/// keep the common ancestor's lines.
+pub struct Merge3 {
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub chunks: Vec<MergeChunk>,
+    pub text: String,
+    pub conflicts: usize,
+}
+
+/// Changed regions of `side` with respect to `base`: (base lines, side lines).
+fn changes(base: &[&str], side: &[&str]) -> Vec<(Range<usize>, Range<usize>)> {
+    TextDiff::configure()
+        .algorithm(Algorithm::Histogram)
+        .timeout(Duration::from_millis(500))
+        .diff_slices(base, side)
+        .ops()
+        .iter()
+        .map(|op| op.as_tag_tuple())
+        .filter(|(tag, _, _)| *tag != DiffTag::Equal)
+        .map(|(_, o, n)| (o, n))
+        .collect()
+}
+
+/// Three-way merge of the changes made to `base` in `ours` and in
+/// `theirs` (like `git merge`): a change made on one side only is taken,
+/// overlapping or adjacent different changes are conflicts.
+pub fn merge3(base: &str, ours: &str, theirs: &str) -> Merge3 {
+    let b: Vec<&str> = base.split_inclusive('\n').collect();
+    let o: Vec<&str> = ours.split_inclusive('\n').collect();
+    let t: Vec<&str> = theirs.split_inclusive('\n').collect();
+    // (base range, side range, is ours)
+    let mut all: Vec<(Range<usize>, Range<usize>, bool)> = changes(&b, &o).into_iter().map(|(x, y)| (x, y, true)).collect();
+    all.extend(changes(&b, &t).into_iter().map(|(x, y)| (x, y, false)));
+    all.sort_by_key(|(x, _, ours)| (x.start, x.end, !ours));
+
+    let mut chunks = Vec::new();
+    let (mut bp, mut op, mut tp) = (0, 0, 0);
+    let mut i = 0;
+    while i < all.len() {
+        // A cluster: changes that overlap or touch in the base.
+        let (bs, mut be) = (all[i].0.start, all[i].0.end);
+        let mut j = i + 1;
+        while j < all.len() && all[j].0.start <= be {
+            be = be.max(all[j].0.end);
+            j += 1;
+        }
+        let cluster = &all[i..j];
+        if bs > bp {
+            let n = bs - bp;
+            chunks.push(MergeChunk { kind: MergeKind::Same, base: bp..bs, ours: op..op + n, theirs: tp..tp + n });
+            op += n;
+            tp += n;
+        }
+        // The range of a side covering the base span bs..be.
+        let span = |mine: bool, pos: usize| -> Option<Range<usize>> {
+            let h: Vec<_> = cluster.iter().filter(|c| c.2 == mine).collect();
+            let (first, last) = (h.first()?, h.last()?);
+            let start = first.1.start - (first.0.start - bs);
+            let end = last.1.end + (be - last.0.end);
+            debug_assert_eq!(start, pos);
+            Some(start..end)
+        };
+        let ours_r = span(true, op);
+        let theirs_r = span(false, tp);
+        let kind = match (&ours_r, &theirs_r) {
+            (Some(_), None) => MergeKind::Ours,
+            (None, Some(_)) => MergeKind::Theirs,
+            (Some(x), Some(y)) if o[x.clone()] == t[y.clone()] => MergeKind::Both,
+            _ => MergeKind::Conflict,
+        };
+        let ours_r = ours_r.unwrap_or(op..op + (be - bs));
+        let theirs_r = theirs_r.unwrap_or(tp..tp + (be - bs));
+        op = ours_r.end;
+        tp = theirs_r.end;
+        chunks.push(MergeChunk { kind, base: bs..be, ours: ours_r, theirs: theirs_r });
+        bp = be;
+        i = j;
+    }
+    if bp < b.len() {
+        let n = b.len() - bp;
+        chunks.push(MergeChunk { kind: MergeKind::Same, base: bp..b.len(), ours: op..op + n, theirs: tp..tp + n });
+    }
+    let mut text = String::with_capacity(base.len().max(ours.len()));
+    let mut conflicts = 0;
+    for c in &chunks {
+        let lines = match c.kind {
+            MergeKind::Same | MergeKind::Conflict => &b[c.base.clone()],
+            MergeKind::Ours | MergeKind::Both => &o[c.ours.clone()],
+            MergeKind::Theirs => &t[c.theirs.clone()],
+        };
+        conflicts += (c.kind == MergeKind::Conflict) as usize;
+        for l in lines {
+            text.push_str(l);
+        }
+    }
+    Merge3 { chunks, text, conflicts }
+}
+
 fn word_diff(a: &str, b: &str, la: usize, lb: usize, res: &mut DiffResult) {
     if a.len() > MAX_WORD_LINE || b.len() > MAX_WORD_LINE {
         return;
@@ -148,6 +278,14 @@ fn word_diff(a: &str, b: &str, la: usize, lb: usize, res: &mut DiffResult) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn unified_text() {
+        assert_eq!(super::unified("a\nb\n", "a\nb\n", "x", "y"), "");
+        let u = super::unified("a\nb\nc\n", "a\nB\nc\n", "vecchio", "attuale");
+        assert!(u.starts_with("--- vecchio\n+++ attuale\n@@ -1,3 +1,3 @@"), "{u}");
+        assert!(u.contains("-b\n+B\n"));
+    }
+
     use super::*;
 
     #[test]
@@ -170,6 +308,31 @@ mod tests {
         assert_eq!(r.map_line(4, true), 3);
         assert_eq!(r.map_line(3, false), 4);
         assert_eq!(r.map_line(2, true), 2);
+    }
+
+    #[test]
+    fn three_way() {
+        let base = "a\nb\nc\nd\ne\nf\ng\n";
+        // Separate changes are both taken.
+        let m = merge3(base, "a\nB\nc\nd\ne\nf\ng\n", "a\nb\nc\nd\ne\nF\ng\n");
+        assert_eq!((m.text.as_str(), m.conflicts), ("a\nB\nc\nd\ne\nF\ng\n", 0));
+        // The same change twice is not a conflict.
+        let m = merge3(base, "a\nX\nc\nd\ne\nf\ng\n", "a\nX\nc\nd\ne\nf\ng\n");
+        assert_eq!(m.conflicts, 0);
+        assert!(m.chunks.iter().any(|c| c.kind == MergeKind::Both));
+        // Different changes to the same line: the base line is kept.
+        let m = merge3(base, "a\nb\nOURS\nd\ne\nf\ng\n", "a\nb\nTHEIRS\nTHEIRS2\nd\ne\nf\ng\n");
+        assert_eq!((m.text.as_str(), m.conflicts), (base, 1));
+        let c = m.chunks.iter().find(|c| c.kind == MergeKind::Conflict).unwrap();
+        assert_eq!((c.base.clone(), c.ours.clone(), c.theirs.clone()), (2..3, 2..3, 2..4));
+        // Lines added at the end on both sides, differently.
+        let m = merge3("x\n", "x\nuno\n", "x\ndue\n");
+        assert_eq!((m.text.as_str(), m.conflicts), ("x\n", 1));
+        // Ranges of every region line up on the three texts.
+        let m = merge3(base, "a\nb\nc\nnuova\nd\ne\ng\n", "z\na\nb\nc\nd\ne\nf\ng\n");
+        assert_eq!((m.text.as_str(), m.conflicts), ("z\na\nb\nc\nnuova\nd\ne\ng\n", 0));
+        let last = m.chunks.last().unwrap();
+        assert_eq!((last.base.end, last.ours.end, last.theirs.end), (7, 7, 8));
     }
 
     #[test]

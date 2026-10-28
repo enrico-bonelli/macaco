@@ -64,6 +64,9 @@ pub struct Settings {
     pub cursor_blink: bool,
     /// Completion list while typing (Ctrl+Space always works).
     pub autocomplete: bool,
+    /// Git over HTTPS: remember user names and passwords in the system
+    /// keyring (when no credential helper of the user is configured).
+    pub git_keyring: bool,
     pub sidebar: bool,
     pub sidebar_width: i32,
     pub width: i32,
@@ -86,6 +89,7 @@ impl Default for Settings {
             bell: true,
             cursor_blink: false,
             autocomplete: true,
+            git_keyring: true,
             sidebar: false,
             sidebar_width: 240,
             width: 1000,
@@ -124,6 +128,7 @@ impl Settings {
                 "bell" => s.bell = flag(v),
                 "cursor_blink" => s.cursor_blink = flag(v),
                 "autocomplete" => s.autocomplete = flag(v),
+                "git_keyring" => s.git_keyring = flag(v),
                 "sidebar" => s.sidebar = flag(v),
                 "sidebar_width" => s.sidebar_width = v.parse().unwrap_or(s.sidebar_width).max(120),
                 "width" => s.width = v.parse().unwrap_or(s.width).max(300),
@@ -137,7 +142,7 @@ impl Settings {
 
     pub fn save(&self) {
         let text = format!(
-            "# macaco settings\nfont_family={}\nfont_size={}\ntab_width={}\ninsert_spaces={}\nwrap={}\nline_numbers={}\nhighlight_line={}\ndark={}\nbell={}\ncursor_blink={}\nautocomplete={}\nsidebar={}\nsidebar_width={}\nwidth={}\nheight={}\n# renderer: cairo (lightest) | gl | vulkan | auto\nrenderer={}\n",
+            "# macaco settings\nfont_family={}\nfont_size={}\ntab_width={}\ninsert_spaces={}\nwrap={}\nline_numbers={}\nhighlight_line={}\ndark={}\nbell={}\ncursor_blink={}\nautocomplete={}\ngit_keyring={}\nsidebar={}\nsidebar_width={}\nwidth={}\nheight={}\n# renderer: cairo (lightest) | gl | vulkan | auto\nrenderer={}\n",
             self.font_family,
             self.font_size,
             self.tab_width,
@@ -149,6 +154,7 @@ impl Settings {
             self.bell,
             self.cursor_blink,
             self.autocomplete,
+            self.git_keyring,
             self.sidebar,
             self.sidebar_width,
             self.width,

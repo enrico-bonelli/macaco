@@ -20,8 +20,11 @@ use std::rc::{Rc, Weak};
 use std::time::{Duration, Instant};
 
 mod bookmarks;
+mod credentials;
 mod external;
 mod gitui;
+mod history;
+mod merge;
 mod inspect;
 mod lspui;
 mod problems;
@@ -146,6 +149,14 @@ pub struct Editor {
     /// Files changed by other programs: bar and documents waiting for a check.
     disk_bar: external::DiskBar,
     disk_pending: RefCell<std::collections::HashSet<String>>,
+    /// Open "history of a file" window.
+    history: RefCell<Option<Rc<history::History>>>,
+    /// Socket answering the password questions of git and ssh (started at
+    /// the first push, pull or fetch) and whether the user cancelled one.
+    askpass: RefCell<Option<crate::askpass::Server>>,
+    askpass_cancelled: Cell<bool>,
+    /// Open compare-and-merge windows.
+    merges: RefCell<Vec<Rc<merge::Merge>>>,
 }
 
 /// Shortcuts that keep working while the terminal has the focus; all the
@@ -350,6 +361,10 @@ impl Editor {
             problems_shown: RefCell::new(Default::default()),
             disk_bar,
             disk_pending: RefCell::new(Default::default()),
+            history: RefCell::new(None),
+            askpass: RefCell::new(None),
+            askpass_cancelled: Cell::new(false),
+            merges: RefCell::new(Vec::new()),
         });
         ed.apply_font();
         ed.apply_theme();
@@ -562,6 +577,8 @@ impl Editor {
         view.append_section(None, &v1);
         let vd = gio::Menu::new();
         vd.append(Some("Confronta schede affiancate (diff)"), Some("win.diff"));
+        vd.append(Some("Confronta e unisci (tre colonne)…"), Some("win.merge"));
+        vd.append(Some("Confronta il file corrente con…"), Some("win.merge-with-file"));
         vd.append(Some("Differenza successiva"), Some("win.diff-next"));
         vd.append(Some("Differenza precedente"), Some("win.diff-prev"));
         view.append_section(None, &vd);
@@ -817,6 +834,8 @@ impl Editor {
         }
         act!("open-folder", ["<Control><Shift>o"], |ed: &Rc<Editor>| ed.open_folder_dialog());
         act!("close-folder", [], |ed: &Rc<Editor>| ed.close_workdir());
+        act!("merge", ["<Control>F9"], |ed: &Rc<Editor>| ed.merge_tabs());
+        act!("merge-with-file", [], |ed: &Rc<Editor>| ed.merge_with_file());
         act!("diff-next", ["<Alt>Down"], |ed: &Rc<Editor>| ed.diff_jump(true));
         act!("diff-prev", ["<Alt>Up"], |ed: &Rc<Editor>| ed.diff_jump(false));
         act!("move-tab", ["<Control><Shift>m"], |ed: &Rc<Editor>| {
@@ -952,7 +971,30 @@ impl Editor {
         self.win.connect_maximized_notify(move |_| ed.schedule_layout());
 
         let ed = self.clone();
-        self.win.connect_close_request(move |_| {
+        self.win.connect_close_request(move |win| {
+            // Tabs are kept in the session, the result of a merge is not.
+            let pending = ed.merges.borrow().iter().find(|m| m.is_modified()).cloned();
+            if let Some(m) = pending {
+                m.win.present();
+                let dialog = gtk::AlertDialog::builder()
+                    .modal(true)
+                    .message("Il risultato di un confronto non è salvato")
+                    .detail("Uscendo, le scelte fatte nella finestra di confronto e unione andranno perse.")
+                    .buttons(["Annulla", "Esci comunque"])
+                    .cancel_button(0)
+                    .default_button(0)
+                    .build();
+                let (ed2, win2) = (ed.clone(), win.clone());
+                dialog.choose(Some(&m.win), None::<&gio::Cancellable>, move |res| {
+                    if res == Ok(1) {
+                        for m in ed2.merges.borrow().iter() {
+                            m.discard();
+                        }
+                        win2.close();
+                    }
+                });
+                return glib::Propagation::Stop;
+            }
             ed.shutdown();
             glib::Propagation::Proceed
         });
@@ -2332,6 +2374,7 @@ impl Editor {
             let w5 = w.clone();
             let w6 = w.clone();
             let w7 = w.clone();
+            let w8 = w.clone();
             let s = Sidebar::new(sidebar::Handlers {
                 open: Box::new(move |p| {
                     if let Some(ed) = w.upgrade() {
@@ -2369,6 +2412,11 @@ impl Editor {
                 bookmark: Box::new(move |p| {
                     if let Some(ed) = w7.upgrade() {
                         ed.add_bookmark(p);
+                    }
+                }),
+                history: Box::new(move |p| {
+                    if let Some(ed) = w8.upgrade() {
+                        ed.file_history(p);
                     }
                 }),
             });
@@ -3058,6 +3106,8 @@ impl Editor {
         for c in self.lsp_clients.borrow_mut().drain(..) {
             c.kill();
         }
+        // Removes the socket of the password questions.
+        drop(self.askpass.borrow_mut().take());
         let mut s = self.shared.settings.borrow_mut();
         if self.sidebar_visible() {
             s.sidebar_width = self.hpaned.position();
@@ -3090,6 +3140,9 @@ impl Editor {
             let i = idx.get();
             idx.set(i + 1);
             let Some(step) = steps.get(i) else {
+                for m in ed.merges.borrow().iter() {
+                    m.discard();
+                }
                 ed.win.close();
                 return glib::ControlFlow::Break;
             };
@@ -3206,6 +3259,28 @@ impl Editor {
                     }
                 }
                 "problems" => ed.debug_problems(),
+                // merge-take:LINK.BLOCK[+] (+: after the block), merge-dump, merge-save:N
+                "merge-take" | "merge-dump" | "merge-save" => {
+                    let m = ed.merges.borrow().last().cloned();
+                    if let Some(m) = m {
+                        let a = arg.unwrap_or("");
+                        match name {
+                            "merge-take" => {
+                                let after = a.ends_with('+');
+                                let (k, i) = a.trim_end_matches('+').split_once('.').unwrap_or(("1", "0"));
+                                m.debug_take(k.parse().unwrap_or(1), i.parse().unwrap_or(0), after);
+                            }
+                            "merge-save" => m.debug_save(a.parse().unwrap_or(1)),
+                            _ => m.debug_dump(),
+                        }
+                    }
+                }
+                // history-page:patch|version|current
+                "history-page" => {
+                    if let Some(h) = ed.history.borrow().as_ref() {
+                        h.debug_page(arg.unwrap_or("patch"));
+                    }
+                }
                 "problem" => ed.jump_to_problem(arg.and_then(|a| a.parse().ok()).unwrap_or(0)),
                 // sel:LINE.COL-LINE.COL[@action] (from 1): the action runs
                 // at once, before the desktop can take the selection away.

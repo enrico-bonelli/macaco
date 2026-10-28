@@ -1,5 +1,6 @@
 //! macaco — a lightweight GTK 4 text editor.
 
+mod askpass;
 mod config;
 mod diff;
 mod doc;
@@ -23,6 +24,10 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 fn main() -> glib::ExitCode {
+    // Run by git or ssh to ask for a password: no window, just the answer.
+    if let Some(code) = askpass::client() {
+        std::process::exit(code);
+    }
     // One malloc arena: memory used by background work (file scans, text
     // search) goes back to the system when freed instead of staying in the
     // arena of a worker thread.

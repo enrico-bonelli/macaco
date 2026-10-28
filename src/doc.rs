@@ -36,6 +36,8 @@ pub struct Tags {
     pub diff_add: gtk::TextTag,
     pub diff_del: gtk::TextTag,
     pub diff_chg: gtk::TextTag,
+    /// Merge: lines changed differently on both sides.
+    pub diff_conflict: gtk::TextTag,
     /// Diff view: changed words in the left / right document.
     pub diff_word_del: gtk::TextTag,
     pub diff_word_add: gtk::TextTag,
@@ -53,6 +55,7 @@ impl Tags {
             t
         };
         let (diff_add, diff_del, diff_chg) = (mk("diff-add"), mk("diff-del"), mk("diff-chg"));
+        let diff_conflict = mk("diff-conflict");
         let (diff_word_del, diff_word_add) = (mk("diff-word-del"), mk("diff-word-add"));
         let syntax: Vec<gtk::TextTag> = KINDS
             .iter()
@@ -74,7 +77,7 @@ impl Tags {
         table.add(&diag_warning);
         let diag_error = gtk::TextTag::builder().name("diag-error").underline(pango::Underline::Error).build();
         table.add(&diag_error);
-        let tags = Tags { table, syntax, curline, bracket, search, fold, fold_head, diag_error, diag_warning, diff_add, diff_del, diff_chg, diff_word_del, diff_word_add };
+        let tags = Tags { table, syntax, curline, bracket, search, fold, fold_head, diag_error, diag_warning, diff_add, diff_del, diff_chg, diff_conflict, diff_word_del, diff_word_add };
         tags.set_palette(dark);
         tags
     }
@@ -83,8 +86,8 @@ impl Tags {
         [&self.diag_error, &self.diag_warning]
     }
 
-    pub fn diff_tags(&self) -> [&gtk::TextTag; 5] {
-        [&self.diff_add, &self.diff_del, &self.diff_chg, &self.diff_word_del, &self.diff_word_add]
+    pub fn diff_tags(&self) -> [&gtk::TextTag; 6] {
+        [&self.diff_add, &self.diff_del, &self.diff_chg, &self.diff_conflict, &self.diff_word_del, &self.diff_word_add]
     }
 
     pub fn set_palette(&self, dark: bool) {
@@ -125,6 +128,7 @@ impl Tags {
         self.diff_add.set_paragraph_background(Some(add));
         self.diff_del.set_paragraph_background(Some(del));
         self.diff_chg.set_paragraph_background(Some(chg));
+        self.diff_conflict.set_paragraph_background(Some(if dark { "#4a2a1c" } else { "#ffe1cc" }));
         self.diff_word_del.set_background(Some(wdel));
         self.diff_word_add.set_background(Some(wadd));
     }

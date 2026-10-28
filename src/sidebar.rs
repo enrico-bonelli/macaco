@@ -26,6 +26,8 @@ pub struct Handlers {
     pub git: Box<dyn Fn(&str, &Path)>,
     /// Add a file or folder to the bookmarks.
     pub bookmark: Box<dyn Fn(&Path)>,
+    /// Git history of a file.
+    pub history: Box<dyn Fn(&Path)>,
 }
 
 /// A row widget of the list (rows are recycled while scrolling).
@@ -91,6 +93,7 @@ fn build_menu(context: bool, git: &[(&str, &str)]) -> gio::Menu {
         s3.append(Some("Sposta nel cestino"), Some("side.trash"));
         s3.append(Some("Copia percorso"), Some("side.copy-path"));
         s3.append(Some("Aggiungi ai preferiti"), Some("side.bookmark"));
+        s3.append(Some("Cronologia git…"), Some("side.history"));
         menu.append_section(None, &s3);
     }
     let sg = gio::Menu::new();
@@ -333,7 +336,12 @@ impl Sidebar {
                 (s.handlers.bookmark)(&p);
             }
         });
-        for name in ["add", "unstage", "restore", "changes"] {
+        add("history", |s| {
+            if let Some(p) = s.context.borrow().clone() {
+                (s.handlers.history)(&p);
+            }
+        });
+        for name in ["add", "unstage", "restore", "changes", "resolve"] {
             let a = gio::SimpleAction::new(&format!("git-{name}"), None);
             let w = Rc::downgrade(self);
             a.connect_activate(move |_, _| {
@@ -410,7 +418,10 @@ impl Sidebar {
         } else if let Some(e) = g.entry(path) {
             match e.mark() {
                 Mark::Untracked => v.push(("Git: aggiungi al repository (add)", "side.git-add")),
-                Mark::Conflict => v.push(("Git: segna il conflitto come risolto (add)", "side.git-add")),
+                Mark::Conflict => {
+                    v.push(("Git: risolvi il conflitto…", "side.git-resolve"));
+                    v.push(("Git: segna il conflitto come risolto (add)", "side.git-add"));
+                }
                 _ => {
                     if e.y != b' ' {
                         v.push(("Git: metti in stage le modifiche (add)", "side.git-add"));

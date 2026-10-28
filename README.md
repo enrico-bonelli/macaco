@@ -8,13 +8,15 @@ ogni giorno a chi lavora su progetti:
 - evidenziazione della sintassi per 18 linguaggi, con React (JSX/TSX),
   Next.js e Vue;
 - formattazione del codice;
-- confronto tra file;
+- confronto tra file e **unione a tre colonne**, anche per risolvere i
+  conflitti di git;
 - pannello dei file, ricerca veloce dei file e ricerca di testo nel progetto;
 - analisi del codice: vai alla definizione, trova utilizzi, completamento
   (anche con i language server);
 - preferiti, per riaprire al volo i file che usi spesso;
 - avviso quando un file aperto viene modificato da un altro programma;
-- integrazione con git;
+- integrazione con git: cronologia dei file, pull e push con le tue
+  credenziali (portachiavi di sistema, chiavi SSH);
 - terminale integrato.
 
 Tutto questo senza rinunciare alla leggerezza: all'avvio occupa circa
@@ -323,6 +325,26 @@ La formattazione è un'unica operazione annullabile.
   - **scorrimento sincronizzato** dei due pannelli;
   - `Alt+↓` / `Alt+↑` saltano alla differenza successiva o precedente;
   - si ricalcola mentre scrivi, con un riepilogo nella barra di stato.
+- **Confronto e unione** (*Visualizza → Confronta e unisci*, `Ctrl+F9`):
+  una finestra a tre colonne per combinare due file con precisione.
+  - **File 1 a sinistra, risultato al centro, file 2 a destra**, con la
+    sintassi colorata e i numeri di riga. Il risultato è modificabile e
+    all'inizio è uguale al file 1.
+  - Tra le colonne, **bande colorate** collegano i blocchi diversi: blu le
+    modifiche, verde le righe presenti solo da un lato, arancione i
+    conflitti. Le parole cambiate dentro le righe sono evidenziate.
+  - Ogni blocco ha una **freccia** verso il risultato:
+    - clic: il blocco sostituisce quello del risultato;
+    - `Ctrl`+clic: lo aggiunge dopo, `Maiusc`+clic prima (per tenere
+      entrambe le versioni).
+  - Le differenze si ricalcolano mentre scrivi nel risultato; le tre
+    colonne scorrono insieme; `Alt+↑` / `Alt+↓` passano al blocco
+    precedente o successivo.
+  - Si salva **nel file 1**, **nel file 2** o con **Salva come…**
+    (`Ctrl+S` salva nel file 1); la scheda del file, se aperta, si
+    aggiorna. Chiudendo senza salvare, macaco chiede conferma.
+  - Confronta le due schede affiancate; con un solo pannello, *Confronta
+    il file corrente con…* fa scegliere il secondo file.
 
 ### Sessione e salvataggio automatico
 
@@ -612,8 +634,79 @@ cartella di lavoro o, se non c'è, del file attivo.
   le modifiche (con conferma), segna il conflitto come risolto.
 - **Commit** (`Ctrl+Alt+C`), con elenco dei file, messaggio, opzioni `-a` e
   `--amend`.
-- **Sincronizzazione:** pull, push e fetch. Al primo push il ramo viene
-  creato sul remoto con `-u`.
+- **Sincronizzazione:** pull, push e fetch. Se il ramo corrente non è
+  collegato a un ramo del server:
+  - **pull** scarica prima i rami del server e chiede da quale unire
+    (proposto quello con lo stesso nome, es. `origin/main`);
+  - **push** chiede su quale remote e con quale nome pubblicarlo;
+  - la casella *Collega a questo ramo per i prossimi pull e push* (attiva)
+    imposta il collegamento (upstream): la domanda arriva una volta sola.
+  Vale sia dal menu Git sia dalla finestra delle modifiche.
+- **Push, pull e fetch con autenticazione:** quando git o ssh hanno
+  bisogno di qualcosa, macaco lo chiede in un dialogo; funziona con server
+  git locali, GitHub, GitLab o qualsiasi altro server.
+  - **HTTPS:** nome utente e password o token. Per GitHub il dialogo
+    ricorda che serve un *token di accesso personale*. Se l'accesso riesce,
+    git li conserva nel **portachiavi di sistema** (KWallet, GNOME
+    Portachiavi, KeePassXC: qualsiasi servizio Secret Service) tramite
+    `git-credential-libsecret`; le volte successive non chiede più nulla.
+    Se una password salvata non è più valida, git la toglie e la chiede di
+    nuovo. macaco non salva password per conto suo. Se hai già un tuo
+    `credential.helper`, macaco lo lascia fare.
+  - **SSH:** valgono le tue chiavi e il tuo `~/.ssh/config` (anche una
+    chiave diversa per ogni server). macaco chiede la **passphrase** della
+    chiave e, alla prima connessione a un server, la conferma della sua
+    **impronta** (fingerprint), poi ricordata in `~/.ssh/known_hosts`. Con
+    `ssh-agent` attivo, le chiavi già caricate non chiedono nulla.
+  - Annullando un dialogo, il comando si ferma senza messaggi d'errore.
+- **Credenziali e chiavi SSH** (*Git → Credenziali e chiavi SSH…*), per il
+  repository della cartella di lavoro:
+  - elenca i remote e come si accede a ciascuno: HTTPS, SSH o locale;
+  - per SSH mostra la chiave che verrà usata, letta dalla configurazione
+    di ssh; permette di **sceglierne un'altra solo per questo
+    repository** (imposta `core.sshCommand`) o di tornare alla
+    configurazione di ssh. La chiave scelta viene provata per prima, ma ssh
+    può provare anche quelle indicate in `~/.ssh/config` per lo stesso
+    server;
+  - **Copia chiave pubblica**, da incollare tra le chiavi SSH del server
+    (GitHub → Settings → SSH keys);
+  - per HTTPS, **Dimentica la password salvata** la toglie dal portachiavi;
+  - **Prova la connessione** (`git ls-remote`) verifica l'accesso senza
+    cambiare nulla;
+  - in alto si attiva o disattiva l'uso del portachiavi.
+- **Cronologia di un file** (*Git → Cronologia del file corrente…*,
+  `Ctrl+Alt+H`, o clic destro su un file nel pannello file → *Cronologia
+  git…*): una finestra con i commit che hanno modificato il file, dal più
+  recente, anche attraverso le rinomine (`git log --follow`).
+  - Ogni commit mostra messaggio, hash breve, data e autore; per i commit
+    precedenti a una rinomina è indicato il nome di allora. Il campo in
+    alto filtra per messaggio, autore, data o hash.
+  - Per il commit selezionato, tre viste:
+    - **Modifiche del commit:** il diff introdotto, con righe aggiunte in
+      verde e tolte in rosso, e il messaggio completo;
+    - **Versione completa:** il file com'era, colorato, con evidenziate le
+      righe che il commit ha aggiunto o cambiato;
+    - **Confronto con il file attuale:** le differenze tra quella versione
+      e il testo nell'editor, modifiche non salvate comprese.
+  - **Ripristina questa versione** mette quel testo nell'editor: si annulla
+    con `Ctrl+Z` e diventa definitivo solo salvando. **Copia hash** copia
+    l'identificativo completo del commit.
+  - Elenca gli ultimi 500 commit del file; `Esc` chiude la finestra.
+- **Risolvere i conflitti di un merge** (*Git → Risolvi il conflitto del
+  file corrente…*, o clic destro su un file in conflitto nel pannello file
+  o nella finestra delle modifiche): la finestra di confronto e unione con
+  - a sinistra **la tua versione** (HEAD), a destra **quella in arrivo**,
+    lette dall'indice di git;
+  - al centro l'**unione automatica a tre vie** dalla versione comune: le
+    modifiche fatte da una parte sola sono già applicate, i **conflitti**
+    (modifiche diverse alle stesse righe) sono in arancione, con la
+    versione comune, e il riepilogo li conta;
+  - le frecce scelgono la tua versione, quella in arrivo o entrambe
+    (`Ctrl`+clic);
+  - **Salva e segna come risolto** (`Ctrl+S`) scrive il file, senza
+    marcatori `<<<<<<<`, e lo aggiunge all'indice (`git add`). Se restano
+    conflitti chiede conferma. Poi si conclude con *Commit…* come al
+    solito.
 - **Rami e merge:** passa a un ramo locale o remoto, crea un ramo, unisci un
   ramo nel corrente, interrompi il merge.
 - `git init` per una cartella nuova.
@@ -622,9 +715,9 @@ cartella di lavoro o, se non c'è, del file attivo.
 - I documenti aperti vengono salvati prima di add e commit, e riletti dopo
   pull, merge, cambio di ramo e annullamento delle modifiche. Quelli con
   modifiche non salvate non vengono mai toccati.
-- Git non chiede mai password, quindi l'editor non resta bloccato. Per
-  push e pull servono ssh-agent o un credential helper; se mancano le
-  credenziali, il messaggio suggerisce di usare il terminale integrato.
+- Git non usa mai il terminale, quindi l'editor non resta bloccato: le
+  domande su password, token e passphrase arrivano in un dialogo (vedi
+  sopra), che si può sempre annullare.
 
 ### Terminale integrato
 
@@ -690,6 +783,7 @@ cartella di lavoro o, se non c'è, del file attivo.
 | `Ctrl+\`, `F8` | affianca schede |
 | `Ctrl+Maiusc+M` | sposta scheda nell'altro pannello |
 | `F9` | confronta le schede affiancate |
+| `Ctrl+F9` | confronto e unione a tre colonne |
 | `Alt+↓` / `Alt+↑` | differenza successiva / precedente |
 | `Ctrl+Maiusc+O` | apri cartella di lavoro |
 | `Ctrl+B`, `F7` | pannello file |
@@ -697,6 +791,7 @@ cartella di lavoro o, se non c'è, del file attivo.
 | `Ctrl+Maiusc+F` | cerca nei file della cartella di lavoro |
 | `Ctrl+Alt+G` | modifiche git della cartella |
 | `Ctrl+Alt+C` | commit |
+| `Ctrl+Alt+H` | cronologia git del file corrente |
 | `F4`, `Ctrl`+clic | vai alla definizione |
 | `Maiusc+F4` | trova utilizzi |
 | `Ctrl+Spazio` | completamento |

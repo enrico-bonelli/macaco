@@ -302,8 +302,21 @@ impl Output {
 /// command runs without a controlling terminal (SSH then uses the agent
 /// or `SSH_ASKPASS`).
 pub fn run(dir: &Path, args: &[&OsStr], done: impl FnOnce(Output) + 'static) {
-    let launcher = gio::SubprocessLauncher::new(gio::SubprocessFlags::STDOUT_PIPE | gio::SubprocessFlags::STDERR_PIPE);
+    run_with(dir, args, &[], None, done);
+}
+
+/// Like `run` with extra environment variables (the askpass helper of
+/// network commands) and an optional standard input.
+pub fn run_with(dir: &Path, args: &[&OsStr], env: &[(String, String)], input: Option<String>, done: impl FnOnce(Output) + 'static) {
+    let mut flags = gio::SubprocessFlags::STDOUT_PIPE | gio::SubprocessFlags::STDERR_PIPE;
+    if input.is_some() {
+        flags |= gio::SubprocessFlags::STDIN_PIPE;
+    }
+    let launcher = gio::SubprocessLauncher::new(flags);
     launcher.set_cwd(dir);
+    for (k, v) in env {
+        launcher.setenv(k, v, true);
+    }
     launcher.setenv("GIT_TERMINAL_PROMPT", "0", true);
     // Merges (also by `git pull`) never open an editor for the message.
     launcher.setenv("GIT_MERGE_AUTOEDIT", "no", true);
@@ -324,7 +337,8 @@ pub fn run(dir: &Path, args: &[&OsStr], done: impl FnOnce(Output) + 'static) {
         }
     };
     glib::MainContext::default().spawn_local(async move {
-        let res = proc.communicate_future(None).await;
+        let stdin = input.map(|s| glib::Bytes::from_owned(s.into_bytes()));
+        let res = proc.communicate_future(stdin.as_ref()).await;
         let out = match res {
             Ok((stdout, stderr)) => Output {
                 ok: proc.is_successful(),
@@ -370,9 +384,243 @@ pub fn status_of(dir: &Path, only: Option<&Path>, done: impl FnOnce(Option<Statu
     });
 }
 
+// ------------------------------------------------------------ remotes
+
+/// How a remote is reached, from its URL.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RemoteKind {
+    /// `https://host/…`: user name and password (or token).
+    Https { host: String },
+    /// `ssh://[user@]host[:port]/…` or `user@host:path`: SSH keys.
+    Ssh { user: Option<String>, host: String, port: Option<u16> },
+    /// A folder or `file://`: no authentication.
+    Local,
+    /// `git://` and anything else.
+    Other,
+}
+
+pub fn remote_kind(url: &str) -> RemoteKind {
+    let u = url.trim();
+    if let Some(rest) = u.strip_prefix("https://").or_else(|| u.strip_prefix("http://")) {
+        let authority = rest.split('/').next().unwrap_or("");
+        let host = authority.rsplit('@').next().unwrap_or(authority);
+        return RemoteKind::Https { host: host.to_string() };
+    }
+    let ssh = |authority: &str| {
+        let (user, hostport) = match authority.rsplit_once('@') {
+            Some((u, h)) => (Some(u.to_string()), h),
+            None => (None, authority),
+        };
+        let (host, port) = match hostport.rsplit_once(':') {
+            Some((h, p)) if p.chars().all(|c| c.is_ascii_digit()) && !p.is_empty() => (h, p.parse().ok()),
+            _ => (hostport, None),
+        };
+        RemoteKind::Ssh { user, host: host.to_string(), port }
+    };
+    if let Some(rest) = u.strip_prefix("ssh://").or_else(|| u.strip_prefix("git+ssh://")) {
+        return ssh(rest.split('/').next().unwrap_or(""));
+    }
+    if u.starts_with("file://") || u.starts_with('/') || u.starts_with('.') || u.starts_with('~') {
+        return RemoteKind::Local;
+    }
+    if u.contains("://") {
+        return RemoteKind::Other;
+    }
+    // scp-like syntax: [user@]host:path (a colon before any slash).
+    match u.split_once(':') {
+        Some((authority, _)) if !authority.contains('/') && !authority.is_empty() => ssh(authority),
+        _ => RemoteKind::Local,
+    }
+}
+
+/// `name url` pairs of `git remote -v` (fetch URLs, without duplicates).
+pub fn parse_remotes(out: &str) -> Vec<(String, String)> {
+    let mut list: Vec<(String, String)> = Vec::new();
+    for l in out.lines() {
+        let mut f = l.split_whitespace();
+        let (Some(name), Some(url)) = (f.next(), f.next()) else { continue };
+        if !list.iter().any(|(n, _)| n == name) {
+            list.push((name.to_string(), url.to_string()));
+        }
+    }
+    list
+}
+
+/// The key passed with `-i` in a `core.sshCommand`.
+pub fn ssh_command_key(cmd: &str) -> Option<String> {
+    let mut words = shell_words(cmd).into_iter();
+    while let Some(w) = words.next() {
+        if w == "-i" {
+            return words.next();
+        }
+        if let Some(k) = w.strip_prefix("-i") {
+            return Some(k.to_string());
+        }
+    }
+    None
+}
+
+/// `core.sshCommand` using only `key` (quoted for the shell git runs it with).
+pub fn ssh_command_for(key: &str) -> String {
+    format!("ssh -i '{}' -o IdentitiesOnly=yes", key.replace('\'', "'\\''"))
+}
+
+/// Split a command line on blanks, honouring single and double quotes.
+fn shell_words(s: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut quote = None;
+    let mut any = false;
+    for c in s.chars() {
+        match (quote, c) {
+            (None, '\'' | '"') => {
+                quote = Some(c);
+                any = true;
+            }
+            (Some(q), c) if c == q => quote = None,
+            (None, c) if c.is_whitespace() => {
+                if any {
+                    out.push(std::mem::take(&mut cur));
+                    any = false;
+                }
+            }
+            (_, c) => {
+                cur.push(c);
+                any = true;
+            }
+        }
+    }
+    if any {
+        out.push(cur);
+    }
+    out
+}
+
+// ---------------------------------------------------------------- history
+
+/// Arguments of `git log` for the history of one file (renames followed),
+/// in the format read by `parse_log`.
+pub fn log_args(rel: &str, max: usize) -> Vec<String> {
+    vec![
+        "log".into(),
+        "--follow".into(),
+        format!("-n{max}"),
+        "--date=format:%d/%m/%Y %H:%M".into(),
+        "--format=%x1e%H%x1f%h%x1f%an%x1f%ad%x1f%s".into(),
+        "--name-only".into(),
+        "--".into(),
+        rel.into(),
+    ]
+}
+
+/// A commit in the history of a file.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LogEntry {
+    pub hash: String,
+    pub short: String,
+    pub author: String,
+    pub date: String,
+    pub subject: String,
+    /// Path of the file (relative to the repository) in that commit: it
+    /// changes across renames.
+    pub path: String,
+}
+
+/// Parse the output of `git log` run with `log_args`. `rel` is the current
+/// path, used for commits that list no file (merges).
+pub fn parse_log(out: &str, rel: &str) -> Vec<LogEntry> {
+    let mut list: Vec<LogEntry> = Vec::new();
+    for rec in out.split('\x1e').filter(|r| !r.trim().is_empty()) {
+        let mut lines = rec.lines();
+        let head = lines.next().unwrap_or("");
+        let f: Vec<&str> = head.split('\x1f').collect();
+        if f.len() < 5 {
+            continue;
+        }
+        let path = lines
+            .map(str::trim)
+            .find(|l| !l.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| list.last().map_or_else(|| rel.to_string(), |e| e.path.clone()));
+        list.push(LogEntry {
+            hash: f[0].into(),
+            short: f[1].into(),
+            author: f[2].into(),
+            date: f[3].into(),
+            subject: f[4..].join("\x1f"),
+            path,
+        });
+    }
+    list
+}
+
+/// Lines (from 0) of the new file added or changed by a unified diff.
+pub fn added_lines(patch: &str) -> Vec<usize> {
+    let mut out = Vec::new();
+    let mut line = None;
+    for l in patch.lines() {
+        if let Some(h) = l.strip_prefix("@@ ") {
+            // @@ -a,b +c,d @@
+            line = h
+                .split_whitespace()
+                .find_map(|p| p.strip_prefix('+'))
+                .and_then(|p| p.split(',').next()?.parse::<usize>().ok())
+                .map(|n| n.saturating_sub(1));
+            continue;
+        }
+        let Some(n) = line.as_mut() else { continue };
+        match l.as_bytes().first() {
+            Some(b'+') => {
+                out.push(*n);
+                *n += 1;
+            }
+            Some(b'-') | Some(b'\\') => {}
+            _ => *n += 1,
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn remotes() {
+        assert_eq!(remote_kind("https://github.com/enrico/macaco.git"), RemoteKind::Https { host: "github.com".into() });
+        assert_eq!(remote_kind("https://tok@git.example.it/x"), RemoteKind::Https { host: "git.example.it".into() });
+        assert_eq!(
+            remote_kind("git@github.com:enrico/macaco.git"),
+            RemoteKind::Ssh { user: Some("git".into()), host: "github.com".into(), port: None }
+        );
+        assert_eq!(
+            remote_kind("ssh://gitea@192.168.1.10:2222/team/app.git"),
+            RemoteKind::Ssh { user: Some("gitea".into()), host: "192.168.1.10".into(), port: Some(2222) }
+        );
+        assert_eq!(remote_kind("server:/srv/git/app.git"), RemoteKind::Ssh { user: None, host: "server".into(), port: None });
+        assert_eq!(remote_kind("/srv/git/app.git"), RemoteKind::Local);
+        assert_eq!(remote_kind("../altro"), RemoteKind::Local);
+        assert_eq!(remote_kind("git://example.org/x"), RemoteKind::Other);
+        let r = parse_remotes("origin\tgit@github.com:a/b.git (fetch)\norigin\tgit@github.com:a/b.git (push)\nlan\t/srv/x (fetch)\n");
+        assert_eq!(r, vec![("origin".into(), "git@github.com:a/b.git".into()), ("lan".into(), "/srv/x".into())]);
+        assert_eq!(ssh_command_key(&ssh_command_for("/home/e/my keys/id_ed25519")).as_deref(), Some("/home/e/my keys/id_ed25519"));
+        assert_eq!(ssh_command_key("ssh -o X=y -i~/.ssh/k").as_deref(), Some("~/.ssh/k"));
+        assert_eq!(ssh_command_key("ssh -v"), None);
+    }
+
+    #[test]
+    fn history() {
+        let out = "\x1eaaa111\x1faaa\x1fAnna\x1f28/10/2026 10:55\x1fCorregge il menu\n\nsrc/new.rs\n\
+                   \x1ebbb222\x1fbbb\x1fLuca\x1f20/10/2026 09:00\x1fMerge branch 'x'\n\
+                   \x1eccc333\x1fccc\x1fLuca\x1f01/10/2026 08:00\x1fPrima versione\n\nsrc/old.rs\n";
+        let l = parse_log(out, "src/new.rs");
+        assert_eq!(l.len(), 3);
+        assert_eq!((l[0].short.as_str(), l[0].author.as_str(), l[0].path.as_str()), ("aaa", "Anna", "src/new.rs"));
+        assert_eq!(l[1].path, "src/new.rs");
+        assert_eq!((l[2].subject.as_str(), l[2].path.as_str()), ("Prima versione", "src/old.rs"));
+        let patch = "diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -1,3 +1,4 @@\n uno\n-due\n+DUE\n+tre\n quattro\n@@ -10,2 +11,2 @@\n a\n+b\n";
+        assert_eq!(added_lines(patch), vec![1, 2, 11]);
+    }
 
     #[test]
     fn parse_status() {
