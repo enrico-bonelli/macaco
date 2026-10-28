@@ -74,6 +74,8 @@ pub enum State {
     PhpHtml,
     /// Markdown code fence: (language index, fence char, packed inner state).
     MdFence(u8, u8, u8),
+    /// JavaScript / TSX: inside JSX elements (see `Jsx`).
+    Jsx(u32),
 }
 
 /// Compress the state of a fenced block's language into one byte (the
@@ -148,7 +150,31 @@ pub fn lex_line(lang: Lang, state: State, line: &str, out: &mut Vec<Token>) -> S
         Lang::Yaml => lx.yaml(state),
         Lang::Php => lx.php(state),
         Lang::Markdown => lx.markdown(state, line),
+        Lang::JavaScript | Lang::Tsx => lx.js(state),
         _ => lx.code(lang.spec(), state, 0, b.len()).0,
+    }
+}
+
+/// Whether the text following `before` (the document up to the start of a
+/// line) is inside JSX markup, where comments are written `{/* … */}`.
+pub fn in_jsx_markup(lang: Lang, before: &str) -> bool {
+    if !matches!(lang, Lang::JavaScript | Lang::Tsx) {
+        return false;
+    }
+    let mut state = initial_state(lang);
+    let mut toks = Vec::new();
+    for line in before.strip_suffix('\n').unwrap_or(before).split('\n') {
+        state = lex_line(lang, state, line, &mut toks);
+    }
+    matches!(state, State::Jsx(v) if Jsx::unpack(v).mode() == JsxMode::Text)
+}
+
+/// Perl quote-like operators and the number of delimited parts they take.
+fn perl_quote_op(w: &[u8]) -> Option<usize> {
+    match w {
+        b"q" | b"qq" | b"qw" | b"qr" | b"m" => Some(1),
+        b"s" | b"tr" | b"y" => Some(2),
+        _ => None,
     }
 }
 
@@ -199,6 +225,68 @@ fn find_ci(b: &[u8], from: usize, end: usize, pat: &[u8]) -> Option<usize> {
         .windows(pat.len())
         .position(|w| w.eq_ignore_ascii_case(pat))
         .map(|p| p + from)
+}
+
+/// Open JSX elements: up to 3 nested trees (a tree inside the `{…}`
+/// expression of another one). For each tree: depth of the open elements,
+/// whether an opening tag is being read and the depth of the `{` braces of
+/// the expression being read (0: none).
+#[derive(Clone, Copy, Default)]
+struct Jsx {
+    n: usize,
+    t: [(u8, bool, u8); 3],
+}
+
+#[derive(PartialEq)]
+enum JsxMode {
+    Code,
+    Tag,
+    Text,
+}
+
+impl Jsx {
+    fn unpack(v: u32) -> Jsx {
+        let mut x = Jsx { n: ((v >> 24) & 3) as usize, ..Default::default() };
+        for k in 0..3 {
+            let b = (v >> (8 * k)) as u8;
+            x.t[k] = (b & 0x0F, b & 0x10 != 0, b >> 5);
+        }
+        x
+    }
+
+    fn state(&self) -> State {
+        if self.n == 0 {
+            return State::Normal;
+        }
+        let mut v = (self.n as u32) << 24;
+        for k in 0..3 {
+            let (d, tag, br) = self.t[k];
+            v |= (((d & 0x0F) | if tag { 0x10 } else { 0 } | (br.min(7) << 5)) as u32) << (8 * k);
+        }
+        State::Jsx(v)
+    }
+
+    fn mode(&self) -> JsxMode {
+        match self.n {
+            0 => JsxMode::Code,
+            n => match self.t[n - 1] {
+                (_, _, br) if br > 0 => JsxMode::Code,
+                (_, true, _) => JsxMode::Tag,
+                _ => JsxMode::Text,
+            },
+        }
+    }
+
+    fn top(&mut self) -> &mut (u8, bool, u8) {
+        &mut self.t[self.n - 1]
+    }
+}
+
+/// Result of one step of the code lexer: where to continue, or the state
+/// that holds until the end of the line (and where lexing stopped).
+enum Step {
+    Next(usize),
+    Stop(State, usize),
 }
 
 struct Lexer<'a> {
@@ -291,7 +379,18 @@ impl Lexer<'_> {
             find(self.b, i + 2, end, b"}").map_or(end, |p| p + 1)
         } else if is_ident_start(c) {
             self.ident_end(i + 1, end)
-        } else if self.lang == Lang::Bash && (c.is_ascii_digit() || b"#?@*$!-".contains(&c)) {
+        } else if self.lang == Lang::Perl && c == b'#' && (is_ident_start(self.at(i + 2)) || matches!(self.at(i + 2), b'{' | b'$')) {
+            // $#array: last index.
+            match self.at(i + 2) {
+                b'$' => self.dollar_var_end(i + 2, end),
+                b'{' => find(self.b, i + 3, end, b"}").map_or(end, |p| p + 1),
+                _ => self.perl_name_end(i + 2, end),
+            }
+        } else if self.lang == Lang::Perl && is_ident_start(c) {
+            self.perl_name_end(i + 1, end)
+        } else if (self.lang == Lang::Perl && (c.is_ascii_digit() || b"&`'+_./\\,;!@$<>0?".contains(&c)))
+            || (self.lang == Lang::Bash && (c.is_ascii_digit() || b"#?@*$!-".contains(&c)))
+        {
             i + 2
         } else {
             i + 1
@@ -352,6 +451,12 @@ impl Lexer<'_> {
     fn resume(&mut self, spec: &Spec, state: State, i: usize, end: usize) -> Result<usize, State> {
         let b = self.b;
         match state {
+            // Perl POD documentation, up to a `=cut` line.
+            State::Comment if self.lang == Lang::Perl => {
+                self.tok(i, end, Kind::Comment);
+                if self.starts(i, end, "=cut") { Ok(end) } else { Err(State::Comment) }
+            }
+            State::Str(b'@') => self.cs_verbatim(i, i, end),
             State::Comment => {
                 let close = spec.block_comment.map_or("*/", |c| c.1);
                 match find(b, i, end, close.as_bytes()) {
@@ -433,198 +538,259 @@ impl Lexer<'_> {
             Err(st) => return (st, end),
         };
         let first_non_ws = b[start..end].iter().position(|c| !c.is_ascii_whitespace()).map(|p| p + start);
-        let php = self.lang == Lang::Php;
 
         while i < end {
-            let c = b[i];
-            if c.is_ascii_whitespace() {
-                i += 1;
-                continue;
+            match self.code_step(spec, i, start, end, first_non_ws) {
+                Step::Next(j) => i = j,
+                Step::Stop(st, j) => return (st, j),
             }
-            if php && c == b'?' && self.at(i + 1) == b'>' {
-                self.tok(i, i + 2, Kind::Preproc);
-                return (State::PhpHtml, i + 2);
+        }
+        (State::Normal, end)
+    }
+
+    /// One token (or one skipped byte) of `code` at `i`.
+    fn code_step(&mut self, spec: &Spec, mut i: usize, start: usize, end: usize, first_non_ws: Option<usize>) -> Step {
+        let b = self.b;
+        let php = self.lang == Lang::Php;
+        let perl = self.lang == Lang::Perl;
+        let c = b[i];
+        if c.is_ascii_whitespace() {
+            i += 1;
+            return Step::Next(i);
+        }
+        if perl && i == start && c == b'=' && self.at(i + 1).is_ascii_alphabetic() {
+            self.tok(i, end, Kind::Comment);
+            return Step::Stop(if self.starts(i, end, "=cut") { State::Normal } else { State::Comment }, end);
+        }
+        if perl {
+            if let Some(e) = self.perl_variable(i, start, end) {
+                self.tok(i, e, Kind::Variable);
+                return Step::Next(e);
             }
-            if php && c == b'<' && self.at(i + 1) == b'?' {
-                let e = if self.starts(i, end, "<?php") { i + 5 } else if self.at(i + 2) == b'=' { i + 3 } else { i + 2 };
-                self.tok(i, e, Kind::Preproc);
-                i = e;
-                continue;
+            if c == b'/' && self.perl_regex_context(i, start) {
+                let e = self.perl_quoted(i, end, 1);
+                self.tok(i, e, Kind::Str);
+                return Step::Next(e);
             }
-            if let Some((open, close)) = spec.block_comment
-                && self.starts(i, end, open) {
-                    match find(b, i + open.len(), end, close.as_bytes()) {
-                        Some(p) => {
-                            self.tok(i, p + close.len(), Kind::Comment);
-                            i = p + close.len();
-                            continue;
-                        }
-                        None => {
-                            self.tok(i, end, Kind::Comment);
-                            return (State::Comment, end);
-                        }
+        }
+        if self.lang == Lang::CSharp && (c == b'@' || c == b'$') {
+            let mut j = i;
+            while j < i + 3 && matches!(self.at(j), b'@' | b'$') {
+                j += 1;
+            }
+            if self.at(j) == b'"' && j < end {
+                if b[i..j].contains(&b'@') {
+                    return match self.cs_verbatim(i, j + 1, end) {
+                        Ok(p) => Step::Next(p),
+                        Err(st) => Step::Stop(st, end),
+                    };
+                }
+                return match self.string(spec, i, j, end) {
+                    Ok(p) => Step::Next(p),
+                    Err(st) => Step::Stop(st, end),
+                };
+            }
+        }
+        if php && c == b'?' && self.at(i + 1) == b'>' {
+            self.tok(i, i + 2, Kind::Preproc);
+            return Step::Stop(State::PhpHtml, i + 2);
+        }
+        if php && c == b'<' && self.at(i + 1) == b'?' {
+            let e = if self.starts(i, end, "<?php") { i + 5 } else if self.at(i + 2) == b'=' { i + 3 } else { i + 2 };
+            self.tok(i, e, Kind::Preproc);
+            i = e;
+            return Step::Next(i);
+        }
+        if let Some((open, close)) = spec.block_comment
+            && self.starts(i, end, open) {
+                match find(b, i + open.len(), end, close.as_bytes()) {
+                    Some(p) => {
+                        self.tok(i, p + close.len(), Kind::Comment);
+                        i = p + close.len();
+                        return Step::Next(i);
+                    }
+                    None => {
+                        self.tok(i, end, Kind::Comment);
+                        return Step::Stop(State::Comment, end);
                     }
                 }
-            if php && c == b'#' && self.at(i + 1) == b'[' {
-                let e = find(b, i, end, b"]").map_or(end, |p| p + 1);
-                self.tok(i, e, Kind::Preproc);
-                i = e;
-                continue;
             }
-            if spec.line_comment.iter().any(|lc| self.starts(i, end, lc))
-                && (!spec.shell || i == start || b[i - 1].is_ascii_whitespace() || b";|&(".contains(&b[i - 1]))
+        if php && c == b'#' && self.at(i + 1) == b'[' {
+            let e = find(b, i, end, b"]").map_or(end, |p| p + 1);
+            self.tok(i, e, Kind::Preproc);
+            i = e;
+            return Step::Next(i);
+        }
+        if spec.line_comment.iter().any(|lc| self.starts(i, end, lc))
+            && (!spec.shell || i == start || b[i - 1].is_ascii_whitespace() || b";|&(".contains(&b[i - 1]))
+        {
+            if php {
+                // A PHP line comment ends at "?>".
+                if let Some(p) = find(b, i, end, b"?>") {
+                    self.tok(i, p, Kind::Comment);
+                    i = p;
+                    return Step::Next(i);
+                }
+            }
+            self.tok(i, end, Kind::Comment);
+            return Step::Stop(State::Normal, end);
+        }
+        if spec.preprocessor && c == b'#' && Some(i) == first_non_ws {
+            let mut j = i + 1;
+            while j < end && b[j] == b' ' {
+                j += 1;
+            }
+            let we = self.ident_end(j, end);
+            self.tok(i, we, Kind::Preproc);
+            let word = &b[j..we];
+            i = we;
+            if word == b"include" || word == b"import" {
+                while i < end && b[i] == b' ' {
+                    i += 1;
+                }
+                if i < end && b[i] == b'<' {
+                    let e = find(b, i, end, b">").map_or(end, |p| p + 1);
+                    self.tok(i, e, Kind::Str);
+                    i = e;
+                }
+            }
+            return Step::Next(i);
+        }
+        if spec.rust {
+            if c == b'#' && (self.at(i + 1) == b'[' || (self.at(i + 1) == b'!' && self.at(i + 2) == b'[')) {
+                let mut depth = 0;
+                let mut j = i;
+                while j < end {
+                    match b[j] {
+                        b'[' => depth += 1,
+                        b']' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                j += 1;
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                    j += 1;
+                }
+                self.tok(i, j, Kind::Preproc);
+                i = j;
+                return Step::Next(i);
+            }
+            if c == b'\'' {
+                i = self.rust_quote(i, end);
+                return Step::Next(i);
+            }
+            if c == b'r' || c == b'b' {
+                let mut j = i;
+                if b[j] == b'b' {
+                    j += 1;
+                }
+                if self.at(j) == b'r' && (self.at(j + 1) == b'"' || self.at(j + 1) == b'#') {
+                    let mut k = j + 1;
+                    while k < end && b[k] == b'#' {
+                        k += 1;
+                    }
+                    if self.at(k) == b'"' && k < end {
+                        let n = k - j - 1;
+                        match self.raw_close(k + 1, end, n) {
+                            Some(p) => {
+                                self.tok(i, p, Kind::Str);
+                                i = p;
+                            }
+                            None => {
+                                self.tok(i, end, Kind::Str);
+                                return Step::Stop(State::RawStr(n as u8), end);
+                            }
+                        }
+                        return Step::Next(i);
+                    }
+                } else if c == b'b' && self.at(i + 1) == b'"' {
+                    match self.string(spec, i, i + 1, end) {
+                        Ok(p) => i = p,
+                        Err(st) => return Step::Stop(st, end),
+                    }
+                    return Step::Next(i);
+                } else if c == b'b' && self.at(i + 1) == b'\'' {
+                    i = self.rust_quote(i + 1, end);
+                    if let Some(t) = self.out.last_mut().filter(|t| t.kind == Kind::Str) {
+                        t.start -= 1;
+                    }
+                    return Step::Next(i);
+                }
+            }
+        }
+        if spec.quotes.contains(&c) {
+            match self.string(spec, i, i, end) {
+                Ok(p) => i = p,
+                Err(st) => return Step::Stop(st, end),
+            }
+            return Step::Next(i);
+        }
+        if spec.dollar_vars && c == b'$' {
+            let e = self.dollar_var_end(i, end);
+            self.tok(i, e, Kind::Variable);
+            i = e;
+            return Step::Next(i);
+        }
+        if spec.decorators && c == b'@' && is_ident_start(self.at(i + 1)) {
+            let mut e = self.ident_end(i + 1, end);
+            while self.at(e) == b'.' && is_ident_start(self.at(e + 1)) {
+                e = self.ident_end(e + 1, end);
+            }
+            self.tok(i, e, Kind::Preproc);
+            i = e;
+            return Step::Next(i);
+        }
+        if c.is_ascii_digit() || (c == b'.' && self.at(i + 1).is_ascii_digit() && !is_ident(self.at(i.wrapping_sub(1)))) {
+            let e = self.number_end(i, end);
+            self.tok(i, e, Kind::Number);
+            i = e;
+            return Step::Next(i);
+        }
+        if is_ident_start(c) {
+            let e = self.ident_end(i, end);
+            // Python string prefixes: r"..", f'..', rb"..".
+            if self.lang == Lang::Python
+                && e - i <= 2
+                && spec.quotes.contains(&self.at(e))
+                && e < end
+                && b[i..e].iter().all(|c| b"rRbBuUfF".contains(c))
             {
-                if php {
-                    // A PHP line comment ends at "?>".
-                    if let Some(p) = find(b, i, end, b"?>") {
-                        self.tok(i, p, Kind::Comment);
-                        i = p;
-                        continue;
-                    }
+                match self.string(spec, i, e, end) {
+                    Ok(p) => i = p,
+                    Err(st) => return Step::Stop(st, end),
                 }
-                self.tok(i, end, Kind::Comment);
-                return (State::Normal, end);
+                return Step::Next(i);
             }
-            if spec.preprocessor && c == b'#' && Some(i) == first_non_ws {
-                let mut j = i + 1;
+            if perl && let Some(parts) = perl_quote_op(&b[i..e]) {
+                let mut j = e;
                 while j < end && b[j] == b' ' {
                     j += 1;
                 }
-                let we = self.ident_end(j, end);
-                self.tok(i, we, Kind::Preproc);
-                let word = &b[j..we];
-                i = we;
-                if word == b"include" || word == b"import" {
-                    while i < end && b[i] == b' ' {
-                        i += 1;
-                    }
-                    if i < end && b[i] == b'<' {
-                        let e = find(b, i, end, b">").map_or(end, |p| p + 1);
-                        self.tok(i, e, Kind::Str);
-                        i = e;
-                    }
-                }
-                continue;
-            }
-            if spec.rust {
-                if c == b'#' && (self.at(i + 1) == b'[' || (self.at(i + 1) == b'!' && self.at(i + 2) == b'[')) {
-                    let mut depth = 0;
-                    let mut j = i;
-                    while j < end {
-                        match b[j] {
-                            b'[' => depth += 1,
-                            b']' => {
-                                depth -= 1;
-                                if depth == 0 {
-                                    j += 1;
-                                    break;
-                                }
-                            }
-                            _ => {}
-                        }
-                        j += 1;
-                    }
-                    self.tok(i, j, Kind::Preproc);
-                    i = j;
-                    continue;
-                }
-                if c == b'\'' {
-                    i = self.rust_quote(i, end);
-                    continue;
-                }
-                if c == b'r' || c == b'b' {
-                    let mut j = i;
-                    if b[j] == b'b' {
-                        j += 1;
-                    }
-                    if self.at(j) == b'r' && (self.at(j + 1) == b'"' || self.at(j + 1) == b'#') {
-                        let mut k = j + 1;
-                        while k < end && b[k] == b'#' {
-                            k += 1;
-                        }
-                        if self.at(k) == b'"' && k < end {
-                            let n = k - j - 1;
-                            match self.raw_close(k + 1, end, n) {
-                                Some(p) => {
-                                    self.tok(i, p, Kind::Str);
-                                    i = p;
-                                }
-                                None => {
-                                    self.tok(i, end, Kind::Str);
-                                    return (State::RawStr(n as u8), end);
-                                }
-                            }
-                            continue;
-                        }
-                    } else if c == b'b' && self.at(i + 1) == b'"' {
-                        match self.string(spec, i, i + 1, end) {
-                            Ok(p) => i = p,
-                            Err(st) => return (st, end),
-                        }
-                        continue;
-                    } else if c == b'b' && self.at(i + 1) == b'\'' {
-                        i = self.rust_quote(i + 1, end);
-                        if let Some(t) = self.out.last_mut().filter(|t| t.kind == Kind::Str) {
-                            t.start -= 1;
-                        }
-                        continue;
-                    }
+                let d = self.at(j);
+                let delimiter = j < end
+                    && !d.is_ascii_alphanumeric()
+                    && !d.is_ascii_whitespace()
+                    && !b"_,;)".contains(&d)
+                    && !(d == b'=' && matches!(self.at(j + 1), b'>' | b'=' | b'~'));
+                if delimiter {
+                    let p = self.perl_quoted(j, end, parts);
+                    self.tok(i, p, Kind::Str);
+                    return Step::Next(p);
                 }
             }
-            if spec.quotes.contains(&c) {
-                match self.string(spec, i, i, end) {
-                    Ok(p) => i = p,
-                    Err(st) => return (st, end),
-                }
-                continue;
-            }
-            if spec.dollar_vars && c == b'$' {
-                let e = self.dollar_var_end(i, end);
-                self.tok(i, e, Kind::Variable);
-                i = e;
-                continue;
-            }
-            if spec.decorators && c == b'@' && is_ident_start(self.at(i + 1)) {
-                let mut e = self.ident_end(i + 1, end);
-                while self.at(e) == b'.' && is_ident_start(self.at(e + 1)) {
-                    e = self.ident_end(e + 1, end);
-                }
-                self.tok(i, e, Kind::Preproc);
-                i = e;
-                continue;
-            }
-            if c.is_ascii_digit() || (c == b'.' && self.at(i + 1).is_ascii_digit() && !is_ident(self.at(i.wrapping_sub(1)))) {
-                let e = self.number_end(i, end);
-                self.tok(i, e, Kind::Number);
-                i = e;
-                continue;
-            }
-            if is_ident_start(c) {
-                let e = self.ident_end(i, end);
-                // Python string prefixes: r"..", f'..', rb"..".
-                if self.lang == Lang::Python
-                    && e - i <= 2
-                    && spec.quotes.contains(&self.at(e))
-                    && e < end
-                    && b[i..e].iter().all(|c| b"rRbBuUfF".contains(c))
-                {
-                    match self.string(spec, i, e, end) {
-                        Ok(p) => i = p,
-                        Err(st) => return (st, end),
-                    }
-                    continue;
-                }
-                self.word(spec, i, e, end);
-                i = e;
-                continue;
-            }
-            // `func (r *T) Name()` in Go: the receiver is not the name.
-            if c == b'(' {
-                self.def_next = false;
-            }
-            i += 1;
+            self.word(spec, i, e, end);
+            i = e;
+            return Step::Next(i);
         }
-        (State::Normal, end)
+        // `func (r *T) Name()` in Go: the receiver is not the name.
+        if c == b'(' {
+            self.def_next = false;
+        }
+        i += 1;
+        Step::Next(i)
     }
 
     fn word(&mut self, spec: &Spec, i: usize, e: usize, end: usize) {
@@ -641,7 +807,7 @@ impl Lexer<'_> {
         }
         let def = std::mem::replace(&mut self.def_next, false);
         if let Some(k) = kind {
-            self.def_next = matches!(s, "fn" | "def" | "function" | "func");
+            self.def_next = matches!(s, "fn" | "def" | "function" | "func" | "sub");
             self.tok(i, e, k);
             return;
         }
@@ -673,6 +839,304 @@ impl Lexer<'_> {
         if spec.cap_types && w[0].is_ascii_uppercase() {
             let all_caps = w.len() > 1 && w.iter().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || *c == b'_');
             self.tok(i, e, if all_caps { Kind::Constant } else { Kind::Type });
+        }
+    }
+
+    // ------------------------------------------------------------ C#, Perl
+
+    /// C# verbatim string (`@"…"`, `$@"…"`): `""` is a quote, `\` is not an
+    /// escape and the literal may span lines. `from` is just after the
+    /// opening quote (or the start of a continued line).
+    fn cs_verbatim(&mut self, tok_start: usize, from: usize, end: usize) -> Result<usize, State> {
+        let b = self.b;
+        let mut j = from;
+        while j < end {
+            if b[j] == b'"' {
+                if self.at(j + 1) == b'"' && j + 1 < end {
+                    j += 2;
+                    continue;
+                }
+                self.tok(tok_start, j + 1, Kind::Str);
+                return Ok(j + 1);
+            }
+            j += 1;
+        }
+        self.tok(tok_start, end, Kind::Str);
+        Err(State::Str(b'@'))
+    }
+
+    /// End of a Perl package-qualified name (`Foo::Bar::baz`).
+    fn perl_name_end(&self, i: usize, end: usize) -> usize {
+        let mut e = self.ident_end(i, end);
+        while self.at(e) == b':' && self.at(e + 1) == b':' && is_ident_start(self.at(e + 2)) {
+            e = self.ident_end(e + 2, end);
+        }
+        e
+    }
+
+    /// Last non-blank byte before `i` on the line and its position.
+    fn prev_significant(&self, i: usize, start: usize) -> Option<(usize, u8)> {
+        (start..i).rev().find(|&k| !self.b[k].is_ascii_whitespace()).map(|k| (k, self.b[k]))
+    }
+
+    /// The word ending at `k` (included).
+    fn word_before(&self, k: usize) -> &[u8] {
+        let mut a = k + 1;
+        while a > 0 && is_ident(self.b[a - 1]) {
+            a -= 1;
+        }
+        &self.b[a..=k]
+    }
+
+    /// Perl `@array`, `%hash`, `@{…}`, `@$ref`: end of the variable at `i`.
+    fn perl_variable(&self, i: usize, start: usize, end: usize) -> Option<usize> {
+        let c = self.b[i];
+        if c != b'@' && c != b'%' {
+            return None;
+        }
+        let n = self.at(i + 1);
+        if i + 1 >= end || !(is_ident_start(n) || n == b'{' || n == b'$') {
+            return None;
+        }
+        // `%` after an operand is the modulo operator (but `my %h`,
+        // `keys %h`: after a keyword or a builtin it is a hash).
+        if c == b'%'
+            && let Some((k, p)) = self.prev_significant(i, start)
+            && (b")]}".contains(&p)
+                || (is_ident(p) && !std::str::from_utf8(self.word_before(k)).is_ok_and(|w| self.words.contains_key(w))))
+        {
+            return None;
+        }
+        Some(match n {
+            b'{' => find(self.b, i + 2, end, b"}").map_or(end, |p| p + 1),
+            b'$' => self.dollar_var_end(i + 1, end),
+            _ => self.perl_name_end(i + 1, end),
+        })
+    }
+
+    /// Whether a `/` at `i` starts a Perl regular expression (not a division).
+    fn perl_regex_context(&self, i: usize, start: usize) -> bool {
+        match self.prev_significant(i, start) {
+            None => true,
+            Some((k, p)) if is_ident(p) => matches!(
+                self.word_before(k),
+                b"split" | b"grep" | b"if" | b"unless" | b"and" | b"or" | b"not" | b"return" | b"while" | b"until"
+            ),
+            Some((_, p)) => b"(,=~!&|{;?:".contains(&p),
+        }
+    }
+
+    /// End of a Perl quoted construct whose delimiter is at `d`: `parts`
+    /// delimited parts (2 for `s///`, `tr///`), then modifiers.
+    fn perl_quoted(&self, d: usize, end: usize, parts: usize) -> usize {
+        let b = self.b;
+        let mut j = d;
+        for part in 0..parts {
+            if part > 0 {
+                while j < end && b[j].is_ascii_whitespace() {
+                    j += 1;
+                }
+            }
+            if j >= end {
+                return end;
+            }
+            let open = b[j];
+            let close = match open {
+                b'(' => b')',
+                b'[' => b']',
+                b'{' => b'}',
+                b'<' => b'>',
+                _ => open,
+            };
+            let paired = close != open;
+            let mut depth = 1;
+            let mut k = j + 1;
+            loop {
+                if k >= end {
+                    return end;
+                }
+                let c = b[k];
+                if c == b'\\' {
+                    k += 2;
+                    continue;
+                }
+                if paired && c == open {
+                    depth += 1;
+                } else if c == close {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                k += 1;
+            }
+            // `s/a/b/`: the closing delimiter also opens the second part.
+            j = if paired || part + 1 == parts { k + 1 } else { k };
+        }
+        while j < end && b[j].is_ascii_alphabetic() {
+            j += 1;
+        }
+        j
+    }
+
+    // ----------------------------------------------------------------- JSX
+
+    /// JavaScript and TSX: code with JSX elements.
+    fn js(&mut self, state: State) -> State {
+        let b = self.b;
+        let end = b.len();
+        let spec = self.lang.spec();
+        let mut x = if let State::Jsx(v) = state { Jsx::unpack(v) } else { Jsx::default() };
+        let mut i = 0;
+        if x.n == 0 {
+            match self.resume(spec, state, 0, end) {
+                Ok(p) => i = p,
+                Err(st) => return st,
+            }
+        }
+        let first_non_ws = b.iter().position(|c| !c.is_ascii_whitespace());
+        while i < end {
+            match x.mode() {
+                JsxMode::Code => {
+                    let c = b[i];
+                    if c == b'<' && x.n < 3 && self.jsx_starts(i) {
+                        x.t[x.n] = (0, true, 0);
+                        x.n += 1;
+                        i = self.jsx_tag_name(i, end);
+                        continue;
+                    }
+                    if x.n > 0 && (c == b'{' || c == b'}') {
+                        let top = x.top();
+                        top.2 = if c == b'{' { (top.2 + 1).min(7) } else { top.2 - 1 };
+                        i += 1;
+                        continue;
+                    }
+                    match self.code_step(spec, i, 0, end, first_non_ws) {
+                        Step::Next(j) => i = j,
+                        // Strings and comments spanning lines are not
+                        // followed inside JSX expressions.
+                        Step::Stop(st, _) => return if x.n == 0 { st } else { x.state() },
+                    }
+                }
+                JsxMode::Tag => i = self.jsx_tag(&mut x, i, end),
+                JsxMode::Text => i = self.jsx_text(&mut x, i, end),
+            }
+        }
+        x.state()
+    }
+
+    /// Whether `<` at `i` opens a JSX element: followed by a name or `>`
+    /// (fragment) where an expression may start.
+    fn jsx_starts(&self, i: usize) -> bool {
+        let n = self.at(i + 1);
+        if !(is_ident_start(n) || n == b'>') {
+            return false;
+        }
+        match self.prev_significant(i, 0) {
+            None => true,
+            Some((k, b'>')) => k > 0 && self.b[k - 1] == b'=',
+            Some((k, p)) if is_ident(p) => {
+                matches!(self.word_before(k), b"return" | b"yield" | b"default" | b"case" | b"else" | b"do" | b"await")
+            }
+            Some((_, p)) => b"([{,;=:?&|!".contains(&p),
+        }
+    }
+
+    /// `<name` or `</name` at `i`; returns the position after the name.
+    fn jsx_tag_name(&mut self, i: usize, end: usize) -> usize {
+        let b = self.b;
+        let mut j = i + 1;
+        if self.at(j) == b'/' {
+            j += 1;
+        }
+        self.tok(i, j, Kind::Tag);
+        let mut k = j;
+        while k < end && (is_ident(b[k]) || b".-:".contains(&b[k])) {
+            k += 1;
+        }
+        // Components (`<Button>`, `<Menu.Item>`) look like types.
+        let component = k > j && (b[j].is_ascii_uppercase() || b[j..k].contains(&b'.'));
+        self.tok(j, k, if component { Kind::Type } else { Kind::Tag });
+        k
+    }
+
+    /// Inside an opening tag: attributes, `{…}` values, `>` or `/>`.
+    fn jsx_tag(&mut self, x: &mut Jsx, i: usize, end: usize) -> usize {
+        let b = self.b;
+        let c = b[i];
+        if c == b'/' && self.at(i + 1) == b'>' {
+            self.tok(i, i + 2, Kind::Tag);
+            let top = x.top();
+            top.1 = false;
+            if top.0 == 0 {
+                x.n -= 1;
+            }
+            return i + 2;
+        }
+        match c {
+            b'>' => {
+                self.tok(i, i + 1, Kind::Tag);
+                let top = x.top();
+                top.1 = false;
+                top.0 = (top.0 + 1).min(15);
+                i + 1
+            }
+            b'{' => {
+                x.top().2 = 1;
+                i + 1
+            }
+            b'"' | b'\'' => {
+                let e = find(b, i + 1, end, &[c]).map_or(end, |p| p + 1);
+                self.tok(i, e, Kind::Str);
+                e
+            }
+            _ if is_ident_start(c) => {
+                let mut k = i;
+                while k < end && (is_ident(b[k]) || b"-:".contains(&b[k])) {
+                    k += 1;
+                }
+                self.tok(i, k, Kind::Attr);
+                k
+            }
+            _ => i + 1,
+        }
+    }
+
+    /// Between tags: text, `{…}` expressions, nested and closing tags.
+    fn jsx_text(&mut self, x: &mut Jsx, i: usize, end: usize) -> usize {
+        let b = self.b;
+        match b[i] {
+            b'{' => {
+                x.top().2 = 1;
+                i + 1
+            }
+            b'<' if self.at(i + 1) == b'/' => {
+                let k = self.jsx_tag_name(i, end);
+                let next = match find(b, k, end, b">") {
+                    Some(p) => {
+                        self.tok(p, p + 1, Kind::Tag);
+                        p + 1
+                    }
+                    None => end,
+                };
+                let top = x.top();
+                top.0 = top.0.saturating_sub(1);
+                if top.0 == 0 {
+                    x.n -= 1;
+                }
+                next
+            }
+            b'<' if is_ident_start(self.at(i + 1)) || self.at(i + 1) == b'>' => {
+                x.top().1 = true;
+                self.jsx_tag_name(i, end)
+            }
+            _ => {
+                let mut k = i + 1;
+                while k < end && b[k] != b'<' && b[k] != b'{' {
+                    k += 1;
+                }
+                k
+            }
         }
     }
 
@@ -1536,6 +2000,93 @@ mod tests {
         let (t, s) = kinds(Lang::Sql, s, "line'); /* x");
         assert_eq!(t[0], ("line'".into(), Kind::Str));
         assert_eq!(s, State::Comment);
+    }
+
+    #[test]
+    fn jsx() {
+        let tok = |t: &[(String, Kind)], s: &str, k: Kind| t.contains(&(s.to_string(), k));
+        let (t, s) = kinds(Lang::JavaScript, State::Normal, r#"return <div className="a">Ciao {nome}, l'utente</div>;"#);
+        assert_eq!(s, State::Normal);
+        assert!(tok(&t, "div", Kind::Tag) && tok(&t, "className", Kind::Attr) && tok(&t, "\"a\"", Kind::Str));
+        // Text is not code: the apostrophe opens no string.
+        assert!(!t.iter().any(|x| x.1 == Kind::Str && x.0.contains("utente")));
+        // Over several lines, with JSX inside an expression.
+        let mut st = State::Normal;
+        let lines = [
+            "export default function Page({ items }) {",
+            "  return (",
+            "    <ul",
+            "      className=\"lista\">",
+            "      {items.map((i) => <li key={i.id}>{i.nome}</li>)}",
+            "      <Card.Header title='x' />",
+            "    </ul>",
+            "  );",
+            "}",
+        ];
+        let mut all = Vec::new();
+        for (n, l) in lines.iter().enumerate() {
+            let (t, s) = kinds(Lang::Tsx, st, l);
+            if (2..7).contains(&n) {
+                assert!(matches!(s, State::Jsx(_)) || n == 6, "riga {n}: {s:?}");
+            }
+            all.extend(t);
+            st = s;
+        }
+        assert_eq!(st, State::Normal);
+        assert!(tok(&all, "className", Kind::Attr) && tok(&all, "li", Kind::Tag) && tok(&all, "Card.Header", Kind::Type));
+        assert!(tok(&all, "map", Kind::Function));
+        // Comparisons and TypeScript generics are not tags.
+        let (t, _) = kinds(Lang::JavaScript, State::Normal, "if (a <b && useState<string>(x)) {}");
+        assert!(!t.iter().any(|x| x.1 == Kind::Tag));
+        let (t, s) = kinds(Lang::TypeScript, State::Normal, "const f = <T>(x: T) => x;");
+        assert!(!t.iter().any(|x| x.1 == Kind::Tag) && s == State::Normal);
+    }
+
+    #[test]
+    fn jsx_markup_comments() {
+        let src = "function A() {\n  return (\n    <div>\n";
+        assert!(in_jsx_markup(Lang::Tsx, src));
+        assert!(!in_jsx_markup(Lang::Tsx, "function A() {\n"));
+        assert!(!in_jsx_markup(Lang::TypeScript, src));
+        assert_eq!(crate::format::toggle_comment_with("{/*", "*/}", &["    <p>x</p>"]), ["    {/* <p>x</p> */}"]);
+        assert_eq!(crate::format::toggle_comment_with("{/*", "*/}", &["    {/* <p>x</p> */}"]), ["    <p>x</p>"]);
+    }
+
+    #[test]
+    fn csharp() {
+        let (t, s) = kinds(Lang::CSharp, State::Normal, r#"var p = @"C:\dir\"; var m = $"Ciao {nome}"; // fine"#);
+        assert_eq!(s, State::Normal);
+        assert!(t.contains(&(r#"@"C:\dir\""#.into(), Kind::Str)));
+        assert!(t.contains(&(r#"$"Ciao {nome}""#.into(), Kind::Str)));
+        assert!(t.contains(&("var".into(), Kind::Keyword)));
+        let (_, s) = kinds(Lang::CSharp, State::Normal, r#"string sql = @"SELECT *"#);
+        assert_eq!(s, State::Str(b'@'));
+        let (t, s) = kinds(Lang::CSharp, s, r#"FROM ""t"""; int x;"#);
+        assert_eq!(s, State::Normal);
+        assert!(t.contains(&("int".into(), Kind::Type)));
+        let (t, _) = kinds(Lang::CSharp, State::Normal, "#region Metodi");
+        assert!(t.iter().any(|x| x.1 == Kind::Preproc));
+    }
+
+    #[test]
+    fn perl() {
+        let tok = |t: &[(String, Kind)], s: &str, k: Kind| t.contains(&(s.to_string(), k));
+        let (t, s) = kinds(Lang::Perl, State::Normal, r#"my @lista = qw(a b c); my %h; print $#lista, "$x\n" if $s =~ /^a.*b$/i; # nota"#);
+        assert_eq!(s, State::Normal);
+        assert!(tok(&t, "@lista", Kind::Variable) && tok(&t, "%h", Kind::Variable) && tok(&t, "$#lista", Kind::Variable), "{t:?}");
+        assert!(tok(&t, "qw(a b c)", Kind::Str) && tok(&t, "/^a.*b$/i", Kind::Str) && tok(&t, "# nota", Kind::Comment));
+        let (t, _) = kinds(Lang::Perl, State::Normal, "$t =~ s{foo}{bar}g; $n = $a % $b; $r = $x / 2;");
+        assert!(tok(&t, "s{foo}{bar}g", Kind::Str));
+        assert!(!t.iter().any(|x| x.0.starts_with('%') || x.0.starts_with("/ 2")));
+        let (t, _) = kinds(Lang::Perl, State::Normal, "sub saluta { my ($nome) = @_; }");
+        assert!(tok(&t, "saluta", Kind::Function) && tok(&t, "@_", Kind::Variable));
+        // POD blocks.
+        let (_, s) = kinds(Lang::Perl, State::Normal, "=head1 NOME");
+        assert_eq!(s, State::Comment);
+        let (t, s) = kinds(Lang::Perl, s, "my $x = 'non è codice';");
+        assert!(s == State::Comment && t.len() == 1);
+        let (_, s) = kinds(Lang::Perl, s, "=cut");
+        assert_eq!(s, State::Normal);
     }
 
     #[test]

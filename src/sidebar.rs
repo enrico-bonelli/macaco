@@ -24,6 +24,8 @@ pub struct Handlers {
     pub error: Box<dyn Fn(&str, &str)>,
     /// Git action ("add", "unstage", "restore") on a path.
     pub git: Box<dyn Fn(&str, &Path)>,
+    /// Add a file or folder to the bookmarks.
+    pub bookmark: Box<dyn Fn(&Path)>,
 }
 
 /// A row widget of the list (rows are recycled while scrolling).
@@ -88,6 +90,7 @@ fn build_menu(context: bool, git: &[(&str, &str)]) -> gio::Menu {
         s3.append(Some("Rinomina…"), Some("side.rename"));
         s3.append(Some("Sposta nel cestino"), Some("side.trash"));
         s3.append(Some("Copia percorso"), Some("side.copy-path"));
+        s3.append(Some("Aggiungi ai preferiti"), Some("side.bookmark"));
         menu.append_section(None, &s3);
     }
     let sg = gio::Menu::new();
@@ -325,6 +328,11 @@ impl Sidebar {
             s.widget.clipboard().set_text(&p.to_string_lossy());
         });
         add("set-workdir", |s| (s.handlers.set_workdir)(Some(s.context_dir())));
+        add("bookmark", |s| {
+            if let Some(p) = s.context.borrow().clone() {
+                (s.handlers.bookmark)(&p);
+            }
+        });
         for name in ["add", "unstage", "restore", "changes"] {
             let a = gio::SimpleAction::new(&format!("git-{name}"), None);
             let w = Rc::downgrade(self);

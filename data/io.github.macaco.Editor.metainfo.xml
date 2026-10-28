@@ -11,11 +11,13 @@
       Le funzioni più pesanti si attivano solo quando servono.
     </p>
     <ul>
-      <li>Evidenziazione della sintassi per 16 linguaggi, tra cui Rust, C/C++, Python, PHP, JavaScript/TypeScript, Vue, Go, Java, SQL e Markdown</li>
+      <li>Evidenziazione della sintassi per 18 linguaggi, tra cui Rust, C/C++, C#, Python, PHP, Perl, JavaScript/TypeScript con React (JSX/TSX) e Next.js, Vue, Go, Java, SQL e Markdown</li>
       <li>Formattazione del codice, schede affiancate con confronto (diff), conversione tra codifiche</li>
       <li>Cartella di lavoro con pannello file, ricerca veloce dei file e ricerca nel testo del progetto</li>
       <li>Analisi del codice: vai alla definizione, trova utilizzi e completamento, anche tramite language server, e verifica del file con elenco dei problemi</li>
       <li>Piegatura del codice: funzioni e blocchi si chiudono lasciando visibile solo la firma</li>
+      <li>Preferiti per riaprire al volo file e cartelle usati spesso</li>
+      <li>Avviso quando un file aperto viene modificato da un altro programma, con ricarica dal disco</li>
       <li>Integrazione con git e terminale integrato</li>
       <li>Recupero automatico dei documenti non salvati</li>
     </ul>
@@ -35,6 +37,11 @@
   </categories>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="0.4.0" date="2026-10-28">
+      <description>
+        <p>Supporto per C#, Perl e React (JSX/TSX) con Next.js; preferiti; avviso e ricarica quando un file aperto viene modificato da un altro programma; comando «Unisci righe»; nelle schede con lo stesso nome compare la cartella.</p>
+      </description>
+    </release>
     <release version="0.3.5" date="2026-10-16">
       <description>
         <p>Piegatura del codice (funzioni, classi e blocchi) e verifica del file su richiesta con i language server, con elenco dei problemi e sottolineature nel codice. Corretto lo scorrimento dell'elenco dei completamenti con i tasti freccia.</p>

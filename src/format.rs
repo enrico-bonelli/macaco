@@ -62,6 +62,8 @@ fn external(lang: Lang, path: Option<&Path>, tab: u32) -> Vec<(&'static str, Vec
         Lang::Java => "java",
         Lang::JavaScript => "js",
         Lang::TypeScript => "ts",
+        Lang::Tsx => "tsx",
+        Lang::CSharp => "cs",
         Lang::Css => "css",
         Lang::Html => "html",
         Lang::Vue => "vue",
@@ -83,8 +85,9 @@ fn external(lang: Lang, path: Option<&Path>, tab: u32) -> Vec<(&'static str, Vec
     let prettier = || ("prettier", vec!["--stdin-filepath".to_string(), fake.clone()]);
     match lang {
         Lang::Rust => vec![("rustfmt", vec!["--edition".into(), "2024".into()])],
-        Lang::C | Lang::Cpp | Lang::Java => vec![clang()],
-        Lang::JavaScript | Lang::TypeScript => vec![prettier(), clang()],
+        Lang::C | Lang::Cpp | Lang::Java | Lang::CSharp => vec![clang()],
+        Lang::JavaScript | Lang::TypeScript | Lang::Tsx => vec![prettier(), clang()],
+        Lang::Perl => vec![("perltidy", vec!["-st".into(), "-se".into(), format!("-i={tab}")])],
         Lang::Css | Lang::Html | Lang::Vue | Lang::Yaml | Lang::Markdown => vec![prettier()],
         Lang::Go => vec![("gofmt", vec![])],
         Lang::Python => vec![("ruff", vec!["format".into(), "-".into()]), ("black", vec!["-q".into(), "-".into()])],
@@ -106,8 +109,8 @@ pub fn format(lang: Lang, path: Option<&Path>, text: &str, tab: u32, spaces: boo
     }
     let unit = if spaces && !lang.prefers_tabs() { " ".repeat(tab as usize) } else { "\t".to_string() };
     let text = match lang {
-        Lang::C | Lang::Cpp | Lang::Rust | Lang::Java | Lang::JavaScript | Lang::TypeScript | Lang::Go
-        | Lang::Php | Lang::Css => reindent_braces(lang, text, &unit),
+        Lang::C | Lang::Cpp | Lang::CSharp | Lang::Rust | Lang::Java | Lang::JavaScript | Lang::TypeScript
+        | Lang::Tsx | Lang::Go | Lang::Php | Lang::Css | Lang::Perl => reindent_braces(lang, text, &unit),
         Lang::Bash => reindent_shell(text, &unit),
         Lang::Html | Lang::Vue => reindent_html(text, &unit),
         Lang::Markdown => tidy_markdown(text),
@@ -471,36 +474,39 @@ pub fn embedded_lang(lang: Lang, before: &str) -> Lang {
 
 pub fn toggle_comment(lang: Lang, lines: &[&str]) -> Option<Vec<String>> {
     let (pre, post) = lang.comment_tokens()?;
+    Some(toggle_comment_with(pre, post, lines))
+}
+
+/// Comment or uncomment `lines` with the given prefix and suffix.
+pub fn toggle_comment_with(pre: &str, post: &str, lines: &[&str]) -> Vec<String> {
     let nonempty = lines.iter().filter(|l| !l.trim().is_empty());
     let all_commented = nonempty.clone().count() > 0
         && nonempty.clone().all(|l| l.trim_start().starts_with(pre) && l.trim_end().ends_with(post));
     let min_indent = nonempty.map(|l| l.len() - l.trim_start().len()).min().unwrap_or(0);
-    Some(
-        lines
-            .iter()
-            .map(|l| {
-                if l.trim().is_empty() {
-                    return l.to_string();
-                }
-                if all_commented {
-                    let ind = l.len() - l.trim_start().len();
-                    let body = &l[ind + pre.len()..];
-                    let body = body.strip_prefix(' ').unwrap_or(body);
-                    let body = if post.is_empty() {
-                        body
-                    } else {
-                        let b = body.trim_end().strip_suffix(post).unwrap_or(body);
-                        b.strip_suffix(' ').unwrap_or(b)
-                    };
-                    format!("{}{}", &l[..ind], body)
-                } else if post.is_empty() {
-                    format!("{}{} {}", &l[..min_indent], pre, &l[min_indent..])
+    lines
+        .iter()
+        .map(|l| {
+            if l.trim().is_empty() {
+                return l.to_string();
+            }
+            if all_commented {
+                let ind = l.len() - l.trim_start().len();
+                let body = &l[ind + pre.len()..];
+                let body = body.strip_prefix(' ').unwrap_or(body);
+                let body = if post.is_empty() {
+                    body
                 } else {
-                    format!("{}{} {} {}", &l[..min_indent], pre, &l[min_indent..], post)
-                }
-            })
-            .collect(),
-    )
+                    let b = body.trim_end().strip_suffix(post).unwrap_or(body);
+                    b.strip_suffix(' ').unwrap_or(b)
+                };
+                format!("{}{}", &l[..ind], body)
+            } else if post.is_empty() {
+                format!("{}{} {}", &l[..min_indent], pre, &l[min_indent..])
+            } else {
+                format!("{}{} {} {}", &l[..min_indent], pre, &l[min_indent..], post)
+            }
+        })
+        .collect()
 }
 
 /// Join `lines` into one: the indentation of the following lines and

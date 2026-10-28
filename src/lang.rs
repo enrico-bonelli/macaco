@@ -7,37 +7,44 @@ pub enum Lang {
     Plain,
     C,
     Cpp,
+    CSharp,
     Rust,
     Php,
     Bash,
     Python,
     JavaScript,
     TypeScript,
+    /// TypeScript with JSX (React): `.tsx` files.
+    Tsx,
     Yaml,
     Html,
     Css,
     Java,
     Go,
+    Perl,
     Markdown,
     Sql,
     Vue,
 }
 
-pub const ALL: [Lang; 17] = [
+pub const ALL: [Lang; 20] = [
     Lang::Plain,
     Lang::C,
     Lang::Cpp,
+    Lang::CSharp,
     Lang::Rust,
     Lang::Php,
     Lang::Bash,
     Lang::Python,
     Lang::JavaScript,
     Lang::TypeScript,
+    Lang::Tsx,
     Lang::Yaml,
     Lang::Html,
     Lang::Css,
     Lang::Java,
     Lang::Go,
+    Lang::Perl,
     Lang::Markdown,
     Lang::Sql,
     Lang::Vue,
@@ -107,6 +114,39 @@ const CPP_TYPES: &[&str] = &[
     "pair", "tuple", "string_view",
 ];
 const CPP_CONST: &[&str] = &["nullptr", "NULL", "true", "false"];
+
+const CS_KW: &[&str] = &[
+    "abstract", "as", "base", "break", "case", "catch", "checked", "class", "const", "continue",
+    "default", "delegate", "do", "else", "enum", "event", "explicit", "extern", "finally", "fixed",
+    "for", "foreach", "goto", "if", "implicit", "in", "interface", "internal", "is", "lock",
+    "namespace", "new", "operator", "out", "override", "params", "private", "protected", "public",
+    "readonly", "ref", "return", "sealed", "sizeof", "stackalloc", "static", "struct", "switch",
+    "this", "throw", "try", "typeof", "unchecked", "unsafe", "using", "virtual", "volatile",
+    "while", "async", "await", "var", "get", "set", "init", "value", "yield", "partial",
+    "record", "where", "when", "with", "nameof", "global", "required", "file", "and", "or", "not",
+];
+const CS_TYPES: &[&str] = &[
+    "bool", "byte", "sbyte", "char", "decimal", "double", "float", "int", "uint", "long", "ulong",
+    "short", "ushort", "object", "string", "void", "nint", "nuint", "dynamic",
+];
+const CS_CONST: &[&str] = &["true", "false", "null", "default"];
+
+const PERL_KW: &[&str] = &[
+    "my", "our", "local", "state", "sub", "package", "use", "no", "require", "if", "elsif",
+    "else", "unless", "while", "until", "for", "foreach", "last", "next", "redo", "return", "do",
+    "eval", "die", "BEGIN", "END", "and", "or", "not", "xor", "eq", "ne", "lt", "gt", "le", "ge",
+    "cmp", "x", "__PACKAGE__", "__FILE__", "__LINE__", "__DATA__", "__END__", "wantarray",
+];
+const PERL_CONST: &[&str] = &["undef"];
+const PERL_BUILTINS: &[&str] = &[
+    "print", "printf", "say", "open", "close", "chomp", "chop", "push", "pop", "shift", "unshift",
+    "splice", "split", "join", "map", "grep", "sort", "reverse", "keys", "values", "each",
+    "exists", "delete", "defined", "ref", "bless", "scalar", "sprintf", "length", "substr",
+    "index", "rindex", "lc", "uc", "lcfirst", "ucfirst", "abs", "int", "sqrt", "rand", "time",
+    "localtime", "gmtime", "sleep", "exit", "warn", "chdir", "mkdir", "rmdir", "unlink",
+    "opendir", "readdir", "closedir", "binmode", "eof", "system", "exec", "fork", "wait",
+    "waitpid", "kill", "local", "croak", "carp", "confess",
+];
 
 const RUST_KW: &[&str] = &[
     "as", "async", "await", "break", "const", "continue", "crate", "dyn", "else", "enum",
@@ -346,6 +386,28 @@ static JS: Spec = Spec {
     ..BASE
 };
 static TS: Spec = Spec { keywords: TS_KW, types: TS_TYPES, ..JS };
+static CSHARP: Spec = Spec {
+    line_comment: &["//"],
+    block_comment: Some(("/*", "*/")),
+    keywords: CS_KW,
+    types: CS_TYPES,
+    constants: CS_CONST,
+    triple_quotes: b"\"",
+    preprocessor: true,
+    cap_types: true,
+    ..BASE
+};
+static PERL: Spec = Spec {
+    line_comment: &["#"],
+    keywords: PERL_KW,
+    constants: PERL_CONST,
+    builtins: PERL_BUILTINS,
+    quotes: b"\"'`",
+    multiline_quotes: b"\"'`",
+    dollar_vars: true,
+    cap_types: true,
+    ..BASE
+};
 static JAVA: Spec = Spec {
     line_comment: &["//"],
     block_comment: Some(("/*", "*/")),
@@ -393,17 +455,20 @@ impl Lang {
             Lang::Plain => "plain",
             Lang::C => "c",
             Lang::Cpp => "cpp",
+            Lang::CSharp => "csharp",
             Lang::Rust => "rust",
             Lang::Php => "php",
             Lang::Bash => "bash",
             Lang::Python => "python",
             Lang::JavaScript => "javascript",
             Lang::TypeScript => "typescript",
+            Lang::Tsx => "tsx",
             Lang::Yaml => "yaml",
             Lang::Html => "html",
             Lang::Css => "css",
             Lang::Java => "java",
             Lang::Go => "go",
+            Lang::Perl => "perl",
             Lang::Markdown => "markdown",
             Lang::Sql => "sql",
             Lang::Vue => "vue",
@@ -415,17 +480,20 @@ impl Lang {
             Lang::Plain => "Testo semplice",
             Lang::C => "C",
             Lang::Cpp => "C++",
+            Lang::CSharp => "C#",
             Lang::Rust => "Rust",
             Lang::Php => "PHP",
             Lang::Bash => "Bash",
             Lang::Python => "Python",
-            Lang::JavaScript => "JavaScript",
+            Lang::JavaScript => "JavaScript / JSX",
             Lang::TypeScript => "TypeScript",
+            Lang::Tsx => "TypeScript React (TSX)",
             Lang::Yaml => "YAML",
             Lang::Html => "HTML",
             Lang::Css => "CSS",
             Lang::Java => "Java",
             Lang::Go => "Go",
+            Lang::Perl => "Perl",
             Lang::Markdown => "Markdown",
             Lang::Sql => "SQL",
             Lang::Vue => "Vue",
@@ -441,17 +509,19 @@ impl Lang {
             Lang::Plain => &PLAIN,
             Lang::C => &C,
             Lang::Cpp => &CPP,
+            Lang::CSharp => &CSHARP,
             Lang::Rust => &RUST,
             Lang::Php => &PHP,
             Lang::Bash => &BASH,
             Lang::Python => &PYTHON,
             Lang::JavaScript => &JS,
-            Lang::TypeScript => &TS,
+            Lang::TypeScript | Lang::Tsx => &TS,
             Lang::Yaml => &YAML,
             Lang::Html => &HTML,
             Lang::Css => &CSS,
             Lang::Java => &JAVA,
             Lang::Go => &GO,
+            Lang::Perl => &PERL,
             Lang::Markdown => &MARKDOWN,
             Lang::Sql => &SQL,
             Lang::Vue => &VUE,
@@ -479,7 +549,10 @@ impl Lang {
             "bash" | "sh" | "shell" | "zsh" | "console" | "shellsession" => Lang::Bash,
             "python" | "py" | "python3" => Lang::Python,
             "js" | "javascript" | "jsx" | "json" | "jsonc" | "node" => Lang::JavaScript,
-            "ts" | "typescript" | "tsx" => Lang::TypeScript,
+            "ts" | "typescript" => Lang::TypeScript,
+            "tsx" => Lang::Tsx,
+            "cs" | "csharp" | "c#" => Lang::CSharp,
+            "perl" | "pl" | "pm" => Lang::Perl,
             "yaml" | "yml" => Lang::Yaml,
             "html" | "xml" | "svg" | "xhtml" => Lang::Html,
             "css" | "scss" | "less" => Lang::Css,
@@ -513,6 +586,8 @@ pub fn detect(path: Option<&Path>, head: &str) -> Lang {
             ".bashrc" | ".bash_profile" | ".bash_logout" | ".profile" | ".zshrc" | ".zprofile"
             | "pkgbuild" | ".xinitrc" | "bashrc" => return Lang::Bash,
             "cmakelists.txt" => return Lang::Plain,
+            // Environment files (Next.js, Vite, docker compose…): KEY=value.
+            n if n == ".env" || n.starts_with(".env.") || n == ".envrc" => return Lang::Bash,
             _ => {}
         }
         if let Some(ext) = lower.rsplit_once('.').map(|(_, e)| e) {
@@ -525,7 +600,10 @@ pub fn detect(path: Option<&Path>, head: &str) -> Lang {
                 "sh" | "bash" | "zsh" | "ksh" | "ebuild" | "install" => Lang::Bash,
                 "py" | "pyw" | "pyi" => Lang::Python,
                 "js" | "mjs" | "cjs" | "jsx" | "json" | "jsonc" => Lang::JavaScript,
-                "ts" | "tsx" | "mts" | "cts" => Lang::TypeScript,
+                "ts" | "mts" | "cts" => Lang::TypeScript,
+                "tsx" => Lang::Tsx,
+                "cs" | "csx" => Lang::CSharp,
+                "pl" | "pm" | "t" | "psgi" | "pod" => Lang::Perl,
                 "yml" | "yaml" => Lang::Yaml,
                 "html" | "htm" | "xhtml" | "xml" | "svg" => Lang::Html,
                 "vue" => Lang::Vue,
@@ -558,6 +636,7 @@ fn detect_content(head: &str) -> Lang {
             "python" => Lang::Python,
             "node" | "nodejs" | "deno" | "bun" => Lang::JavaScript,
             "php" => Lang::Php,
+            "perl" => Lang::Perl,
             _ => Lang::Plain,
         };
     }
@@ -592,5 +671,10 @@ mod tests {
         assert_eq!(detect(Some(Path::new("schema.SQL")), ""), Lang::Sql);
         assert_eq!(Lang::from_fence("postgresql"), Lang::Sql);
         assert_eq!(detect(Some(Path::new("src/App.vue")), ""), Lang::Vue);
+        assert_eq!(detect(Some(Path::new("app/page.tsx")), ""), Lang::Tsx);
+        assert_eq!(detect(Some(Path::new("Program.cs")), ""), Lang::CSharp);
+        assert_eq!(detect(Some(Path::new("lib/Foo.pm")), ""), Lang::Perl);
+        assert_eq!(detect(Some(Path::new("tool")), "#!/usr/bin/env perl\n"), Lang::Perl);
+        assert_eq!(detect(Some(Path::new(".env.local")), ""), Lang::Bash);
     }
 }

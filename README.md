@@ -5,12 +5,15 @@ GTK 4.
 
 macaco unisce la reattività di un editor minimale agli strumenti che servono
 ogni giorno a chi lavora su progetti:
-- evidenziazione della sintassi per 16 linguaggi, Vue compreso;
+- evidenziazione della sintassi per 18 linguaggi, con React (JSX/TSX),
+  Next.js e Vue;
 - formattazione del codice;
 - confronto tra file;
 - pannello dei file, ricerca veloce dei file e ricerca di testo nel progetto;
 - analisi del codice: vai alla definizione, trova utilizzi, completamento
   (anche con i language server);
+- preferiti, per riaprire al volo i file che usi spesso;
+- avviso quando un file aperto viene modificato da un altro programma;
 - integrazione con git;
 - terminale integrato.
 
@@ -26,6 +29,8 @@ Tutto questo senza rinunciare alla leggerezza: all'avvio occupa circa
 - [Funzionalità](#funzionalità)
   - [Scrittura e modifica](#scrittura-e-modifica)
   - [Piegatura del codice](#piegatura-del-codice)
+  - [Preferiti](#preferiti)
+  - [File modificati da altri programmi](#file-modificati-da-altri-programmi)
   - [Linguaggi supportati](#linguaggi-supportati)
   - [Formattazione del codice](#formattazione-del-codice)
   - [Cerca e sostituisci](#cerca-e-sostituisci)
@@ -130,8 +135,9 @@ Così non si rischia di scrivere nella funzione sbagliata.
     piega i blocchi più esterni;
   - `Ctrl+Alt++` espande tutto.
 - **I blocchi si trovano** con le parentesi `{}`, `()` e `[]` (ignorando
-  stringhe e commenti) in C, C++, Rust, PHP, Bash, JavaScript, TypeScript,
-  CSS, Java, Go e Vue, e con l'indentazione in Python, YAML e HTML. La
+  stringhe e commenti) in C, C++, C#, Rust, PHP, Bash, Perl, JavaScript,
+  TypeScript, JSX/TSX, CSS, Java, Go e Vue, e con l'indentazione in Python,
+  YAML e HTML. La
   parentesi di chiusura resta visibile sotto l'intestazione; con lo stile
   Allman (graffa da sola sulla riga) l'intestazione è la riga della firma.
 - **Il testo nascosto non si modifica per sbaglio:**
@@ -146,6 +152,41 @@ Così non si rischia di scrivere nella funzione sbagliata.
   parte di una selezione; le pieghe restano anche quando una scheda
   nascosta viene scaricata dalla memoria e ricaricata.
 
+### Preferiti
+
+I file (e le cartelle) che usi spesso si possono mettere nei **preferiti**
+e riaprire da ovunque, senza cercarli.
+- **Aggiungere:** menu *Preferiti → File corrente nei preferiti*
+  (`Ctrl+Alt+B`, di nuovo per toglierlo). Dal pannello file, clic destro →
+  *Aggiungi ai preferiti*, anche su una cartella.
+- **Aprire:**
+  - dal menu *Preferiti*, che li elenca tutti;
+  - oppure con *Apri un preferito…* (`Ctrl+Maiusc+B`): una finestra con un
+    filtro, si scrive parte del nome o della cartella, ↑/↓ e Invio. Una
+    cartella diventa la cartella di lavoro.
+- **Togliere:** nella stessa finestra, il pulsante a destra di ogni riga.
+  I preferiti che non esistono più sono segnati «non trovato».
+- Se rinomini o sposti un file dal pannello file, il preferito lo segue.
+- Sono salvati in `~/.macaco/bookmarks`.
+
+### File modificati da altri programmi
+
+macaco si accorge se il file di una scheda viene cambiato da fuori: un
+altro editor, `git checkout`, un formattatore, uno script.
+- Una **barra in alto** avvisa che «il file è stato modificato da un altro
+  programma», con **Ricarica** e **Ignora**:
+  - *Ricarica* rilegge il file dal disco; se hai modifiche non salvate, la
+    barra lo dice e chiede conferma prima di perderle;
+  - *Ignora* tiene il testo dell'editor: avvisa di nuovo solo per modifiche
+    successive.
+- Se il file viene **eliminato o spostato**, la barra offre *Chiudi scheda*
+  o *Mantieni*: il testo resta nell'editor e salvandolo ricrei il file.
+- **Salvando** sopra un file cambiato da fuori, macaco chiede prima se vuoi
+  davvero sovrascriverlo.
+- Il controllo è immediato (osserva i file aperti) e si ripete quando la
+  finestra torna in primo piano o cambi scheda. Per le schede non visibili
+  compare un messaggio nella barra di stato e la barra quando le apri.
+
 ### Linguaggi supportati
 
 Ogni linguaggio ha un lexer interno con colorazione di parole chiave, tipi,
@@ -154,15 +195,19 @@ costanti, funzioni, stringhe, numeri, commenti e direttive.
 | Linguaggio | Riconosciuto da |
 |---|---|
 | C, C++ | `.c` `.h` / `.cpp` `.cc` `.hpp` `.ino` … |
+| C# | `.cs` `.csx` |
 | Rust | `.rs` |
 | Go | `.go` |
 | Java | `.java` |
 | Python | `.py` `.pyw` `.pyi`, shebang `python` |
-| JavaScript, TypeScript | `.js` `.mjs` `.jsx` `.json` / `.ts` `.tsx` |
+| JavaScript con JSX (React) | `.js` `.mjs` `.cjs` `.jsx` `.json` |
+| TypeScript | `.ts` `.mts` `.cts` |
+| TypeScript React (TSX) | `.tsx` |
+| Perl | `.pl` `.pm` `.t` `.psgi` `.pod`, shebang `perl` |
 | PHP (anche misto a HTML) | `.php` `.phtml`, contenuto `<?php` |
 | HTML (con CSS e JS incorporati), XML, SVG | `.html` `.htm` `.xml` `.svg` `.vue`, `<!DOCTYPE html>` |
 | CSS, SCSS, Less | `.css` `.scss` `.less` |
-| Bash e shell | `.sh` `.bash` `.zsh`, `PKGBUILD`, `.bashrc`, shebang `sh`/`bash`/`zsh` |
+| Bash e shell | `.sh` `.bash` `.zsh`, `PKGBUILD`, `.bashrc`, file `.env` `.env.local` …, shebang `sh`/`bash`/`zsh` |
 | YAML | `.yml` `.yaml`, `---` iniziale |
 | Markdown | `.md` `.markdown` `.mdx` … |
 | SQL (PostgreSQL, MySQL/MariaDB, SQLite) | `.sql` `.pgsql` `.psql` `.mysql` `.ddl` `.dml` |
@@ -182,6 +227,32 @@ costanti, funzioni, stringhe, numeri, commenti e direttive.
   *Commenta/decommenta* usa `<!-- -->` nel template, `//` nello script e
   `/* */` nello stile; lo stesso vale per gli script e gli stili delle
   pagine HTML.
+- **React (JSX e TSX):**
+  - nei file JavaScript e TSX i tag sono colorati come HTML, i componenti
+    (`<Card>`, `<Menu.Item>`) come tipi, gli attributi a parte;
+  - i valori `{…}`, anche con altro JSX dentro (`items.map(i => <li>…</li>)`),
+    sono colorati come codice;
+  - il testo tra i tag resta testo: un apostrofo non apre una stringa;
+  - tag e attributi possono andare a capo su più righe;
+  - nei file `.ts` il JSX non è attivo, così `<T>(x) => …` resta un
+    generico.
+
+  *Commenta/decommenta* dentro il markup usa `{/* … */}`.
+- **Next.js:**
+  - componenti e pagine sono JSX/TSX;
+  - i file `.env`, `.env.local` … sono colorati come shell;
+  - le schede con lo stesso nome mostrano anche la cartella
+    (`page.tsx · dashboard`, `page.tsx · blog`), così le tante `page.tsx` e
+    `layout.tsx` di un progetto si distinguono.
+- **C#:** stringhe verbatim `@"…"` (anche su più righe, con `""`),
+  interpolate `$"…"` e raw `"""…"""`, direttive `#region` / `#if`.
+- **Perl:**
+  - variabili `$x` `@lista` `%hash` `$#lista` `$Pkg::nome`;
+  - operatori `q` `qq` `qw` `qr` `m` `s` `tr` con qualsiasi delimitatore;
+  - espressioni regolari dopo `=~` e `split`;
+  - documentazione POD fino a `=cut`.
+
+  Gli *here-document* (`<<EOF`) non sono riconosciuti.
 - **SQL** riconosce parole chiave, tipi e funzioni senza distinguere
   maiuscole e minuscole, i commenti `--` e `/* */` e le stringhe su più
   righe.
@@ -196,8 +267,9 @@ linguaggio, se è installato:
 | Linguaggio | Strumento |
 |---|---|
 | Rust | `rustfmt` |
-| C, C++, Java | `clang-format` (rispetta un eventuale `.clang-format` del progetto) |
-| JavaScript, TypeScript | `prettier`, poi `clang-format` |
+| C, C++, C#, Java | `clang-format` (rispetta un eventuale `.clang-format` del progetto) |
+| JavaScript, TypeScript, JSX, TSX | `prettier`, poi `clang-format` |
+| Perl | `perltidy` |
 | CSS, HTML, Vue, YAML, Markdown | `prettier` |
 | Go | `gofmt` |
 | Python | `ruff`, poi `black` |
@@ -240,7 +312,9 @@ La formattazione è un'unica operazione annullabile.
     contenuto;
   - `•` indica modifiche non salvate;
   - si riordinano e si trascinano tra i pannelli;
-  - si chiudono anche con il clic centrale.
+  - si chiudono anche con il clic centrale;
+  - con più file aperti dallo stesso nome mostrano anche la cartella che li
+    distingue (`index.js · src/api`, `index.js · src/ui`).
 - **Vista affiancata** (`Ctrl+\` o `F8`): due pannelli con le proprie
   schede; `Ctrl+Maiusc+M` sposta la scheda nell'altro pannello.
 - **Confronto (diff)** tra le due schede affiancate (`F9`):
@@ -446,10 +520,12 @@ protocollo LSP di VS Code e altri editor), che capiscono davvero il codice:
 | Rust | `rust-analyzer` | `rust-analyzer` (o `rustup component add rust-analyzer`) |
 | C, C++ | `clangd` | `clang` |
 | Python | `basedpyright`, `pyright`, `pylsp`, `jedi-language-server` | `pyright`, `python-lsp-server` |
-| JavaScript, TypeScript | `typescript-language-server` | `typescript-language-server` |
+| JavaScript, TypeScript, JSX, TSX (React, Next.js) | `typescript-language-server` | `typescript-language-server` |
 | Go | `gopls` | `gopls` |
 | PHP | `intelephense` (consigliato), `phpactor` | `npm install -g intelephense` (serve Node.js); `phpactor` (AUR, serve PHP) |
 | Java | `jdtls` | `jdtls` (AUR) |
+| C# | `csharp-ls`, `OmniSharp` | `dotnet tool install -g csharp-ls`; `omnisharp-roslyn` (AUR) |
+| Perl | `perlnavigator` | `npm install -g perlnavigator-server` |
 | Bash | `bash-language-server` | `bash-language-server` |
 | Markdown | `marksman` | `marksman` |
 | SQL | `sqls` | `sqls` (AUR) |
@@ -607,6 +683,8 @@ cartella di lavoro o, se non c'è, del file attivo.
 | `Ctrl+Maiusc+I` | formatta documento |
 | `Ctrl+Maiusc+-` / `Ctrl+Maiusc++` | piega / espandi il blocco |
 | `Ctrl+Alt+-` / `Ctrl+Alt++` | piega tutte le funzioni / espandi tutto |
+| `Ctrl+Alt+B` | file corrente nei preferiti (aggiungi / togli) |
+| `Ctrl+Maiusc+B` | apri un preferito |
 | `Alt+Z` | a capo automatico |
 | `Ctrl++` / `Ctrl+-` / `Ctrl+0` | zoom |
 | `Ctrl+\`, `F8` | affianca schede |

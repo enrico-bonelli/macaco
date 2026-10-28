@@ -19,6 +19,8 @@ use std::ops::Range;
 use std::rc::{Rc, Weak};
 use std::time::{Duration, Instant};
 
+mod bookmarks;
+mod external;
 mod gitui;
 mod inspect;
 mod lspui;
@@ -72,6 +74,9 @@ pub struct Editor {
     active_pane: Cell<usize>,
     recent: RefCell<Vec<PathBuf>>,
     recent_menu: gio::Menu,
+    /// Favourite files and folders, and the "Preferiti" menu listing them.
+    bookmarks: RefCell<Vec<PathBuf>>,
+    bookmarks_menu: gio::Menu,
     search: SearchUi,
     status: StatusUi,
     lang_action: gio::SimpleAction,
@@ -138,6 +143,9 @@ pub struct Editor {
     lsp_check: RefCell<Option<problems::Check>>,
     problems: problems::ProblemsUi,
     problems_shown: RefCell<problems::Shown>,
+    /// Files changed by other programs: bar and documents waiting for a check.
+    disk_bar: external::DiskBar,
+    disk_pending: RefCell<std::collections::HashSet<String>>,
 }
 
 /// Shortcuts that keep working while the terminal has the focus; all the
@@ -151,6 +159,32 @@ const TERMINAL_ACCELS: &[&str] = &[
     "win.zoom-out",
     "win.zoom-reset",
 ];
+
+/// For each path, the last folders that tell it from the other paths with
+/// the same file name (empty if the name is unique).
+fn tab_contexts(paths: &[Option<PathBuf>]) -> Vec<String> {
+    let folders = |p: &Path| -> Vec<String> {
+        p.parent().map(|d| d.iter().map(|c| c.to_string_lossy().into_owned()).collect()).unwrap_or_default()
+    };
+    paths
+        .iter()
+        .enumerate()
+        .map(|(i, p)| {
+            let Some(p) = p else { return String::new() };
+            let others: Vec<&PathBuf> =
+                paths.iter().enumerate().filter(|(j, q)| *j != i && q.as_ref().is_some_and(|q| q.file_name() == p.file_name() && q != p)).filter_map(|(_, q)| q.as_ref()).collect();
+            if others.is_empty() {
+                return String::new();
+            }
+            let mine = folders(p);
+            let tail = |f: &[String], k: usize| f[f.len().saturating_sub(k)..].to_vec();
+            let k = (1..=mine.len().min(4))
+                .find(|&k| others.iter().all(|o| tail(&folders(o), k) != tail(&mine, k)))
+                .unwrap_or(mine.len().min(4));
+            tail(&mine, k).join("/")
+        })
+        .collect()
+}
 
 /// Whether the current GTK theme is dark (light foreground color).
 fn system_prefers_dark() -> bool {
@@ -233,12 +267,15 @@ impl Editor {
         let (search_box, search) = Self::build_search_bar();
         let (status_box, status) = Self::build_status_bar();
         let problems = problems::build_panel();
+        let disk_bar = external::build_bar();
 
         let recent_menu = gio::Menu::new();
-        let menubar = gtk::PopoverMenuBar::from_model(Some(&Self::build_menu(&recent_menu)));
+        let bookmarks_menu = gio::Menu::new();
+        let menubar = gtk::PopoverMenuBar::from_model(Some(&Self::build_menu(&recent_menu, &bookmarks_menu)));
 
         let vbox = gtk::Box::new(gtk::Orientation::Vertical, 0);
         vbox.append(&menubar);
+        vbox.append(&disk_bar.revealer);
         vbox.append(&hpaned);
         vbox.append(&problems.revealer);
         vbox.append(&search_box);
@@ -266,6 +303,8 @@ impl Editor {
             active_pane: Cell::new(0),
             recent: RefCell::new(config::load_recent()),
             recent_menu,
+            bookmarks: RefCell::new(config::load_bookmarks()),
+            bookmarks_menu,
             search,
             status,
             lang_action,
@@ -309,6 +348,8 @@ impl Editor {
             lsp_check: RefCell::new(None),
             problems,
             problems_shown: RefCell::new(Default::default()),
+            disk_bar,
+            disk_pending: RefCell::new(Default::default()),
         });
         ed.apply_font();
         ed.apply_theme();
@@ -444,7 +485,7 @@ impl Editor {
         (bar, StatusUi { message, pos, goto, lang, enc, eol, diff, branch, lsp, mem })
     }
 
-    fn build_menu(recent: &gio::Menu) -> gio::Menu {
+    fn build_menu(recent: &gio::Menu, bookmarks: &gio::Menu) -> gio::Menu {
         let bar = gio::Menu::new();
 
         let file = gio::Menu::new();
@@ -547,6 +588,7 @@ impl Editor {
         v4.append(Some("Terminale nella cartella del file"), Some("win.terminal-here"));
         view.append_section(None, &v4);
         bar.append_submenu(Some("_Visualizza"), &view);
+        bar.append_submenu(Some("_Preferiti"), bookmarks);
 
         let langm = gio::Menu::new();
         for l in lang::ALL {
@@ -850,6 +892,8 @@ impl Editor {
         self.setup_inspect_actions();
         self.setup_lsp_actions();
         self.setup_problems_actions();
+        self.setup_bookmark_actions();
+        self.setup_disk_actions();
     }
 
     fn connect_ui(self: &Rc<Self>) {
@@ -1026,6 +1070,7 @@ impl Editor {
     /// Window-level signal handlers of a document.
     fn wire_doc(self: &Rc<Self>, d: &Rc<Doc>) {
         self.wire_inspect(d);
+        self.watch_doc(d);
         let ed = Rc::downgrade(self);
         let wd = d.weak();
         d.close_button.connect_clicked(move |_| {
@@ -1265,8 +1310,24 @@ impl Editor {
         }
     }
 
-    /// Warn about characters the target encoding cannot represent.
+    /// Ask before overwriting a file changed by another program, then
+    /// warn about characters the target encoding cannot represent.
     fn save_checked(self: &Rc<Self>, d: &Rc<Doc>, path: PathBuf, then: Option<Box<dyn FnOnce(bool)>>) {
+        let (ed, d2, p2) = (self.clone(), d.clone(), path.clone());
+        self.confirm_overwrite(
+            d,
+            &path,
+            Box::new(move |go| {
+                if go {
+                    ed.save_encoded(&d2, p2, then);
+                } else if let Some(t) = then {
+                    t(false);
+                }
+            }),
+        );
+    }
+
+    fn save_encoded(self: &Rc<Self>, d: &Rc<Doc>, path: PathBuf, then: Option<Box<dyn FnOnce(bool)>>) {
         let bad = encoding::unrepresentable(&d.text(), d.encoding.get());
         if bad == 0 {
             let ok = self.write_doc(d, &path);
@@ -1537,7 +1598,10 @@ impl Editor {
         // HTML and Vue: the comment syntax of the script or style block.
         let before = d.buffer.text(&d.buffer.start_iter(), &a, true);
         let lang = format::embedded_lang(d.lang.get(), &before);
-        let Some(new) = format::toggle_comment(lang, &lines) else {
+        // Inside JSX markup (React) comments are `{/* … */}`.
+        let jsx = crate::lexer::in_jsx_markup(lang, &before);
+        let new = if jsx { Some(format::toggle_comment_with("{/*", "*/}", &lines)) } else { format::toggle_comment(lang, &lines) };
+        let Some(new) = new else {
             self.message("Nessuna sintassi di commento per questo linguaggio");
             return;
         };
@@ -2118,6 +2182,16 @@ impl Editor {
     }
 
     fn layout_tabs(&self) {
+        // Tabs with the same file name (Next.js `page.tsx`, `index.js`…)
+        // also show their folders.
+        {
+            let docs = self.docs.borrow();
+            let paths: Vec<Option<PathBuf>> = docs.iter().map(|d| d.path.borrow().clone()).collect();
+            let contexts = tab_contexts(&paths);
+            for (d, c) in docs.iter().zip(contexts) {
+                d.set_label_context(c);
+            }
+        }
         let layout = self.win.create_pango_layout(Some("abcdefghijklmnopqrstuvwxyz"));
         let char_px = (layout.pixel_size().0 / 26).max(4);
         for nb in &self.notebooks {
@@ -2257,6 +2331,7 @@ impl Editor {
             let w4 = w.clone();
             let w5 = w.clone();
             let w6 = w.clone();
+            let w7 = w.clone();
             let s = Sidebar::new(sidebar::Handlers {
                 open: Box::new(move |p| {
                     if let Some(ed) = w.upgrade() {
@@ -2289,6 +2364,11 @@ impl Editor {
                 git: Box::new(move |action, p| {
                     if let Some(ed) = w6.upgrade() {
                         ed.git_path_action(action, p);
+                    }
+                }),
+                bookmark: Box::new(move |p| {
+                    if let Some(ed) = w7.upgrade() {
+                        ed.add_bookmark(p);
                     }
                 }),
             });
@@ -2417,6 +2497,7 @@ impl Editor {
 
     /// Updates open documents after a file or folder was renamed.
     fn renamed(self: &Rc<Self>, old: &Path, new: &Path) {
+        self.bookmarks_renamed(old, new);
         for d in self.docs.borrow().iter() {
             let moved = d.path.borrow().as_ref().and_then(|p| p.strip_prefix(old).ok().map(|rest| new.join(rest)));
             if let Some(p) = moved {
@@ -2534,6 +2615,12 @@ impl Editor {
         self.eol_action.set_state(&d.eol.get().id().to_variant());
         self.update_pos(d);
         self.update_title(d);
+        self.update_bookmark_state();
+        // The file may have changed while another tab was shown.
+        if d.is_loaded() {
+            d.disk_change.set(d.check_disk());
+        }
+        self.update_disk_bar();
     }
 
     fn update_pos(&self, d: &Doc) {
@@ -2645,6 +2732,7 @@ impl Editor {
              .sidebar .git-staged label, .changes-list .git-staged label.git-mark {{ color: {git_staged}; }}\n\
              .sidebar .git-modified label, .changes-list .git-modified label.git-mark {{ color: {git_mod}; }}\n\
              .sidebar .git-conflict label, .changes-list .git-conflict label.git-mark, button.git-branch.git-conflict {{ color: {git_conflict}; }}\n\
+             .disk-bar {{ padding: 6px 10px; background: alpha({p_warn}, 0.18); border-bottom: 1px solid alpha({p_warn}, 0.5); }}\n\
              .problems-panel {{ padding: 4px 6px; border-top: 1px solid alpha(currentColor, 0.12); }}\n\
              .problems-title {{ font-weight: bold; }}\n\
              .problems-list {{ background: transparent; }}\n\
@@ -3216,5 +3304,19 @@ impl Editor {
         let tex = renderer.render_texture(node, Some(&gtk::graphene::Rect::new(0.0, 0.0, w as f32, h as f32)));
         let _ = tex.save_to_png(path);
         eprintln!("screenshot {path}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn contexts() {
+        let p = |s: &str| Some(PathBuf::from(s));
+        let c = tab_contexts(&[p("/w/app/dashboard/page.tsx"), p("/w/app/blog/page.tsx"), p("/w/app/layout.tsx"), None]);
+        assert_eq!(c, ["dashboard", "blog", "", ""]);
+        let c = tab_contexts(&[p("/a/src/index.js"), p("/b/src/index.js")]);
+        assert_eq!(c, ["a/src", "b/src"]);
     }
 }

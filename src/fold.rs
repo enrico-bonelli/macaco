@@ -35,6 +35,9 @@ fn style(lang: Lang) -> Option<Style> {
         | Lang::Bash
         | Lang::JavaScript
         | Lang::TypeScript
+        | Lang::Tsx
+        | Lang::CSharp
+        | Lang::Perl
         | Lang::Css
         | Lang::Java
         | Lang::Go

@@ -8,6 +8,7 @@
 //! * `indexed`               folders indexed for the quick file search
 //! * `index/<hash>.paths`    their list of files
 //! * `lsp-folders`           folders where language servers are enabled
+//! * `bookmarks`             favourite files and folders
 
 use crate::encoding::{Encoding, Eol};
 use crate::lang::Lang;
@@ -158,6 +159,19 @@ impl Settings {
             eprintln!("macaco: impossibile salvare le impostazioni: {e}");
         }
     }
+}
+
+// ---------------------------------------------------------------- bookmarks
+
+pub fn load_bookmarks() -> Vec<PathBuf> {
+    fs::read_to_string(base_dir().join("bookmarks"))
+        .map(|t| t.lines().filter(|l| !l.is_empty()).map(PathBuf::from).collect())
+        .unwrap_or_default()
+}
+
+pub fn save_bookmarks(list: &[PathBuf]) {
+    let text: String = list.iter().map(|p| format!("{}\n", p.to_string_lossy())).collect();
+    let _ = write_atomic(&base_dir().join("bookmarks"), text.as_bytes());
 }
 
 // ------------------------------------------------------------- recent files

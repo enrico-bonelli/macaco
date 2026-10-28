@@ -7,11 +7,11 @@ use crate::fold;
 use crate::lang::Lang;
 use crate::lexer::{self, KINDS, State};
 use gtk::prelude::*;
-use gtk::{gdk, glib, pango};
+use gtk::{gdk, gio, glib, pango};
 use std::cell::{Cell, RefCell};
 use std::path::{Path, PathBuf};
 use std::rc::{Rc, Weak};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 /// Documents larger than this are not highlighted.
 const MAX_HIGHLIGHT_BYTES: i32 = 8 * 1024 * 1024;
@@ -148,6 +148,21 @@ impl Shared {
 
 const NO_DIRTY: usize = usize::MAX;
 
+/// The file of a document changed on disk (by another program) since it
+/// was read or saved.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DiskChange {
+    None,
+    Modified,
+    Deleted,
+}
+
+/// What identifies a version of a file on disk.
+fn disk_stamp(path: &Path) -> Option<(SystemTime, u64)> {
+    let m = std::fs::metadata(path).ok()?;
+    Some((m.modified().ok()?, m.len()))
+}
+
 /// A collapsed block: the lines from `start` (included) to `end` (excluded)
 /// are hidden below the header line starting at `head`.
 struct Fold {
@@ -250,6 +265,8 @@ pub struct Doc {
     pub key_hook: RefCell<Option<Box<dyn Fn(gdk::Key, gdk::ModifierType) -> bool>>>,
     title: RefCell<String>,
     label_budget: Cell<usize>,
+    /// Folders shown after the name when other tabs have the same name.
+    label_context: RefCell<String>,
     hl: RefCell<Highlighter>,
     bracket_on: Cell<bool>,
     /// Collapsed blocks.
@@ -261,6 +278,14 @@ pub struct Doc {
     gutter_hover: Cell<bool>,
     /// Times the content was (re)loaded.
     loads: Cell<u32>,
+    /// Modification time and size of the file when it was read or saved.
+    disk_stamp: Cell<Option<(SystemTime, u64)>>,
+    pub disk_change: Cell<DiskChange>,
+    /// Called when the file may have changed on disk; while it is set, a
+    /// monitor watches the file of the loaded document.
+    #[allow(clippy::type_complexity)]
+    disk_handler: RefCell<Option<Rc<dyn Fn()>>>,
+    monitor: RefCell<Option<gio::FileMonitor>>,
 }
 
 fn count_digits(mut n: i32) -> i32 {
@@ -356,6 +381,7 @@ impl Doc {
             key_hook: RefCell::new(None),
             title: RefCell::new(String::new()),
             label_budget: Cell::new(10),
+            label_context: RefCell::new(String::new()),
             hl: RefCell::new(Highlighter { states: vec![State::Normal], lo: NO_DIRTY, hi: 0, scheduled: false, enabled: true }),
             bracket_on: Cell::new(false),
             folds: RefCell::new(Vec::new()),
@@ -364,6 +390,10 @@ impl Doc {
             saved_folds: RefCell::new(Vec::new()),
             gutter_hover: Cell::new(false),
             loads: Cell::new(0),
+            disk_stamp: Cell::new(None),
+            disk_change: Cell::new(DiskChange::None),
+            disk_handler: RefCell::new(None),
+            monitor: RefCell::new(None),
         });
         doc.connect_signals();
         doc.apply_settings();
@@ -822,7 +852,11 @@ impl Doc {
     /// the number of blocks collapsed.
     pub fn fold_all(&self) -> usize {
         let ranges = self.fold_ranges();
-        let mut lines: Vec<u32> = crate::symbols::extract(self.lang.get(), &self.text()).iter().map(|s| s.line).collect();
+        let lang = self.lang.get();
+        // A C# or C++ namespace wraps the whole file: its body stays open.
+        let wraps_file = |s: &crate::symbols::Symbol| matches!(lang, Lang::CSharp | Lang::Cpp) && s.kind == crate::symbols::SymKind::Module;
+        let mut lines: Vec<u32> =
+            crate::symbols::extract(lang, &self.text()).iter().filter(|s| !wraps_file(s)).map(|s| s.line).collect();
         lines.sort_unstable();
         lines.dedup();
         let mut targets: Vec<fold::Range> = Vec::new();
@@ -931,6 +965,60 @@ impl Doc {
 
     // ------------------------------------------------------------- content
 
+    // ------------------------------------------------------- changes on disk
+
+    /// Watch the file for changes made by other programs: `handler` is
+    /// called (on the main loop) when it may have changed.
+    pub fn set_disk_handler(&self, handler: Rc<dyn Fn()>) {
+        *self.disk_handler.borrow_mut() = Some(handler);
+        self.watch_file();
+    }
+
+    /// (Re)create the monitor of the file, or drop it when the document is
+    /// unloaded or has no file.
+    fn watch_file(&self) {
+        let path = self.path.borrow().clone().filter(|_| self.loaded.get());
+        let handler = self.disk_handler.borrow().clone();
+        if let Some(m) = self.monitor.take() {
+            m.cancel();
+        }
+        let (Some(path), Some(handler)) = (path, handler) else { return };
+        // WATCH_MOVES also catches files replaced by a rename (atomic saves
+        // of other editors, git checkout).
+        if let Ok(m) = gio::File::for_path(&path).monitor_file(gio::FileMonitorFlags::WATCH_MOVES, None::<&gio::Cancellable>) {
+            m.connect_changed(move |_, _, _, ev| {
+                if !matches!(ev, gio::FileMonitorEvent::Unmounted | gio::FileMonitorEvent::AttributeChanged) {
+                    handler();
+                }
+            });
+            *self.monitor.borrow_mut() = Some(m);
+        }
+    }
+
+    /// The content now matches the file on disk (just read or saved).
+    pub fn record_disk_stamp(&self) {
+        let stamp = self.path.borrow().as_deref().and_then(disk_stamp);
+        self.disk_stamp.set(stamp);
+        self.disk_change.set(DiskChange::None);
+        // Saving under a new name (or reloading) changes the watched file.
+        self.watch_file();
+    }
+
+    /// Compare the file on disk with the version that was read or saved.
+    pub fn check_disk(&self) -> DiskChange {
+        let Some(path) = self.path.borrow().clone() else { return DiskChange::None };
+        let Some(known) = self.disk_stamp.get() else { return DiskChange::None };
+        if !self.loaded.get() {
+            return DiskChange::None;
+        }
+        match disk_stamp(&path) {
+            None if !path.exists() => DiskChange::Deleted,
+            None => DiskChange::None,
+            Some(now) if now != known => DiskChange::Modified,
+            Some(_) => DiskChange::None,
+        }
+    }
+
     /// Times the content was (re)loaded: marks set before a reload are lost.
     pub fn loads(&self) -> u32 {
         self.loads.get()
@@ -983,6 +1071,7 @@ impl Doc {
         self.buffer.place_cursor(&it);
         self.loading.set(false);
         self.loaded.set(true);
+        self.record_disk_stamp();
         self.edit_gen.set(self.edit_gen.get() + 1);
         self.reset_highlight();
         self.update_gutter_width();
@@ -1049,6 +1138,7 @@ impl Doc {
         self.buffer.end_irreversible_action();
         self.loading.set(false);
         self.loaded.set(false);
+        self.watch_file();
         let mut hl = self.hl.borrow_mut();
         hl.states = vec![State::Normal];
         hl.states.shrink_to_fit();
@@ -1130,6 +1220,7 @@ impl Doc {
         let (bytes, _) = encoding::encode(&text, self.encoding.get());
         std::fs::write(path, bytes).map_err(|e| format!("{}: {e}", path.display()))?;
         *self.path.borrow_mut() = Some(path.to_path_buf());
+        self.record_disk_stamp();
         self.buffer.set_modified(false);
         self.drop_cache();
         self.refresh_title();
@@ -1187,15 +1278,27 @@ impl Doc {
         }
     }
 
+    /// Folders that tell this tab from others with the same file name
+    /// (`page.tsx · dashboard`); empty when the name is unique.
+    pub fn set_label_context(&self, context: String) {
+        if *self.label_context.borrow() != context {
+            *self.label_context.borrow_mut() = context;
+            self.update_label();
+        }
+    }
+
     pub fn update_label(&self) {
         let title = self.title.borrow();
         let budget = self.label_budget.get().max(1);
         let mark = if self.is_unsaved() { "• " } else { "" };
+        let context = self.label_context.borrow();
         let text = if self.path.borrow().is_none() {
             let shown: String = title.chars().take(budget).collect();
             format!("{mark}{shown}")
-        } else {
+        } else if context.is_empty() {
             format!("{mark}{title}")
+        } else {
+            format!("{mark}{title} · {context}")
         };
         self.label.set_text(&text);
         if self.path.borrow().is_some() {

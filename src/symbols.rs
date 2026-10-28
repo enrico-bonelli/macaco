@@ -73,12 +73,22 @@ fn def_keywords(lang: Lang) -> &'static [(&'static str, SymKind)] {
         ],
         Lang::Python => &[("def", Function), ("class", Class)],
         Lang::JavaScript => &[("function", Function), ("class", Class)],
-        Lang::TypeScript => {
+        Lang::TypeScript | Lang::Tsx => {
             &[("function", Function), ("class", Class), ("interface", Interface), ("enum", Enum), ("type", Type), ("namespace", Module)]
         }
         Lang::Go => &[("func", Function), ("type", Type)],
         Lang::Php => &[("function", Function), ("class", Class), ("interface", Interface), ("trait", Interface), ("enum", Enum)],
         Lang::Java => &[("class", Class), ("interface", Interface), ("enum", Enum), ("record", Class)],
+        Lang::CSharp => &[
+            ("class", Class),
+            ("struct", Struct),
+            ("interface", Interface),
+            ("enum", Enum),
+            ("record", Class),
+            ("namespace", Module),
+            ("delegate", Type),
+        ],
+        Lang::Perl => &[("sub", Function), ("package", Module)],
         Lang::C | Lang::Cpp => &[
             ("struct", Struct),
             ("union", Struct),
@@ -95,7 +105,7 @@ fn def_keywords(lang: Lang) -> &'static [(&'static str, SymKind)] {
 /// Languages where `name(…) {` at the start of a line defines a function
 /// or method (C, C++, Java, JavaScript class methods…).
 fn c_like_functions(lang: Lang) -> bool {
-    matches!(lang, Lang::C | Lang::Cpp | Lang::Java | Lang::JavaScript | Lang::TypeScript)
+    matches!(lang, Lang::C | Lang::Cpp | Lang::CSharp | Lang::Java | Lang::JavaScript | Lang::TypeScript | Lang::Tsx)
 }
 
 fn control_words() -> &'static [&'static str] {
@@ -284,7 +294,7 @@ pub fn extract(lang: Lang, text: &str) -> Vec<Symbol> {
 
         let t = m.trim();
         // const name = (…) => / function
-        if matches!(lang, Lang::JavaScript | Lang::TypeScript) {
+        if matches!(lang, Lang::JavaScript | Lang::TypeScript | Lang::Tsx) {
             for c in js_arrow().captures_iter(&m) {
                 let g = c.get(1).unwrap();
                 push(g.as_str(), g.start(), SymKind::Function);

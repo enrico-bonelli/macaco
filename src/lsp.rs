@@ -41,7 +41,7 @@ pub const SERVERS: &[ServerSpec] = &[
     },
     ServerSpec {
         name: "typescript-language-server",
-        langs: &[Lang::JavaScript, Lang::TypeScript],
+        langs: &[Lang::JavaScript, Lang::TypeScript, Lang::Tsx],
         commands: &[("typescript-language-server", &["--stdio"])],
         package: "typescript-language-server",
     },
@@ -53,6 +53,18 @@ pub const SERVERS: &[ServerSpec] = &[
         package: "intelephense (npm install -g intelephense)",
     },
     ServerSpec { name: "jdtls", langs: &[Lang::Java], commands: &[("jdtls", &[])], package: "jdtls (AUR)" },
+    ServerSpec {
+        name: "C#",
+        langs: &[Lang::CSharp],
+        commands: &[("csharp-ls", &[]), ("OmniSharp", &["-lsp"]), ("omnisharp", &["-lsp"])],
+        package: "csharp-ls (dotnet tool install -g csharp-ls) o omnisharp-roslyn (AUR)",
+    },
+    ServerSpec {
+        name: "Perl Navigator",
+        langs: &[Lang::Perl],
+        commands: &[("perlnavigator", &["--stdio"])],
+        package: "perlnavigator (npm install -g perlnavigator-server)",
+    },
     ServerSpec {
         name: "bash-language-server",
         langs: &[Lang::Bash],
@@ -94,6 +106,9 @@ pub fn language_id(lang: Lang, path: &Path) -> &'static str {
         Lang::JavaScript => "javascript",
         Lang::TypeScript if ext == "tsx" => "typescriptreact",
         Lang::TypeScript => "typescript",
+        Lang::Tsx => "typescriptreact",
+        Lang::CSharp => "csharp",
+        Lang::Perl => "perl",
         Lang::Go => "go",
         Lang::Php => "php",
         Lang::Java => "java",
