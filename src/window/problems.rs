@@ -11,7 +11,7 @@ use super::Editor;
 use crate::doc::Doc;
 use crate::lsp::{self, Diagnostic, Severity};
 use gtk::prelude::*;
-use gtk::{gio, glib, pango};
+use gtk::{glib, pango};
 use std::collections::HashMap;
 use std::rc::{Rc, Weak};
 use std::time::{Duration, Instant};
@@ -26,7 +26,7 @@ const QUIET: Duration = Duration::from_millis(2500);
 const TIMEOUT: Duration = Duration::from_secs(45);
 
 /// Latest diagnostics pushed by the servers: (server, URI) → (time, problems).
-pub(super) type DiagStore = HashMap<(&'static str, String), (Instant, Rc<Vec<Diagnostic>>)>;
+pub(super) type DiagStore = HashMap<(&'static str, String), (Instant, Vec<Diagnostic>)>;
 
 pub(super) struct ProblemsUi {
     pub(super) revealer: gtk::Revealer,
@@ -104,15 +104,8 @@ pub(super) fn build_panel() -> ProblemsUi {
 
 impl Editor {
     pub(super) fn setup_problems_actions(self: &Rc<Self>) {
-        let a = gio::SimpleAction::new("check-file", None);
-        let ed = self.clone();
-        a.connect_activate(move |_, _| ed.check_file());
-        self.win.add_action(&a);
-        self.app.set_accels_for_action("win.check-file", &["F5"]);
-        let a = gio::SimpleAction::new("problems-close", None);
-        let ed = self.clone();
-        a.connect_activate(move |_, _| ed.close_problems());
-        self.win.add_action(&a);
+        self.add_action("check-file", &["F5"], |ed| ed.check_file());
+        self.add_action("problems-close", &[], |ed| ed.close_problems());
         let ed = Rc::downgrade(self);
         self.problems.list.connect_row_activated(move |_, row| {
             if let Some(ed) = ed.upgrade() {
@@ -122,9 +115,16 @@ impl Editor {
     }
 
     /// A server sent the diagnostics of a document.
+    /// Only those of the documents open in the server are kept: some
+    /// servers publish them for the whole project.
     pub(super) fn lsp_diagnostics(&self, server: &'static str, params: &serde_json::Value) {
+        let Some(uri) = params.get("uri").and_then(serde_json::Value::as_str) else { return };
+        let open = self.lsp_clients.borrow().iter().any(|c| c.spec.name == server && c.docs.borrow().contains_key(uri));
+        if !open {
+            return;
+        }
         if let Some((uri, diags)) = lsp::parse_diagnostics(params) {
-            self.lsp_diags.borrow_mut().insert((server, uri), (Instant::now(), Rc::new(diags)));
+            self.lsp_diags.borrow_mut().insert((server, uri), (Instant::now(), diags));
         }
     }
 
@@ -173,11 +173,7 @@ impl Editor {
         self.lsp_dirty.borrow_mut().remove(&*d.id.borrow());
         let text = d.text();
         for c in &clients {
-            if c.docs.borrow().contains_key(&uri) {
-                c.did_change(&uri, &text);
-            } else if c.ready.get() {
-                c.did_open(&uri, lsp::language_id(d.lang.get(), &path), &text);
-            }
+            c.sync_text(&uri, lsp::language_id(d.lang.get(), &path), &text);
         }
         let servers: Vec<&'static str> = clients.iter().map(|c| c.spec.name).collect();
         let started = Instant::now();
@@ -316,16 +312,7 @@ impl Editor {
         let tags = &self.shared.tags;
         let mut items = Vec::new();
         for x in &all {
-            let at = |line: u32, u16col: u32| {
-                let mut it = buf.iter_at_line(line as i32).unwrap_or_else(|| buf.end_iter());
-                let mut end = it;
-                if !end.ends_line() {
-                    end.forward_to_line_end();
-                }
-                let col = lsp::char_col(&buf.text(&it, &end, true), u16col) as i32;
-                it.set_line_offset(col.min(end.line_offset()));
-                it
-            };
+            let at = |line: u32, u16col: u32| d.iter_at_line_col(line as i32, lsp::char_col(&d.line_text(line as i32), u16col) as i32);
             let start = at(x.line, x.u16col);
             let mut end = at(x.end_line, x.end_u16col);
             if end <= start {
@@ -398,13 +385,7 @@ impl Editor {
         } else {
             // Reloaded since the check: the marks are lost, use the
             // position found then.
-            let mut it = buf.iter_at_line(line as i32).unwrap_or_else(|| buf.end_iter());
-            let mut end = it;
-            if !end.ends_line() {
-                end.forward_to_line_end();
-            }
-            it.set_line_offset((col as i32).min(end.line_offset()));
-            it
+            d.iter_at_line_col(line as i32, col as i32)
         };
         buf.place_cursor(&it);
         d.view.scroll_to_mark(&buf.get_insert(), 0.1, true, 0.0, 0.4);

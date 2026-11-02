@@ -7,7 +7,7 @@
 
 use super::Editor;
 use crate::config;
-use crate::diff::{self, DiffResult, HunkKind};
+use crate::diff::{self, DiffResult, Hunk, HunkKind};
 use crate::doc::Doc;
 use crate::git;
 use crate::lang;
@@ -32,11 +32,19 @@ pub(super) enum Target {
     Git { root: PathBuf, rel: String, file: PathBuf },
 }
 
-/// One side of the merge as shown: its text, title and language.
+/// One side of the merge as shown: its text, title and file.
 pub(super) struct Side {
     pub(super) text: String,
     pub(super) title: String,
     pub(super) path: Option<PathBuf>,
+}
+
+impl Side {
+    /// The current text of an open document.
+    fn of_doc(d: &Doc) -> Side {
+        let path = d.path.borrow().clone();
+        Side { text: d.text(), title: path.as_deref().map_or_else(|| d.title(), short), path }
+    }
 }
 
 pub(super) struct Merge {
@@ -49,6 +57,9 @@ pub(super) struct Merge {
     /// Differences of the left and of the right side from the result
     /// (old = side, new = result).
     diffs: RefCell<[DiffResult; 2]>,
+    /// For each hunk of `diffs`: whether it touches one of the other side
+    /// (a conflict). Computed with the diffs, read when drawing.
+    conflicting: RefCell<[Vec<bool>; 2]>,
     /// Arrows drawn: (link, x, y, hunk index).
     arrows: RefCell<Vec<(usize, f64, f64, usize)>>,
     summary: gtk::Label,
@@ -65,6 +76,17 @@ fn touches(a: &Range<usize>, b: &Range<usize>) -> bool {
     } else {
         a.start < b.end && b.start < a.end
     }
+}
+
+/// For each hunk of `a`, whether it touches a hunk of `b` (both sorted, as
+/// a diff gives them): a binary search instead of a scan of `b`.
+fn conflict_flags(a: &[Hunk], b: &[Hunk]) -> Vec<bool> {
+    a.iter()
+        .map(|h| {
+            let i = b.partition_point(|o| o.new.end < h.new.start);
+            b[i..].iter().take_while(|o| o.new.start <= h.new.end).any(|o| touches(&o.new, &h.new))
+        })
+        .collect()
 }
 
 fn pane_box(title: &str, doc: &Rc<Doc>) -> gtk::Box {
@@ -105,8 +127,7 @@ impl Editor {
                 return;
             }
         }
-        let side = |d: &Rc<Doc>| Side { text: d.text(), title: d.path.borrow().as_deref().map_or_else(|| d.title(), short), path: d.path.borrow().clone() };
-        let (left, right) = (side(&l), side(&r));
+        let (left, right) = (Side::of_doc(&l), Side::of_doc(&r));
         let target = Target::Files { left: left.path.clone(), right: right.path.clone() };
         let center = left.text.clone();
         self.open_merge(left, center, right, target, "Confronto e unione");
@@ -132,7 +153,7 @@ impl Editor {
                     return;
                 }
             };
-            let left = Side { text: d.text(), title: d.path.borrow().as_deref().map_or_else(|| d.title(), short), path: d.path.borrow().clone() };
+            let left = Side::of_doc(&d);
             let right = Side { text, title: short(&path), path: Some(path.clone()) };
             let target = Target::Files { left: left.path.clone(), right: Some(path) };
             let center = left.text.clone();
@@ -153,33 +174,29 @@ impl Editor {
         let ed = self.clone();
         let stage = |n: u8| format!(":{n}:{rel}");
         let (s1, s2, s3) = (stage(1), stage(2), stage(3));
-        git::run_str(&root.clone(), &["show", &s2], move |ours| {
+        // Common ancestor, ours, theirs: read at the same time.
+        git::run_many(&root.clone(), &[&["show", &s1], &["show", &s2], &["show", &s3]], move |outs| {
+            let [base, ours, theirs] = <[git::Output; 3]>::try_from(outs).ok().expect("three commands");
             if !ours.ok {
                 ed.message(&format!("{rel}: nell'indice manca la tua versione (non è in conflitto, o è stato eliminato nel tuo ramo: in quel caso tienilo con git add o toglilo con git rm)"));
                 return;
             }
-            let ed2 = ed.clone();
-            git::run_str(&root.clone(), &["show", &s3], move |theirs| {
-                if !theirs.ok {
-                    ed2.message(&format!("{rel}: nell'indice manca la versione in arrivo (il file è stato eliminato nell'altro ramo: tienilo con git add o toglilo con git rm)"));
-                    return;
-                }
-                let ed3 = ed2.clone();
-                // The common ancestor is missing when both sides added the file.
-                git::run_str(&root.clone(), &["show", &s1], move |base| {
-                    let text = |o: &git::Output| String::from_utf8_lossy(&o.stdout).into_owned();
-                    let (b, o, t) = (if base.ok { text(&base) } else { String::new() }, text(&ours), text(&theirs));
-                    let merged = diff::merge3(&b, &o, &t);
-                    let left = Side { text: o, title: format!("La tua versione (HEAD) — {rel}"), path: Some(file.clone()) };
-                    let right = Side { text: t, title: format!("Versione in arrivo — {rel}"), path: Some(file.clone()) };
-                    ed3.message(&match merged.conflicts {
-                        0 => "Unione automatica senza conflitti: controlla il risultato e salva".to_string(),
-                        1 => "1 conflitto da risolvere (in rosso)".to_string(),
-                        n => format!("{n} conflitti da risolvere (in rosso)"),
-                    });
-                    ed3.open_merge(left, merged.text, right, Target::Git { root, rel: rel.clone(), file }, &format!("Risolvi il conflitto — {rel}"));
-                });
+            if !theirs.ok {
+                ed.message(&format!("{rel}: nell'indice manca la versione in arrivo (il file è stato eliminato nell'altro ramo: tienilo con git add o toglilo con git rm)"));
+                return;
+            }
+            let text = |o: &git::Output| String::from_utf8_lossy(&o.stdout).into_owned();
+            // The common ancestor is missing when both sides added the file.
+            let (b, o, t) = (if base.ok { text(&base) } else { String::new() }, text(&ours), text(&theirs));
+            let merged = diff::merge3(&b, &o, &t);
+            let left = Side { text: o, title: format!("La tua versione (HEAD) — {rel}"), path: Some(file.clone()) };
+            let right = Side { text: t, title: format!("Versione in arrivo — {rel}"), path: Some(file.clone()) };
+            ed.message(&match merged.conflicts {
+                0 => "Unione automatica senza conflitti: controlla il risultato e salva".to_string(),
+                1 => "1 conflitto da risolvere (in rosso)".to_string(),
+                n => format!("{n} conflitti da risolvere (in rosso)"),
             });
+            ed.open_merge(left, merged.text, right, Target::Git { root, rel: rel.clone(), file }, &format!("Risolvi il conflitto — {rel}"));
         });
     }
 
@@ -192,15 +209,13 @@ impl Editor {
 }
 
 fn short(p: &Path) -> String {
-    let s = p.display().to_string();
-    let home = std::env::var("HOME").unwrap_or_default();
-    if !home.is_empty() && s.starts_with(&home) { format!("~{}", &s[home.len()..]) } else { s }
+    config::tilde(p)
 }
 
 impl Merge {
     fn new(ed: &Rc<Editor>, left: Side, center: String, right: Side, target: Target, title: &str) -> Rc<Merge> {
         let win = gtk::Window::builder().title(title).transient_for(&ed.win).default_width(1400).default_height(820).build();
-        let lang_of = |s: &Side| lang::detect(s.path.as_deref(), &s.text.chars().take(256).collect::<String>());
+        let lang_of = |s: &Side| lang::detect(s.path.as_deref(), &s.text);
         let doc = |text: &str, l: lang::Lang, editable: bool| {
             let d = Doc::new(&ed.shared, config::new_id());
             d.view.set_editable(editable);
@@ -288,6 +303,7 @@ impl Merge {
             panes,
             links,
             diffs: RefCell::new([DiffResult::default(), DiffResult::default()]),
+            conflicting: RefCell::new([Vec::new(), Vec::new()]),
             arrows: RefCell::new(Vec::new()),
             summary,
             target,
@@ -339,7 +355,8 @@ impl Merge {
         for (p, d) in self.panes.iter().enumerate() {
             let w = Rc::downgrade(self);
             d.scroller.vadjustment().connect_value_changed(move |_| {
-                if let Some(m) = w.upgrade() {
+                // The panes moved by `sync_from` are redrawn by its caller.
+                if let Some(m) = w.upgrade().filter(|m| !m.syncing.get()) {
                     m.sync_from(p);
                     m.redraw();
                 }
@@ -398,17 +415,10 @@ impl Merge {
                 m.forget();
                 return glib::Propagation::Proceed;
             }
-            let dialog = gtk::AlertDialog::builder()
-                .modal(true)
-                .message("Chiudere senza salvare il risultato?")
-                .detail("Le scelte fatte in questa finestra andranno perse.")
-                .buttons(["Annulla", "Chiudi senza salvare"])
-                .cancel_button(0)
-                .default_button(0)
-                .build();
             let w2 = Rc::downgrade(&m);
-            dialog.choose(Some(win), None::<&gio::Cancellable>, move |res| {
-                if res == Ok(1)
+            let detail = "Le scelte fatte in questa finestra andranno perse.";
+            crate::ui::confirm(Some(win), "Chiudere senza salvare il risultato?", detail, "Chiudi senza salvare", false, move |ok| {
+                if ok
                     && let Some(m) = w2.upgrade()
                 {
                     m.panes[1].buffer.set_modified(false);
@@ -432,6 +442,8 @@ impl Merge {
     fn forget(self: &Rc<Self>) {
         if let Some(ed) = self.ed.upgrade() {
             ed.merges.borrow_mut().retain(|x| !Rc::ptr_eq(x, self));
+            // Three documents with their highlighting.
+            ed.release_memory();
         }
     }
 
@@ -481,11 +493,10 @@ impl Merge {
                 }
             }
         };
+        let conflicting = [conflict_flags(&diffs[0].hunks, &diffs[1].hunks), conflict_flags(&diffs[1].hunks, &diffs[0].hunks)];
         let mut blocks = 0;
         for (k, side) in [(0, 0), (1, 2)] {
-            let other = &diffs[1 - k];
-            for h in &diffs[k].hunks {
-                let conflict = other.hunks.iter().any(|o| touches(&o.new, &h.new));
+            for (h, &conflict) in diffs[k].hunks.iter().zip(&conflicting[k]) {
                 let side_tag = match (conflict, &h.kind) {
                     (true, _) => &tags.diff_conflict,
                     (false, HunkKind::Removed) => &tags.diff_add,
@@ -499,7 +510,7 @@ impl Merge {
             words(&self.panes[1], &diffs[k].new_words, &tags.diff_word_del);
         }
         // A conflict is counted once, from the left side.
-        let conflicts_left = diffs[0].hunks.iter().filter(|h| diffs[1].hunks.iter().any(|o| touches(&o.new, &h.new))).count();
+        let conflicts_left = conflicting[0].iter().filter(|c| **c).count();
         let diff_count = blocks - conflicts_left;
         self.summary.set_text(&match (diff_count, conflicts_left) {
             (0, _) => "Nessuna differenza".to_string(),
@@ -512,7 +523,16 @@ impl Merge {
             self.summary.remove_css_class("error");
         }
         *self.diffs.borrow_mut() = diffs;
+        *self.conflicting.borrow_mut() = conflicting;
         self.redraw();
+    }
+
+    /// First and last line shown in pane `p` (with one line of margin).
+    fn visible_lines(&self, p: usize) -> (usize, usize) {
+        let view = &self.panes[p].view;
+        let r = view.visible_rect();
+        let line = |y: i32| view.line_at_y(y).0.line().max(0) as usize;
+        (line(r.y()).saturating_sub(1), line(r.y() + r.height()) + 1)
     }
 
     /// Top and bottom of lines `r` of pane `p`, in the coordinates of `link`.
@@ -546,16 +566,24 @@ impl Merge {
         };
         let link = &self.links[k];
         let diffs = self.diffs.borrow();
-        let (side, d, other) = if k == 0 { (0, &diffs[0], &diffs[1]) } else { (2, &diffs[1], &diffs[0]) };
+        let conflicting = self.conflicting.borrow();
+        let (side, d) = if k == 0 { (0, &diffs[0]) } else { (2, &diffs[1]) };
         let mut arrows = self.arrows.borrow_mut();
         arrows.retain(|a| a.0 != k);
-        for (i, hk) in d.hunks.iter().enumerate() {
+        // Only the blocks near the lines shown in the two panes.
+        let (side_top, side_bottom) = self.visible_lines(side);
+        let (res_top, res_bottom) = self.visible_lines(1);
+        let first = d.hunks.partition_point(|x| x.old.end < side_top).min(d.hunks.partition_point(|x| x.new.end < res_top));
+        for (i, hk) in d.hunks.iter().enumerate().skip(first) {
+            if hk.old.start > side_bottom && hk.new.start > res_bottom {
+                break;
+            }
             let (s1, s2) = self.range_y(side, &hk.old, link);
             let (c1, c2) = self.range_y(1, &hk.new, link);
             if s2.max(c2) < 0.0 || s1.min(c1) > h {
                 continue;
             }
-            let color = if other.hunks.iter().any(|o| touches(&o.new, &hk.new)) {
+            let color = if conflicting[k].get(i).copied().unwrap_or(false) {
                 conflict
             } else if hk.kind == HunkKind::Removed {
                 add
@@ -701,13 +729,15 @@ impl Merge {
     }
 
     fn conflicts(&self) -> usize {
-        let d = self.diffs.borrow();
-        d[0].hunks.iter().filter(|h| d[1].hunks.iter().any(|o| touches(&o.new, &h.new))).count()
+        self.conflicting.borrow()[0].iter().filter(|c| **c).count()
     }
 
     /// Write the result: into `path`, or as git resolution, or "save as".
     fn save(self: &Rc<Self>, path: Option<PathBuf>) {
-        self.recompute();
+        // The count of conflicts must be up to date (only git asks it).
+        if matches!(self.target, Target::Git { .. }) {
+            self.recompute();
+        }
         let Some(ed) = self.ed.upgrade() else { return };
         let text = self.panes[1].text();
         match (&self.target, path) {
@@ -736,16 +766,9 @@ impl Merge {
                     go();
                     return;
                 }
-                let dialog = gtk::AlertDialog::builder()
-                    .modal(true)
-                    .message(format!("Restano {n} conflitti"))
-                    .detail("Le parti in rosso non sono state scelte: nel file resterà il testo della versione comune. Segnare comunque il file come risolto?")
-                    .buttons(["Annulla", "Salva comunque"])
-                    .cancel_button(0)
-                    .default_button(0)
-                    .build();
-                dialog.choose(Some(&self.win), None::<&gio::Cancellable>, move |res| {
-                    if res == Ok(1) {
+                let detail = "Le parti in rosso non sono state scelte: nel file resterà il testo della versione comune. Segnare comunque il file come risolto?";
+                crate::ui::confirm(Some(&self.win), &format!("Restano {n} conflitti"), detail, "Salva comunque", false, move |ok| {
+                    if ok {
                         go();
                     }
                 });

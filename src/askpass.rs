@@ -57,17 +57,33 @@ pub type Handler = Rc<dyn Fn(Request, Box<dyn FnOnce(Option<String>)>)>;
 /// The socket the askpass helpers connect to.
 pub struct Server {
     path: PathBuf,
+    /// The folder was created for the socket (removed with it).
+    own_dir: bool,
     token: String,
     exe: PathBuf,
     service: gio::SocketService,
 }
 
-fn random_token() -> String {
+/// A secret shared with the helpers; None if no random bytes are
+/// available (then nothing is asked in the editor).
+fn random_token() -> Option<String> {
     let mut b = [0u8; 16];
-    if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
-        let _ = f.read_exact(&mut b);
+    std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut b)).ok()?;
+    Some(b.iter().map(|x| format!("{x:02x}")).collect())
+}
+
+/// Folder of the socket: the user's runtime folder (private), else a new
+/// private folder in the temporary one, so that the socket is never
+/// reachable by others, not even before its permissions are set.
+fn socket_dir() -> Result<(PathBuf, bool), String> {
+    if let Some(d) = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from).filter(|d| d.is_dir()) {
+        return Ok((d, false));
     }
-    b.iter().map(|x| format!("{x:02x}")).collect()
+    use std::os::unix::fs::DirBuilderExt;
+    let d = std::env::temp_dir().join(format!("macaco-askpass-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&d);
+    std::fs::DirBuilder::new().mode(0o700).create(&d).map_err(|e| format!("{}: {e}", d.display()))?;
+    Ok((d, true))
 }
 
 /// This program, also after an upgrade replaced the file on disk.
@@ -84,7 +100,8 @@ fn own_exe() -> Option<PathBuf> {
 impl Server {
     pub fn start(handler: Handler) -> Result<Server, String> {
         let exe = own_exe().ok_or("percorso del programma non disponibile")?;
-        let dir = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from).unwrap_or_else(std::env::temp_dir);
+        let token = random_token().ok_or("nessuna sorgente di numeri casuali")?;
+        let (dir, own_dir) = socket_dir()?;
         let path = dir.join(format!("macaco-askpass-{}.sock", std::process::id()));
         let _ = std::fs::remove_file(&path);
         let service = gio::SocketService::new();
@@ -96,7 +113,6 @@ impl Server {
             use std::os::unix::fs::PermissionsExt;
             let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
         }
-        let token = random_token();
         let expected = token.clone();
         service.connect_incoming(move |_, conn, _| {
             let (conn, handler, expected) = (conn.clone(), handler.clone(), expected.clone());
@@ -118,12 +134,22 @@ impl Server {
                 }
                 let reply = Box::new(move |answer: Option<String>| {
                     let msg = match answer {
-                        Some(a) => format!("OK\n{a}"),
-                        None => "NO".to_string(),
+                        Some(a) => {
+                            let mut a = a.into_bytes();
+                            let mut msg = b"OK\n".to_vec();
+                            msg.extend_from_slice(&a);
+                            a.fill(0);
+                            msg
+                        }
+                        None => b"NO".to_vec(),
                     };
                     glib::MainContext::default().spawn_local(async move {
                         let out = conn.output_stream();
-                        let _ = out.write_all_future(msg.into_bytes(), glib::Priority::DEFAULT).await;
+                        // The answer may be a password: not left in memory.
+                        let mut sent = match out.write_all_future(msg, glib::Priority::DEFAULT).await {
+                            Ok((b, ..)) | Err((b, _)) => b,
+                        };
+                        sent.fill(0);
                         let _ = conn.close_future(glib::Priority::DEFAULT).await;
                     });
                 });
@@ -132,7 +158,7 @@ impl Server {
             true
         });
         service.start();
-        Ok(Server { path, token, exe, service })
+        Ok(Server { path, own_dir, token, exe, service })
     }
 
     /// Environment of a network git command: its questions come here.
@@ -153,5 +179,10 @@ impl Drop for Server {
     fn drop(&mut self) {
         self.service.stop();
         let _ = std::fs::remove_file(&self.path);
+        if self.own_dir
+            && let Some(d) = self.path.parent()
+        {
+            let _ = std::fs::remove_dir(d);
+        }
     }
 }

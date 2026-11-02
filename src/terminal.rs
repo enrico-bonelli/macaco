@@ -304,6 +304,18 @@ impl Terminal {
         Ok(())
     }
 
+    /// Runs `cmd` at the prompt of the shell. Fails while the shell is
+    /// starting or running another command.
+    pub fn run(&self, cmd: &str) -> Result<(), ()> {
+        if !self.shell_idle() {
+            return Err(());
+        }
+        let line = format!("\x05\x15{cmd}\r");
+        // SAFETY: valid terminal pointer and buffer.
+        unsafe { (self.vte.feed_child)(self.ptr(), line.as_ptr().cast(), line.len() as isize) };
+        Ok(())
+    }
+
     #[cfg(debug_assertions)]
     pub fn debug_feed(&self, text: &str) {
         // SAFETY: valid terminal pointer and buffer.

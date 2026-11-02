@@ -5,7 +5,7 @@
 use super::Editor;
 use crate::doc::{DiskChange, Doc};
 use gtk::prelude::*;
-use gtk::{gio, glib, pango};
+use gtk::{glib, pango};
 use std::path::PathBuf;
 use std::rc::{Rc, Weak};
 use std::time::Duration;
@@ -49,30 +49,17 @@ pub(super) fn build_bar() -> DiskBar {
 
 impl Editor {
     pub(super) fn setup_disk_actions(self: &Rc<Self>) {
-        let a = gio::SimpleAction::new("disk-reload", None);
-        let ed = self.clone();
-        a.connect_activate(move |_, _| {
+        self.add_action("disk-reload", &[], |ed| {
             if let Some(d) = ed.active_doc() {
                 ed.reopen_with(&d, d.encoding.get());
             }
         });
-        self.win.add_action(&a);
-        let a = gio::SimpleAction::new("disk-ignore", None);
-        let ed = self.clone();
-        a.connect_activate(move |_, _| {
+        self.add_action("disk-ignore", &[], |ed| {
             if let Some(d) = ed.active_doc() {
                 // The version on disk becomes the known one: only later
                 // changes are reported.
                 d.record_disk_stamp();
                 ed.update_disk_bar();
-            }
-        });
-        self.win.add_action(&a);
-        // Back to the editor: files may have changed in the meantime.
-        let ed = Rc::downgrade(self);
-        self.win.connect_is_active_notify(move |w| {
-            if let (true, Some(ed)) = (w.is_active(), ed.upgrade()) {
-                ed.check_disk_all();
             }
         });
     }
@@ -159,14 +146,13 @@ impl Editor {
             then(true);
             return;
         }
-        let dialog = gtk::AlertDialog::builder()
-            .modal(true)
-            .message(format!("«{}» è stato modificato da un altro programma", d.title()))
-            .detail("Salvando sostituisci il file su disco con il testo dell'editor: le modifiche fatte dall'altro programma andranno perse.")
-            .buttons(["Annulla", "Sovrascrivi"])
-            .cancel_button(0)
-            .default_button(0)
-            .build();
-        dialog.choose(Some(&self.win), None::<&gio::Cancellable>, move |res| then(res == Ok(1)));
+        crate::ui::confirm(
+            Some(self.win.upcast_ref()),
+            &format!("«{}» è stato modificato da un altro programma", d.title()),
+            "Salvando sostituisci il file su disco con il testo dell'editor: le modifiche fatte dall'altro programma andranno perse.",
+            "Sovrascrivi",
+            false,
+            then,
+        );
     }
 }

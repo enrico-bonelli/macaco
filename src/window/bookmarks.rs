@@ -12,9 +12,7 @@ use std::rc::Rc;
 
 /// "name  —  ~/folder" for menus and lists.
 fn short_dir(p: &Path) -> String {
-    let dir = p.parent().map(|d| d.display().to_string()).unwrap_or_default();
-    let home = std::env::var("HOME").unwrap_or_default();
-    if !home.is_empty() && dir.starts_with(&home) { format!("~{}", &dir[home.len()..]) } else { dir }
+    p.parent().map(config::tilde).unwrap_or_default()
 }
 
 fn name_of(p: &Path) -> String {
@@ -28,19 +26,10 @@ impl Editor {
         a.connect_activate(move |_, _| ed.toggle_bookmark());
         self.win.add_action(&a);
         self.app.set_accels_for_action("win.bookmark", &["<Control><Alt>b"]);
-        let a = gio::SimpleAction::new("bookmarks", None);
-        let ed = self.clone();
-        a.connect_activate(move |_, _| ed.bookmarks_window());
-        self.win.add_action(&a);
-        self.app.set_accels_for_action("win.bookmarks", &["<Control><Shift>b"]);
-        let a = gio::SimpleAction::new("open-bookmark", Some(glib::VariantTy::STRING));
-        let ed = self.clone();
-        a.connect_activate(move |_, v| {
-            if let Some(p) = v.and_then(|v| v.get::<String>()) {
-                ed.open_bookmark(Path::new(&p));
-            }
+        self.add_action("bookmarks", &["<Control><Shift>b"], |ed| ed.bookmarks_window());
+        self.add_str_action("open-bookmark", |ed, p| {
+            ed.open_bookmark(Path::new(&p));
         });
-        self.win.add_action(&a);
         self.rebuild_bookmarks_menu();
     }
 
@@ -52,23 +41,12 @@ impl Editor {
         head.append(Some("File corrente nei preferiti"), Some("win.bookmark"));
         head.append(Some("Apri un preferito…"), Some("win.bookmarks"));
         m.append_section(None, &head);
-        let files = gio::Menu::new();
-        for p in self.bookmarks.borrow().iter() {
-            // '_' would be taken as a mnemonic marker.
-            let label = format!("{}  —  {}", name_of(p), short_dir(p)).replace('_', "__");
-            let item = gio::MenuItem::new(Some(&label), None);
-            item.set_action_and_target_value(Some("win.open-bookmark"), Some(&p.to_string_lossy().to_variant()));
-            files.append_item(&item);
-        }
-        if self.bookmarks.borrow().is_empty() {
-            files.append(Some("(nessun preferito)"), Some("win.none"));
-        }
-        m.append_section(None, &files);
+        m.append_section(None, &crate::ui::path_menu(&self.bookmarks.borrow(), "win.open-bookmark", "(nessun preferito)"));
     }
 
     /// Check mark of "File corrente nei preferiti" for the active tab.
     pub(super) fn update_bookmark_state(&self) {
-        let Some(a) = self.win.lookup_action("bookmark").and_downcast::<gio::SimpleAction>() else { return };
+        let Some(a) = self.action("bookmark") else { return };
         let path = self.active_doc().and_then(|d| d.path.borrow().clone());
         a.set_enabled(path.is_some());
         let on = path.is_some_and(|p| self.bookmarks.borrow().contains(&p));
@@ -146,34 +124,12 @@ impl Editor {
             self.message("Nessun preferito: aggiungi il file corrente con Preferiti → File corrente nei preferiti (Ctrl+Alt+B)");
             return;
         }
-        let win = gtk::Window::builder()
-            .title("Preferiti")
-            .transient_for(&self.win)
-            .modal(true)
-            .default_width(620)
-            .default_height(420)
-            .build();
-        let entry = gtk::SearchEntry::builder().placeholder_text("Filtra i preferiti").hexpand(true).build();
         let list = gtk::ListBox::new();
         list.set_activate_on_single_click(true);
         list.add_css_class("bookmarks-list");
-        let scroll = gtk::ScrolledWindow::builder().child(&list).hscrollbar_policy(gtk::PolicyType::Never).vexpand(true).build();
-        scroll.add_css_class("frame");
-        let hint = gtk::Label::new(Some("Invio apre · Esc chiude · il pulsante a destra toglie dai preferiti"));
-        hint.add_css_class("dim-label");
-        hint.set_xalign(0.0);
-        let b = gtk::Box::builder()
-            .orientation(gtk::Orientation::Vertical)
-            .spacing(8)
-            .margin_top(10)
-            .margin_bottom(10)
-            .margin_start(10)
-            .margin_end(10)
-            .build();
-        b.append(&entry);
-        b.append(&scroll);
-        b.append(&hint);
-        win.set_child(Some(&b));
+        let entry = gtk::SearchEntry::builder().placeholder_text("Filtra i preferiti").hexpand(true).build();
+        let (win, entry, hint) = crate::ui::picker_window(&self.win, "Preferiti", (620, 420), entry, &list);
+        hint.set_text("Invio apre · Esc chiude · il pulsante a destra toglie dai preferiti");
 
         // Rows and the bookmark each one shows.
         let rows: Rc<RefCell<Vec<(gtk::ListBoxRow, PathBuf)>>> = Rc::default();

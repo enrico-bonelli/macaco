@@ -10,6 +10,7 @@ pub struct Options {
     pub regex: bool,
 }
 
+#[derive(Clone)]
 pub struct Query {
     pub re: Regex,
     pub opts: Options,
@@ -33,7 +34,7 @@ impl Query {
         Ok(Query { re, opts })
     }
 
-    /// Replacement text for the match `m` found in `hay`.
+    /// Replacement text for the match starting at byte `start` of `hay`.
     pub fn replacement(&self, hay: &str, start: usize, repl: &str) -> String {
         if !self.opts.regex {
             return repl.to_string();
@@ -47,6 +48,25 @@ impl Query {
             None => repl.to_string(),
         }
     }
+}
+
+/// Every non-empty match of `q` in `hay` with its replacement:
+/// (start, end, text). The regex runs once per match.
+pub fn replacements(q: &Query, hay: &str, repl: &str) -> Vec<(usize, usize, String)> {
+    if !q.opts.regex {
+        return q.re.find_iter(hay).filter(|m| m.start() != m.end()).map(|m| (m.start(), m.end(), repl.to_string())).collect();
+    }
+    q.re
+        .captures_iter(hay)
+        .filter_map(|caps| {
+            let m = caps.get(0)?;
+            (m.start() != m.end()).then(|| {
+                let mut out = String::new();
+                caps.expand(repl, &mut out);
+                (m.start(), m.end(), out)
+            })
+        })
+        .collect()
 }
 
 /// Convert a byte offset in `s` into a char offset, continuing from a
@@ -72,6 +92,9 @@ mod tests {
         assert!(q.re.is_match("a cat."));
         let q = Query::new(r"(\w+)@(\w+)", Options { regex: true, ..Default::default() }).unwrap();
         assert_eq!(q.replacement("x foo@bar", 2, "$2 at $1"), "bar at foo");
+        assert_eq!(replacements(&q, "a@b c@d", "$2$1"), vec![(0, 3, "ba".to_string()), (4, 7, "dc".to_string())]);
+        let plain = Query::new("$1", Options::default()).unwrap();
+        assert_eq!(replacements(&plain, "x$1", "$0"), vec![(1, 3, "$0".to_string())]);
         assert!(Query::new("(", Options { regex: true, ..Default::default() }).is_err());
     }
 }

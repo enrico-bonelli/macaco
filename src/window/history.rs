@@ -10,7 +10,7 @@ use crate::doc::Doc;
 use crate::git::{self, LogEntry};
 use crate::lang;
 use gtk::prelude::*;
-use gtk::{gdk, glib, pango};
+use gtk::{glib, pango};
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -20,6 +20,35 @@ use std::rc::{Rc, Weak};
 const MAX_COMMITS: usize = 500;
 /// Larger outputs are cut (a huge generated file).
 const MAX_TEXT: usize = 4 << 20;
+/// Commits whose patch and content are kept (the others are read again).
+const CACHED: usize = 16;
+
+/// The last `CACHED` values read, by commit hash.
+struct Cache<V> {
+    map: HashMap<String, V>,
+    order: std::collections::VecDeque<String>,
+}
+
+impl<V: Clone> Cache<V> {
+    fn new() -> Cache<V> {
+        Cache { map: HashMap::new(), order: Default::default() }
+    }
+
+    fn get(&self, hash: &str) -> Option<V> {
+        self.map.get(hash).cloned()
+    }
+
+    fn insert(&mut self, hash: String, v: V) {
+        if self.map.insert(hash.clone(), v).is_none() {
+            self.order.push_back(hash);
+            while self.order.len() > CACHED {
+                if let Some(old) = self.order.pop_front() {
+                    self.map.remove(&old);
+                }
+            }
+        }
+    }
+}
 
 pub(super) struct History {
     ed: Weak<Editor>,
@@ -42,10 +71,12 @@ pub(super) struct History {
     restore: gtk::Button,
     copy: gtk::Button,
     selected: Cell<Option<usize>>,
-    /// Commit message and patch by hash.
-    patches: RefCell<HashMap<String, (String, String)>>,
+    /// Commit message and patch by hash (shared, not copied, by the pages).
+    patches: RefCell<Cache<(Rc<str>, Rc<str>)>>,
     /// File content by hash.
-    contents: RefCell<HashMap<String, String>>,
+    contents: RefCell<Cache<Rc<str>>>,
+    /// Commit shown in the "version" page.
+    shown_version: RefCell<Option<String>>,
     /// Answers for an older selection are dropped.
     generation: Cell<u32>,
 }
@@ -63,7 +94,7 @@ fn cut(mut s: String) -> String {
 }
 
 /// A read-only monospace view for diffs, sharing the editor tags.
-fn diff_view(tags: &gtk::TextTagTable) -> gtk::TextView {
+pub(super) fn diff_view(tags: &gtk::TextTagTable) -> gtk::TextView {
     let buf = gtk::TextBuffer::new(Some(tags));
     let v = gtk::TextView::with_buffer(&buf);
     v.add_css_class("macaco");
@@ -221,8 +252,9 @@ impl History {
             restore,
             copy,
             selected: Cell::new(None),
-            patches: RefCell::new(HashMap::new()),
-            contents: RefCell::new(HashMap::new()),
+            patches: RefCell::new(Cache::new()),
+            contents: RefCell::new(Cache::new()),
+            shown_version: RefCell::new(None),
             generation: Cell::new(0),
         });
         h.fill();
@@ -308,22 +340,12 @@ impl History {
                 && ed.history.borrow().as_ref().is_some_and(|x| Rc::ptr_eq(x, &h))
             {
                 *ed.history.borrow_mut() = None;
+                ed.release_memory();
             }
             glib::Propagation::Proceed
         });
         // Escape closes.
-        let keys = gtk::EventControllerKey::new();
-        let w = self.win.downgrade();
-        keys.connect_key_pressed(move |_, key, _, _| {
-            if key == gdk::Key::Escape
-                && let Some(w) = w.upgrade()
-            {
-                w.close();
-                return glib::Propagation::Stop;
-            }
-            glib::Propagation::Proceed
-        });
-        self.win.add_controller(keys);
+        crate::ui::close_on_escape(&self.win);
         if let Some(r) = self.list.row_at_index(0) {
             self.list.select_row(Some(&r));
         }
@@ -341,7 +363,7 @@ impl History {
         self.show_page();
         // Message and patch are needed by every page (the patch marks the
         // changed lines of the whole version).
-        if !self.patches.borrow().contains_key(&e.hash) {
+        if self.patches.borrow().get(&e.hash).is_none() {
             let (w, wanted, hash) = (Rc::downgrade(self), self.generation.get(), e.hash.clone());
             // With the name in the previous commit too, a rename is shown
             // as such and not as a whole new file.
@@ -355,7 +377,7 @@ impl History {
                 let text = String::from_utf8_lossy(&out.stdout).into_owned();
                 let (msg, patch) = text.split_once('\0').map_or((String::new(), text.clone()), |(m, p)| (m.trim().to_string(), p.trim_start_matches('\n').to_string()));
                 let patch = if out.ok { cut(patch) } else { format!("git show non riuscito: {}", out.summary()) };
-                h.patches.borrow_mut().insert(hash, (msg, patch));
+                h.patches.borrow_mut().insert(hash, (msg.into(), patch.into()));
                 if h.generation.get() == wanted {
                     h.show_page();
                 }
@@ -365,7 +387,8 @@ impl History {
 
     /// Fetch the file at the selected version, then call `then`.
     fn with_content(self: &Rc<Self>, e: &LogEntry, then: impl FnOnce(&Rc<History>, &str) + 'static) {
-        if let Some(c) = self.contents.borrow().get(&e.hash).cloned() {
+        let cached = self.contents.borrow().get(&e.hash);
+        if let Some(c) = cached {
             then(self, &c);
             return;
         }
@@ -380,6 +403,7 @@ impl History {
             } else {
                 cut(String::from_utf8_lossy(&out.stdout).into_owned())
             };
+            let text: Rc<str> = text.into();
             h.contents.borrow_mut().insert(hash, text.clone());
             if h.generation.get() == wanted {
                 then(&h, &text);
@@ -390,7 +414,7 @@ impl History {
     /// Render the visible page for the selected commit.
     fn show_page(self: &Rc<Self>) {
         let Some(e) = self.current_entry() else { return };
-        let patch = self.patches.borrow().get(&e.hash).cloned();
+        let patch = self.patches.borrow().get(&e.hash);
         if let Some((msg, _)) = &patch {
             self.message.set_text(if msg.is_empty() { &e.subject } else { msg });
         }
@@ -405,15 +429,20 @@ impl History {
                 self.with_content(&e, move |h, text| h.show_current(&entry, text));
             }
             _ => {
-                let text = patch.map_or_else(|| "Caricamento…".to_string(), |(_, p)| p);
+                let text = patch.map_or_else(|| "Caricamento…".into(), |(_, p)| p);
                 show_diff(&self.patch_view, &text);
             }
         }
     }
 
     fn show_version(&self, e: &LogEntry, text: &str, patch: &str) {
+        // Already shown (back to this page): not loaded and colored again.
+        if self.shown_version.borrow().as_deref() == Some(e.hash.as_str()) {
+            return;
+        }
+        *self.shown_version.borrow_mut() = Some(e.hash.clone());
         let d = &self.version;
-        d.set_lang(lang::detect(Some(Path::new(&e.path)), &text.chars().take(256).collect::<String>()));
+        d.set_lang(lang::detect(Some(Path::new(&e.path)), text));
         d.set_content(text, false, 0);
         // The lines this commit added or changed.
         let buf = &d.buffer;
@@ -474,7 +503,7 @@ impl History {
 }
 
 /// Show a unified diff with added, removed and header lines colored.
-fn show_diff(view: &gtk::TextView, text: &str) {
+pub(super) fn show_diff(view: &gtk::TextView, text: &str) {
     let buf = view.buffer();
     buf.set_text(text);
     let table = buf.tag_table();

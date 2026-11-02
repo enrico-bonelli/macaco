@@ -7,7 +7,7 @@ use super::Editor;
 use crate::doc::Doc;
 use crate::finder::{self, TextMatch, TextResults};
 use crate::lang::{self, Lang};
-use crate::symbols::{self, ProjectSymbols, Symbol};
+use crate::symbols::{self, FileSymbols, ProjectSymbols, Symbol};
 use gtk::prelude::*;
 use gtk::{gdk, gio, glib};
 use std::cell::{Cell, RefCell};
@@ -51,6 +51,8 @@ pub(super) struct Completion {
     start: Cell<i32>,
     /// Requests started before this one are obsolete.
     pub(super) generation: Cell<u32>,
+    /// Completion requests waiting for a server, cancelled by a new one.
+    pub(super) requests: RefCell<Vec<(Weak<crate::lsp::Client>, i64)>>,
 }
 
 impl Completion {
@@ -127,6 +129,27 @@ fn prefix_at_cursor(d: &Doc) -> (String, i32) {
     (buf.text(&a, &it, true).to_string(), a.offset())
 }
 
+/// A row of the completion list: name and detail.
+fn completion_row() -> gtk::Box {
+    let name = gtk::Label::new(None);
+    name.set_xalign(0.0);
+    name.set_hexpand(true);
+    name.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    name.set_width_chars(16);
+    name.set_max_width_chars(48);
+    name.add_css_class("monospace");
+    let detail = gtk::Label::new(None);
+    detail.add_css_class("dim-label");
+    detail.set_ellipsize(gtk::pango::EllipsizeMode::Start);
+    detail.set_max_width_chars(30);
+    let row = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+    row.set_margin_start(4);
+    row.set_margin_end(4);
+    row.append(&name);
+    row.append(&detail);
+    row
+}
+
 /// Text of the document around the cursor (at most about 1 MB), for the
 /// words proposed by the completion.
 fn text_near_cursor(d: &Doc) -> String {
@@ -139,13 +162,7 @@ fn text_near_cursor(d: &Doc) -> String {
 
 impl Editor {
     pub(super) fn setup_inspect_actions(self: &Rc<Self>) {
-        let add = |name: &str, accels: &[&str], f: fn(&Rc<Editor>)| {
-            let a = gio::SimpleAction::new(name, None);
-            let ed = self.clone();
-            a.connect_activate(move |_, _| f(&ed));
-            self.win.add_action(&a);
-            self.app.set_accels_for_action(&format!("win.{name}"), accels);
-        };
+        let add = |name: &str, accels: &[&str], f: fn(&Rc<Editor>)| self.add_action(name, accels, f);
         add("goto-definition", &["F4"], |ed| ed.goto_definition());
         add("find-usages", &["<Shift>F4"], |ed| ed.find_usages());
         add("complete", &["<Control>space"], |ed| {
@@ -255,35 +272,63 @@ impl Editor {
     // ------------------------------------------------------------ symbols
 
     /// Scans the files of the indexed working folder for definitions, in
-    /// the background.
-    pub(super) fn rebuild_symbols(self: &Rc<Self>, root: PathBuf, files: Vec<String>) {
+    /// the background. Only new files and files changed since the last scan
+    /// are read again.
+    pub(super) fn rebuild_symbols(self: &Rc<Self>, root: PathBuf, paths: finder::Paths) {
         if self.symbols_building.replace(true) {
             return;
         }
+        let old = self.symbols.borrow().as_ref().filter(|s| s.root == root).map(|s| s.project.borrow().stamps()).unwrap_or_default();
         let ed = Rc::downgrade(self);
         glib::spawn_future_local(async move {
             let r = root.clone();
-            let project = gio::spawn_blocking(move || {
-                let per_file: Vec<Vec<Symbol>> = files
+            let scan = gio::spawn_blocking(move || {
+                let files: Vec<String> = (0..paths.len()).map(|i| paths.get(i).to_string()).collect();
+                drop(paths);
+                let mut stamps = Vec::with_capacity(files.len());
+                let mut per_file: Vec<FileSymbols> = files
                     .iter()
                     .map(|rel| {
                         let path = r.join(rel);
-                        let l = lang::detect(Some(&path), "");
-                        if l == Lang::Plain || std::fs::metadata(&path).map_or(true, |m| m.len() > MAX_SYMBOL_FILE) {
-                            return Vec::new();
+                        let meta = std::fs::metadata(&path).ok();
+                        let stamp = meta.as_ref().map_or((0, 0), symbols::stamp_of);
+                        stamps.push(stamp);
+                        if let Some(&(s, i)) = old.get(rel)
+                            && s == stamp
+                        {
+                            return FileSymbols::Same(i);
                         }
-                        finder::read_text(&path).map(|t| symbols::extract_file(l, &path, &t)).unwrap_or_default()
+                        let l = lang::detect(Some(&path), "");
+                        if l == Lang::Plain || meta.is_none_or(|m| m.len() > MAX_SYMBOL_FILE) {
+                            return FileSymbols::New(Vec::new());
+                        }
+                        FileSymbols::New(finder::read_text(&path).map(|t| symbols::extract_file(l, &path, &t)).unwrap_or_default())
                     })
                     .collect();
-                ProjectSymbols::build(files, per_file)
+                let sorted = symbols::sort_new(&mut per_file);
+                (files, stamps, per_file, sorted)
             })
             .await;
             let Some(ed) = ed.upgrade() else { return };
             ed.symbols_building.set(false);
-            let Ok(project) = project else { return };
+            let Ok((files, stamps, per_file, sorted)) = scan else { return };
             // The folder may have been closed meanwhile.
-            if ed.workdir.borrow().as_deref() == Some(root.as_path()) {
-                *ed.symbols.borrow_mut() = Some(Rc::new(Symbols { root, project: RefCell::new(project) }));
+            if ed.workdir.borrow().as_deref() != Some(root.as_path()) {
+                return;
+            }
+            let current = ed.symbols.borrow().clone().filter(|s| s.root == root);
+            match current {
+                Some(s) => {
+                    let mut p = s.project.borrow_mut();
+                    if !p.unchanged(&files, &per_file) {
+                        p.apply_scan(files, stamps, &per_file, sorted);
+                    }
+                }
+                None => {
+                    let mut p = ProjectSymbols::default();
+                    p.apply_scan(files, stamps, &per_file, sorted);
+                    *ed.symbols.borrow_mut() = Some(Rc::new(Symbols { root, project: RefCell::new(p) }));
+                }
             }
             ed.release_memory();
         });
@@ -306,7 +351,8 @@ impl Editor {
         let Some(path) = d.path.borrow().clone() else { return };
         let Ok(rel) = path.strip_prefix(&s.root) else { return };
         let syms = symbols::extract_file(d.lang.get(), &path, &d.text());
-        s.project.borrow_mut().update_file(&rel.to_string_lossy(), syms);
+        let stamp = std::fs::metadata(&path).map_or((0, 0), |m| symbols::stamp_of(&m));
+        s.project.borrow_mut().update_file(&rel.to_string_lossy(), stamp, syms);
     }
 
     // --------------------------------------------------- definition, usages
@@ -384,13 +430,7 @@ impl Editor {
             Some(p) if d.path.borrow().as_deref() != Some(p) => self.open_at(p, line, col),
             _ => {
                 let buf = &d.buffer;
-                let mut it = buf.iter_at_line(line as i32).unwrap_or_else(|| buf.end_iter());
-                let mut end = it;
-                if !end.ends_line() {
-                    end.forward_to_line_end();
-                }
-                it.set_line_offset((col as i32).min(end.line_offset()));
-                buf.place_cursor(&it);
+                buf.place_cursor(&d.iter_at_line_col(line as i32, col as i32));
                 d.view.scroll_to_mark(&buf.get_insert(), 0.1, true, 0.0, 0.4);
                 d.view.grab_focus();
             }
@@ -440,6 +480,7 @@ impl Editor {
             doc: RefCell::new(Weak::new()),
             start: Cell::new(0),
             generation: Cell::new(0),
+            requests: RefCell::new(Vec::new()),
         });
         let ed = Rc::downgrade(self);
         c.list.connect_row_activated(move |_, row| {
@@ -523,33 +564,34 @@ impl Editor {
         let lower = prefix.to_lowercase();
         // name -> (rank, detail)
         let mut best: HashMap<String, (u8, String)> = HashMap::new();
-        let mut add = |name: &str, rank: u8, detail: String| {
-            if name == prefix || !name.to_lowercase().starts_with(&lower) {
+        let mut add = |name: &str, rank: u8, detail: &str| {
+            if name == prefix || !symbols::starts_with_lower(name, &lower) {
                 return;
             }
             let rank = rank + if name.starts_with(prefix) { 0 } else { 4 };
             let e = best.entry(name.to_string()).or_insert((u8::MAX, String::new()));
             if rank < e.0 {
-                *e = (rank, detail);
+                *e = (rank, detail.to_string());
             }
         };
-        for s in symbols::extract(d.lang.get(), &text_near_cursor(d)) {
-            add(&s.name, 0, s.kind.label().to_string());
+        let text = text_near_cursor(d);
+        for s in symbols::extract(d.lang.get(), &text) {
+            add(&s.name, 0, s.kind.label());
         }
         if let Some(p) = self.symbols.borrow().as_ref() {
             let project = p.project.borrow();
             for e in project.with_prefix(prefix, 300) {
-                let file = project.files[e.file as usize].rsplit('/').next().unwrap_or("").to_string();
-                add(&e.sym.name, 2, format!("{} · {file}", e.sym.kind.label()));
+                let file = project.files[e.file as usize].rsplit('/').next().unwrap_or("");
+                add(&e.sym.name, 2, &format!("{} · {file}", e.sym.kind.label()));
             }
         }
-        for w in symbols::words(&text_near_cursor(d), MIN_PREFIX) {
-            add(&w, 1, String::new());
+        for w in symbols::words(&text, MIN_PREFIX, &lower) {
+            add(w, 1, "");
         }
         let spec = d.lang.get().spec();
         for (list, label) in [(spec.keywords, "parola chiave"), (spec.types, "tipo"), (spec.constants, "costante"), (spec.builtins, "funzione")] {
             for k in list {
-                add(k, 3, label.to_string());
+                add(k, 3, label);
             }
         }
         let mut items: Vec<(u8, String, String)> = best.into_iter().map(|(n, (r, det))| (r, n, det)).collect();
@@ -568,25 +610,28 @@ impl Editor {
             return;
         }
         let c = self.completion();
-        c.list.remove_all();
-        for it in &items {
-            let name = gtk::Label::new(Some(&it.label));
-            name.set_xalign(0.0);
-            name.set_hexpand(true);
-            name.set_ellipsize(gtk::pango::EllipsizeMode::End);
-            name.set_width_chars(16);
-            name.set_max_width_chars(48);
-            name.add_css_class("monospace");
-            let detail = gtk::Label::new(Some(&it.detail));
-            detail.add_css_class("dim-label");
-            detail.set_ellipsize(gtk::pango::EllipsizeMode::Start);
-            detail.set_max_width_chars(30);
-            let row = gtk::Box::new(gtk::Orientation::Horizontal, 12);
-            row.set_margin_start(4);
-            row.set_margin_end(4);
-            row.append(&name);
-            row.append(&detail);
-            c.list.append(&row);
+        // The rows are kept and reused: only the texts change while typing.
+        for (i, it) in items.iter().enumerate() {
+            let row = match c.list.row_at_index(i as i32) {
+                Some(r) => r,
+                None => {
+                    c.list.append(&completion_row());
+                    c.list.row_at_index(i as i32).expect("row just added")
+                }
+            };
+            let Some(b) = row.child() else { continue };
+            if let Some(l) = b.first_child().and_downcast::<gtk::Label>() {
+                l.set_text(&it.label);
+            }
+            if let Some(l) = b.last_child().and_downcast::<gtk::Label>() {
+                l.set_text(&it.detail);
+            }
+            row.set_visible(true);
+        }
+        let mut extra = c.list.row_at_index(items.len() as i32);
+        while let Some(r) = extra {
+            r.set_visible(false);
+            extra = r.next_sibling().and_downcast::<gtk::ListBoxRow>();
         }
         *c.items.borrow_mut() = items;
         if let Some(r) = c.list.row_at_index(0) {
@@ -644,29 +689,26 @@ impl Editor {
 /// Results for several definitions, shown like search results.
 fn definition_results(root: &Path, d: &Doc, found: &[(Option<PathBuf>, Symbol)]) -> TextResults {
     let mut res = TextResults::default();
-    let mut texts: HashMap<PathBuf, Option<String>> = HashMap::new();
-    let doc_text = d.text();
+    let doc_path = d.path.borrow().clone();
+    // Texts of the other files, read once each.
+    let mut texts: HashMap<&Path, String> = HashMap::new();
     for (path, s) in found {
-        let text = match path {
-            Some(p) if d.path.borrow().as_deref() != Some(p.as_path()) => {
-                texts.entry(p.clone()).or_insert_with(|| finder::read_text(p)).clone().unwrap_or_default()
+        let line = match path {
+            Some(p) if doc_path.as_deref() != Some(p.as_path()) => {
+                let text = texts.entry(p.as_path()).or_insert_with(|| finder::read_text(p).unwrap_or_default());
+                text.lines().nth(s.line as usize).unwrap_or("").to_string()
             }
-            _ => doc_text.clone(),
+            _ => d.line_text(s.line as i32),
         };
-        let line = text.lines().nth(s.line as usize).unwrap_or("");
+        // The file may have changed since its symbols were read: `snippet`
+        // keeps the positions inside the line.
         let start = line.char_indices().nth(s.col as usize).map_or(line.len(), |(b, _)| b);
-        let (snippet, hl, col) = finder::snippet(line, start, start + s.name.len());
+        let (snippet, hl, col) = finder::snippet(&line, start, start + s.name.len());
         let rel = match path {
-            Some(p) => p.strip_prefix(root).map_or_else(|_| p.to_string_lossy().into_owned(), |r| r.to_string_lossy().into_owned()),
+            Some(p) => finder::rel_or_full(root, p),
             None => d.title(),
         };
-        let file = match res.files.iter().position(|f| *f == rel) {
-            Some(i) => i as u32,
-            None => {
-                res.files.push(rel);
-                (res.files.len() - 1) as u32
-            }
-        };
+        let file = res.file_index(rel);
         res.matches.push(TextMatch { file, line: s.line, col, snippet, hl });
     }
     res
@@ -675,7 +717,7 @@ fn definition_results(root: &Path, d: &Doc, found: &[(Option<PathBuf>, Symbol)])
 #[cfg(debug_assertions)]
 impl Editor {
     pub(super) fn debug_inspect(&self) {
-        let syms = self.symbols.borrow().as_ref().map_or(0, |s| if s.project.borrow().is_empty() { 0 } else { s.project.borrow().len() });
+        let syms = self.symbols.borrow().as_ref().map_or(0, |s| s.project.borrow().len());
         let items: Vec<String> = self
             .completion
             .borrow()
@@ -684,7 +726,7 @@ impl Editor {
             .map(|c| c.items.borrow().iter().map(|i| format!("{} [{}]", i.label, i.detail)).collect())
             .unwrap_or_default();
         let pos = self.active_doc().map(|d| {
-            let it = d.buffer.iter_at_mark(&d.buffer.get_insert());
+            let it = d.cursor_iter();
             (d.title(), it.line() + 1, it.line_offset() + 1)
         });
         let focus = gtk::prelude::GtkWindowExt::focus(&self.win).map(|w| w.type_().name().to_string());

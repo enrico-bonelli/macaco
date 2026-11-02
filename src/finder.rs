@@ -23,7 +23,7 @@ fn in_hidden_dir(rel: &str) -> bool {
 
 /// List of relative paths stored in one block of text (`a\0b\0…`): half
 /// the memory of a `Vec<String>`, and the same format as the cache file.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct Paths {
     data: String,
     /// Start and end of each path in `data`.
@@ -84,8 +84,7 @@ fn git_files(root: &Path) -> Option<Vec<String>> {
         .arg("-C")
         .arg(root)
         .args(["ls-files", "-z", "--cached", "--others", "--exclude-standard"])
-        .env("GIT_OPTIONAL_LOCKS", "0")
-        .env("GIT_TERMINAL_PROMPT", "0")
+        .envs(crate::git::QUIET_ENV)
         .stdin(Stdio::null())
         .stderr(Stdio::null())
         .output()
@@ -324,6 +323,24 @@ pub struct TextResults {
     pub cancelled: bool,
 }
 
+impl TextResults {
+    /// Index of file `rel` in `files` (added if missing).
+    pub fn file_index(&mut self, rel: String) -> u32 {
+        match self.files.iter().rposition(|f| *f == rel) {
+            Some(i) => i as u32,
+            None => {
+                self.files.push(rel);
+                (self.files.len() - 1) as u32
+            }
+        }
+    }
+}
+
+/// `path` relative to `root` when inside it, else in full.
+pub fn rel_or_full(root: &Path, path: &Path) -> String {
+    path.strip_prefix(root).unwrap_or(path).to_string_lossy().into_owned()
+}
+
 /// Progress of a search, shared with the thread running it.
 #[derive(Default)]
 pub struct Progress {
@@ -354,15 +371,29 @@ pub fn read_text(path: &Path) -> Option<String> {
         return None;
     }
     f.read_to_end(&mut bytes).ok()?;
-    Some(encoding::normalize_eol(encoding::decode(&bytes, encoding::detect(&bytes))).0)
+    let enc = encoding::detect(&bytes);
+    Some(encoding::normalize_eol(encoding::decode_owned(bytes, enc)).0)
+}
+
+/// Largest char boundary of `s` that is `<= i`.
+fn floor_boundary(s: &str, i: usize) -> usize {
+    let mut i = i.min(s.len());
+    while !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
 }
 
 /// Part of a line to show for a match at bytes `start..end` of `line`:
 /// (snippet, match inside it in characters, column of the match).
+/// Out-of-range or mid-character positions (e.g. a file changed since it
+/// was indexed) are clamped.
 pub fn snippet(line: &str, start: usize, end: usize) -> (String, (u32, u32), u32) {
+    let start = floor_boundary(line, start);
+    let end = floor_boundary(line, end).max(start);
     let before: Vec<char> = line[..start].chars().collect();
-    let found: Vec<char> = line[start..end.max(start)].chars().collect();
-    let after = &line[end.max(start)..];
+    let found: Vec<char> = line[start..end].chars().collect();
+    let after = &line[end..];
     // Some text around the match, without leading blanks.
     let skip = before.iter().take_while(|c| c.is_whitespace()).count().max(before.len().saturating_sub(SNIPPET_BEFORE));
     let mut snippet = String::new();
@@ -396,11 +427,12 @@ fn comments_and_strings(lang: crate::lang::Lang, text: &str) -> Vec<(usize, usiz
     out
 }
 
-/// Searches `q` in the files of `root` (same files as the quick search).
-/// With `code_only`, matches inside comments and strings are skipped.
+/// Searches `q` in the files of `root` (same files as the quick search;
+/// `paths` when they are already known). With `code_only`, matches inside
+/// comments and strings are skipped.
 /// Slow: to be run in a thread; `progress.cancel` stops it.
-pub fn grep(root: &Path, q: &Query, code_only: bool, progress: &Progress) -> TextResults {
-    let paths = scan(root);
+pub fn grep(root: &Path, paths: Option<Paths>, q: &Query, code_only: bool, progress: &Progress) -> TextResults {
+    let paths = paths.unwrap_or_else(|| scan(root));
     progress.total.store(paths.len(), Ordering::Relaxed);
     let mut res = TextResults::default();
     for i in 0..paths.len() {
@@ -424,8 +456,7 @@ pub fn grep(root: &Path, q: &Query, code_only: bool, progress: &Progress) -> Tex
             }
             if code_only {
                 let ranges = skip_ranges.get_or_insert_with(|| {
-                    let head: String = text.chars().take(256).collect();
-                    match crate::lang::detect(Some(Path::new(rel)), &head) {
+                    match crate::lang::detect(Some(Path::new(rel)), &text) {
                         crate::lang::Lang::Plain => Vec::new(),
                         lang => comments_and_strings(lang, &text),
                     }
@@ -494,6 +525,15 @@ mod tests {
     use super::*;
 
     #[test]
+    fn snippet_out_of_range() {
+        // A definition whose file was emptied or shortened.
+        assert_eq!(snippet("", 0, 5).0, "");
+        assert_eq!(snippet("ab", 1, 9), ("ab".to_string(), (1, 1), 1));
+        // A position inside a multi-byte character.
+        assert_eq!(snippet("àb", 1, 2).0, "àb");
+    }
+
+    #[test]
     fn hidden_dirs() {
         assert!(in_hidden_dir(".git/HEAD"));
         assert!(in_hidden_dir("a/.cache/x"));
@@ -535,7 +575,7 @@ mod tests {
         fs::write(dir.join(".git/x"), "ciao").unwrap();
         fs::write(dir.join("bin.dat"), b"ciao\0\0").unwrap();
         let q = Query::new("ciao", Options::default()).unwrap();
-        let res = grep(&dir, &q, false, &Progress::default());
+        let res = grep(&dir, None, &q, false, &Progress::default());
         assert_eq!(res.files, vec!["a.txt"]);
         assert_eq!(res.matches.len(), 2);
         let m = &res.matches[0];
@@ -545,7 +585,7 @@ mod tests {
         assert_eq!(res.matches[1].line, 3);
         // Only code: the match in the comment is skipped.
         fs::write(dir.join("b.rs"), "fn ciao() {}\n// ciao\nlet s = \"ciao\"; ciao();\n").unwrap();
-        let res = grep(&dir, &q, true, &Progress::default());
+        let res = grep(&dir, None, &q, true, &Progress::default());
         let in_b: Vec<u32> = res.matches.iter().filter(|m| res.files[m.file as usize] == "b.rs").map(|m| m.line).collect();
         assert_eq!(in_b, vec![0, 2]);
         let m = res.matches.iter().find(|m| res.files[m.file as usize] == "b.rs" && m.line == 2).unwrap();

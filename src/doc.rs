@@ -144,9 +144,15 @@ pub struct Shared {
 }
 
 impl Shared {
-    pub fn indent_unit(&self, lang: Lang) -> String {
+    pub fn indent_unit(&self, lang: Lang) -> std::borrow::Cow<'static, str> {
+        const SPACES: &str = "                ";
         let s = self.settings.borrow();
-        if s.insert_spaces && !lang.prefers_tabs() { " ".repeat(s.tab_width as usize) } else { "\t".into() }
+        let n = s.tab_width as usize;
+        match (s.insert_spaces && !lang.prefers_tabs(), SPACES.get(..n)) {
+            (false, _) => "\t".into(),
+            (true, Some(sp)) => sp.into(),
+            (true, None) => " ".repeat(n).into(),
+        }
     }
 }
 
@@ -292,13 +298,22 @@ pub struct Doc {
     monitor: RefCell<Option<gio::FileMonitor>>,
 }
 
-fn count_digits(mut n: i32) -> i32 {
-    let mut d = 1;
-    while n >= 10 {
-        n /= 10;
-        d += 1;
+/// Removes `tag` from the ranges that have it. Removing it from the whole
+/// buffer would make GTK redraw (and, for tags changing the font, measure
+/// again) every line; the toggles are found through the buffer tree.
+pub fn remove_tag_where_applied(buf: &gtk::TextBuffer, tag: &gtk::TextTag) {
+    let mut it = buf.start_iter();
+    while it.starts_tag(Some(tag)) || it.forward_to_tag_toggle(Some(tag)) {
+        let start = it;
+        if !it.forward_to_tag_toggle(Some(tag)) {
+            it = buf.end_iter();
+        }
+        buf.remove_tag(tag, &start, &it);
     }
-    d
+}
+
+fn count_digits(n: i32) -> i32 {
+    n.max(1).ilog10() as i32 + 1
 }
 
 /// Debug builds: documents alive and weak references to their buffers, to
@@ -431,8 +446,10 @@ impl Doc {
                     d.schedule_highlight();
                     d.update_gutter_width();
                     d.gutter.queue_draw();
-                    if d.path.borrow().is_none() {
-                        d.refresh_title();
+                    // Untitled: the tab shows the first words, while typing
+                    // its label is set again only when they change.
+                    if d.path.borrow().is_none() && d.update_title() {
+                        d.update_label();
                     }
                 }
         });
@@ -497,19 +514,16 @@ impl Doc {
         });
         self.gutter.add_controller(motion);
 
+        // Scrolling, or a new height of the text: the gutter follows.
         let vadj = self.scroller.vadjustment();
         let g = self.gutter.downgrade();
-        vadj.connect_value_changed(move |_| {
+        let redraw = move |_: &gtk::Adjustment| {
             if let Some(g) = g.upgrade() {
                 g.queue_draw();
             }
-        });
-        let g = self.gutter.downgrade();
-        vadj.connect_changed(move |_| {
-            if let Some(g) = g.upgrade() {
-                g.queue_draw();
-            }
-        });
+        };
+        vadj.connect_value_changed(redraw.clone());
+        vadj.connect_changed(redraw);
 
         // Editing keys: auto-indent, tab/shift-tab, smart backspace.
         let keys = gtk::EventControllerKey::new();
@@ -537,8 +551,7 @@ impl Doc {
         tabs.set_tab(0, pango::TabAlign::Left, layout.pixel_size().0);
         self.view.set_tabs(&tabs);
         if !s.highlight_line {
-            let (a, b) = self.buffer.bounds();
-            self.buffer.remove_tag(&self.shared.tags.curline, &a, &b);
+            remove_tag_where_applied(&self.buffer, &self.shared.tags.curline);
         }
         drop((s, font));
         self.update_gutter_width();
@@ -588,7 +601,7 @@ impl Doc {
         let rect = self.view.visible_rect();
         // The visible rect starts above line 0 by the top margin.
         let (mut iter, _) = self.view.line_at_y(rect.y().max(0));
-        let cur_line = self.buffer.iter_at_mark(&self.buffer.get_insert()).line();
+        let cur_line = self.cursor_iter().line();
         let bottom = rect.y() + rect.height();
         let fw = self.fold_width();
         // Collapsed blocks: (header line, first visible position after them).
@@ -824,7 +837,7 @@ impl Doc {
     /// Collapse the block starting on the cursor line or else the innermost
     /// one containing it; false if there is none.
     pub fn fold_at_cursor(&self) -> bool {
-        let line = self.buffer.iter_at_mark(&self.buffer.get_insert()).line() as u32;
+        let line = self.cursor_iter().line() as u32;
         let ranges = self.fold_ranges();
         let open = |r: &&fold::Range| self.fold_index_at_line(r.header as i32).is_none();
         let pick = ranges.iter().filter(open).find(|r| r.header == line).or_else(|| {
@@ -841,7 +854,7 @@ impl Doc {
 
     /// Expand the collapsed block on the cursor line; false if there is none.
     pub fn unfold_at_cursor(&self) -> bool {
-        let line = self.buffer.iter_at_mark(&self.buffer.get_insert()).line();
+        let line = self.cursor_iter().line();
         match self.fold_index_at_line(line) {
             Some(i) => {
                 self.unfold_index(i);
@@ -928,7 +941,7 @@ impl Doc {
     /// line", a jump to a definition, …).
     fn reveal_cursor(&self) {
         loop {
-            let ins = self.buffer.iter_at_mark(&self.buffer.get_insert());
+            let ins = self.cursor_iter();
             let hit = self.folds.borrow().iter().position(|f| {
                 let (_, s, e) = self.fold_iters(f);
                 hides(&s, &e, &ins)
@@ -966,8 +979,6 @@ impl Doc {
         self.gutter_hover.set(on);
         self.gutter.queue_draw();
     }
-
-    // ------------------------------------------------------------- content
 
     // ------------------------------------------------------- changes on disk
 
@@ -1009,6 +1020,12 @@ impl Doc {
     }
 
     /// Compare the file on disk with the version that was read or saved.
+    /// Whether the file may differ from the version read (date or size
+    /// changed, or never recorded).
+    pub fn maybe_changed_on_disk(&self) -> bool {
+        self.disk_stamp.get().is_none() || !matches!(self.check_disk(), DiskChange::None)
+    }
+
     pub fn check_disk(&self) -> DiskChange {
         let Some(path) = self.path.borrow().clone() else { return DiskChange::None };
         let Some(known) = self.disk_stamp.get() else { return DiskChange::None };
@@ -1049,6 +1066,53 @@ impl Doc {
         self.path.borrow().is_none() && !self.is_nonempty()
     }
 
+    /// Position at `line`, character `col` (both from 0), kept inside the
+    /// text: the line may have been shortened since `col` was found.
+    pub fn iter_at_line_col(&self, line: i32, col: i32) -> gtk::TextIter {
+        let buf = &self.buffer;
+        let mut it = buf.iter_at_line(line).unwrap_or_else(|| buf.end_iter());
+        let mut end = it;
+        if !end.ends_line() {
+            end.forward_to_line_end();
+        }
+        it.set_line_offset(col.clamp(0, end.line_offset()));
+        it
+    }
+
+    /// Text of line `line` (without the newline; empty if missing).
+    pub fn line_text(&self, line: i32) -> String {
+        let buf = &self.buffer;
+        let Some(a) = buf.iter_at_line(line) else { return String::new() };
+        let mut b = a;
+        if !b.ends_line() {
+            b.forward_to_line_end();
+        }
+        buf.text(&a, &b, true).into()
+    }
+
+    /// Lexer state at the start of `line`, when the highlighting is up to
+    /// date there (it is kept for every line).
+    pub fn state_at_line_start(&self, line: usize) -> Option<State> {
+        if line == 0 {
+            return Some(lexer::initial_state(self.lang.get()));
+        }
+        let hl = self.hl.borrow();
+        if hl.lo != NO_DIRTY && hl.lo < line {
+            return None;
+        }
+        hl.states.get(line - 1).copied()
+    }
+
+    /// Position of the cursor.
+    pub fn cursor_iter(&self) -> gtk::TextIter {
+        self.buffer.iter_at_mark(&self.buffer.get_insert())
+    }
+
+    /// Changes with every edit of the text.
+    pub fn edit_gen(&self) -> u64 {
+        self.edit_gen.get()
+    }
+
     pub fn text(&self) -> String {
         let (a, b) = self.buffer.bounds();
         self.buffer.text(&a, &b, true).into()
@@ -1056,7 +1120,7 @@ impl Doc {
 
     pub fn cursor_offset(&self) -> i32 {
         if self.loaded.get() {
-            self.buffer.iter_at_mark(&self.buffer.get_insert()).offset()
+            self.cursor_iter().offset()
         } else {
             self.saved_cursor.get()
         }
@@ -1104,8 +1168,7 @@ impl Doc {
             self.encoding_known.set(true);
             self.eol.set(eol);
             if self.lang.get() == Lang::Plain {
-                let head: String = text.chars().take(256).collect();
-                self.lang.set(crate::lang::detect(Some(&p), &head));
+                self.lang.set(crate::lang::detect(Some(&p), &text));
             }
             self.set_content(&text, false, cursor);
         }
@@ -1161,15 +1224,7 @@ impl Doc {
         self.eol.set(meta.eol);
         self.lang.set(meta.lang);
         let id = self.id.borrow().clone();
-        let head: String = std::fs::File::open(config::cache_dir().join(format!("{id}.txt")))
-            .ok()
-            .map(|f| {
-                use std::io::Read;
-                let mut buf = Vec::new();
-                let _ = f.take(256).read_to_end(&mut buf);
-                String::from_utf8_lossy(&buf).into_owned()
-            })
-            .unwrap_or_default();
+        let head = config::read_cache_head(&id, 256);
         *self.title.borrow_mut() = self.compute_title(&head);
         self.update_label();
     }
@@ -1253,10 +1308,17 @@ impl Doc {
 
     /// Recompute the title (file name or first characters of the content).
     pub fn refresh_title(&self) {
+        self.update_title();
+        self.update_label();
+    }
+
+    /// Computes the title again; returns whether it changed.
+    fn update_title(&self) -> bool {
         let title = if self.path.borrow().is_none() && self.loaded.get() {
+            // The title of an untitled document comes from its first
+            // characters (see `compute_title`).
             let start = self.buffer.start_iter();
             let mut end = start;
-            // Skip leading blank space, then take a few characters.
             end.forward_chars(256);
             let head = self.buffer.text(&start, &end, true);
             self.compute_title(&head)
@@ -1267,7 +1329,7 @@ impl Doc {
         if changed {
             *self.title.borrow_mut() = title;
         }
-        self.update_label();
+        changed
     }
 
     pub fn title(&self) -> String {
@@ -1396,7 +1458,9 @@ impl Doc {
         let deadline = Instant::now() + HL_BUDGET;
         let mut line = hl.lo;
         let mut state = if line == 0 { lexer::initial_state(lang) } else { hl.states[line - 1] };
-        let mut chunk = 8;
+        // A key press usually changes one line, which converges at the
+        // next one: two lines, then twice as many each round.
+        let mut chunk = 2;
         let mut toks = Vec::with_capacity(32);
         loop {
             let end_line = (line + chunk).min(n);
@@ -1448,8 +1512,7 @@ impl Doc {
         let buf = &self.buffer;
         let cursor = buf.iter_at_mark(&buf.get_insert());
         if self.shared.settings.borrow().highlight_line {
-            let (a, b) = buf.bounds();
-            buf.remove_tag(&tags.curline, &a, &b);
+            remove_tag_where_applied(buf, &tags.curline);
             if !buf.has_selection() {
                 let mut s = cursor;
                 s.set_line_offset(0);
@@ -1460,8 +1523,7 @@ impl Doc {
         }
         // Matching bracket.
         if self.bracket_on.replace(false) {
-            let (a, b) = buf.bounds();
-            buf.remove_tag(&tags.bracket, &a, &b);
+            remove_tag_where_applied(buf, &tags.bracket);
         }
         if let Some((p, q)) = self.find_bracket_pair(&cursor) {
             for off in [p, q] {
@@ -1530,11 +1592,8 @@ impl Doc {
         match key {
             gdk::Key::Return | gdk::Key::KP_Enter if !shift => self.newline_with_indent(),
             gdk::Key::Tab if !shift => self.tab_key(),
-            gdk::Key::ISO_Left_Tab => {
-                self.indent_lines(false);
-                true
-            }
-            gdk::Key::Tab => {
+            // Shift+Tab (sent as ISO_Left_Tab or as Tab with Shift).
+            gdk::Key::ISO_Left_Tab | gdk::Key::Tab => {
                 self.indent_lines(false);
                 true
             }
@@ -1549,6 +1608,20 @@ impl Doc {
         let mut s = *it;
         s.set_line_offset(0);
         self.buffer.text(&s, it, true).into()
+    }
+
+    /// The text before `it` on its line if it is only blanks (looked at
+    /// backwards, stopping at the first other character: a long line is
+    /// not copied).
+    fn blank_prefix(&self, it: &gtk::TextIter) -> Option<String> {
+        let mut s = *it;
+        while !s.starts_line() {
+            s.backward_char();
+            if !matches!(s.char(), ' ' | '\t') {
+                return None;
+            }
+        }
+        Some(self.buffer.text(&s, it, true).into())
     }
 
     fn newline_with_indent(&self) -> bool {
@@ -1617,7 +1690,7 @@ impl Doc {
         buf.begin_user_action();
         buf.delete_selection(true, true);
         let mut it = buf.iter_at_mark(&buf.get_insert());
-        let col = self.line_prefix(&it).chars().count();
+        let col = it.line_offset() as usize;
         let w = unit.len();
         let n = w - col % w;
         buf.insert(&mut it, &" ".repeat(n));
@@ -1684,7 +1757,7 @@ impl Doc {
             return false;
         }
         let it = buf.iter_at_mark(&buf.get_insert());
-        let prefix = self.line_prefix(&it);
+        let Some(prefix) = self.blank_prefix(&it) else { return false };
         if prefix.is_empty() || !prefix.bytes().all(|c| c == b' ') {
             return false;
         }
@@ -1706,8 +1779,8 @@ impl Doc {
             return false;
         }
         let it = buf.iter_at_mark(&buf.get_insert());
-        let prefix = self.line_prefix(&it);
-        if prefix.is_empty() || !prefix.chars().all(|c| c == ' ' || c == '\t') {
+        let Some(prefix) = self.blank_prefix(&it) else { return false };
+        if prefix.is_empty() {
             return false;
         }
         let ch = match key {
@@ -1757,7 +1830,7 @@ impl Doc {
 pub fn read_file(path: &Path, enc: Option<Encoding>) -> std::io::Result<(String, Encoding, Eol)> {
     let bytes = std::fs::read(path)?;
     let enc = enc.unwrap_or_else(|| encoding::detect(&bytes));
-    let text = encoding::decode(&bytes, enc);
+    let text = encoding::decode_owned(bytes, enc);
     let (text, eol) = encoding::normalize_eol(text);
     Ok((text, enc, eol))
 }

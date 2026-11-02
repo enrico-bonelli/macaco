@@ -166,6 +166,11 @@ pub fn in_jsx_markup(lang: Lang, before: &str) -> bool {
     for line in before.strip_suffix('\n').unwrap_or(before).split('\n') {
         state = lex_line(lang, state, line, &mut toks);
     }
+    is_jsx_text(state)
+}
+
+/// Whether a line starting in `state` is in JSX markup (see `in_jsx_markup`).
+pub fn is_jsx_text(state: State) -> bool {
     matches!(state, State::Jsx(v) if Jsx::unpack(v).mode() == JsxMode::Text)
 }
 
@@ -178,13 +183,38 @@ fn perl_quote_op(w: &[u8]) -> Option<usize> {
     }
 }
 
-fn word_table(lang: Lang) -> &'static HashMap<&'static str, Kind> {
+/// FNV-1a: keywords are short, the default hasher (SipHash) is several
+/// times slower on them, and they are looked up for every identifier.
+#[derive(Default)]
+struct Fnv(u64);
+
+impl std::hash::Hasher for Fnv {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        let mut h = if self.0 == 0 { 0xcbf2_9ce4_8422_2325 } else { self.0 };
+        for b in bytes {
+            h = (h ^ u64::from(*b)).wrapping_mul(0x0100_0000_01b3);
+        }
+        self.0 = h;
+    }
+}
+
+/// Keywords, types, constants and built-ins of a language.
+type Words = HashMap<&'static [u8], Kind, std::hash::BuildHasherDefault<Fnv>>;
+
+/// Longer words are never in a table (no lookup, no lower case copy).
+const MAX_WORD: usize = 32;
+
+fn word_table(lang: Lang) -> &'static Words {
     const N: usize = crate::lang::ALL.len();
-    static TABLES: [OnceLock<HashMap<&'static str, Kind>>; N] = [const { OnceLock::new() }; N];
-    let idx = crate::lang::ALL.iter().position(|&l| l == lang).unwrap_or(0);
-    TABLES[idx].get_or_init(|| {
+    static TABLES: [OnceLock<Words>; N] = [const { OnceLock::new() }; N];
+    // `ALL` lists the languages in the order of the enum (see the test).
+    TABLES[lang as usize].get_or_init(|| {
         let s = lang.spec();
-        let mut m = HashMap::new();
+        let mut m = Words::default();
         // Later inserts win: keywords have the highest precedence.
         for (list, kind) in [
             (s.builtins, Kind::Function),
@@ -193,7 +223,8 @@ fn word_table(lang: Lang) -> &'static HashMap<&'static str, Kind> {
             (s.keywords, Kind::Keyword),
         ] {
             for w in list {
-                m.insert(*w, kind);
+                debug_assert!(w.len() <= MAX_WORD, "{w}");
+                m.insert(w.as_bytes(), kind);
             }
         }
         m
@@ -210,7 +241,8 @@ fn is_ident(c: u8) -> bool {
     c.is_ascii_alphanumeric() || c == b'_' || c >= 0x80
 }
 
-fn find(b: &[u8], from: usize, end: usize, pat: &[u8]) -> Option<usize> {
+/// Position of `pat` in `b[from..end]`.
+pub(crate) fn find(b: &[u8], from: usize, end: usize, pat: &[u8]) -> Option<usize> {
     if from >= end || pat.len() > end - from {
         return None;
     }
@@ -293,7 +325,7 @@ struct Lexer<'a> {
     b: &'a [u8],
     out: &'a mut Vec<Token>,
     lang: Lang,
-    words: &'static HashMap<&'static str, Kind>,
+    words: &'static Words,
     /// The previous word was `fn`/`def`/...: the next one names a function.
     def_next: bool,
 }
@@ -404,17 +436,7 @@ impl Lexer<'_> {
         let b = self.b;
         let quote = b[q];
         if spec.triple_quotes.contains(&quote) && self.at(q + 1) == quote && self.at(q + 2) == quote && q + 2 < end {
-            let pat = [quote; 3];
-            return match find(b, q + 3, end, &pat) {
-                Some(p) => {
-                    self.tok(tok_start, p + 3, Kind::Str);
-                    Ok(p + 3)
-                }
-                None => {
-                    self.tok(tok_start, end, Kind::Str);
-                    Err(State::Triple(quote))
-                }
-            };
+            return self.span_to(tok_start, q + 3, end, &[quote; 3], Kind::Str).ok_or(State::Triple(quote));
         }
         let raw = spec.shell && quote == b'\'';
         let mut j = q + 1;
@@ -445,6 +467,22 @@ impl Lexer<'_> {
         }
     }
 
+    /// A token `kind` from `start` to the end of `close` (looked for from
+    /// `from`), or to the end of the line. Returns the position after
+    /// `close`, or None when the construct goes on to the next line.
+    fn span_to(&mut self, start: usize, from: usize, end: usize, close: &[u8], kind: Kind) -> Option<usize> {
+        match find(self.b, from, end, close) {
+            Some(p) => {
+                self.tok(start, p + close.len(), kind);
+                Some(p + close.len())
+            }
+            None => {
+                self.tok(start, end, kind);
+                None
+            }
+        }
+    }
+
     /// Continue a construct that started on a previous line.
     /// Returns the position where normal lexing resumes or the state that
     /// still holds at the end of the line.
@@ -459,16 +497,7 @@ impl Lexer<'_> {
             State::Str(b'@') => self.cs_verbatim(i, i, end),
             State::Comment => {
                 let close = spec.block_comment.map_or("*/", |c| c.1);
-                match find(b, i, end, close.as_bytes()) {
-                    Some(p) => {
-                        self.tok(i, p + close.len(), Kind::Comment);
-                        Ok(p + close.len())
-                    }
-                    None => {
-                        self.tok(i, end, Kind::Comment);
-                        Err(State::Comment)
-                    }
-                }
+                self.span_to(i, i, end, close.as_bytes(), Kind::Comment).ok_or(State::Comment)
             }
             State::Str(q) => {
                 let raw = spec.shell && q == b'\'';
@@ -493,16 +522,7 @@ impl Lexer<'_> {
                 }
                 Err(state)
             }
-            State::Triple(q) => match find(b, i, end, &[q; 3]) {
-                Some(p) => {
-                    self.tok(i, p + 3, Kind::Str);
-                    Ok(p + 3)
-                }
-                None => {
-                    self.tok(i, end, Kind::Str);
-                    Err(state)
-                }
-            },
+            State::Triple(q) => self.span_to(i, i, end, &[q; 3], Kind::Str).ok_or(state),
             State::RawStr(n) => match self.raw_close(i, end, n as usize) {
                 Some(p) => {
                     self.tok(i, p, Kind::Str);
@@ -603,17 +623,10 @@ impl Lexer<'_> {
         }
         if let Some((open, close)) = spec.block_comment
             && self.starts(i, end, open) {
-                match find(b, i + open.len(), end, close.as_bytes()) {
-                    Some(p) => {
-                        self.tok(i, p + close.len(), Kind::Comment);
-                        i = p + close.len();
-                        return Step::Next(i);
-                    }
-                    None => {
-                        self.tok(i, end, Kind::Comment);
-                        return Step::Stop(State::Comment, end);
-                    }
-                }
+                return match self.span_to(i, i + open.len(), end, close.as_bytes(), Kind::Comment) {
+                    Some(p) => Step::Next(p),
+                    None => Step::Stop(State::Comment, end),
+                };
             }
         if php && c == b'#' && self.at(i + 1) == b'[' {
             let e = find(b, i, end, b"]").map_or(end, |p| p + 1);
@@ -796,18 +809,18 @@ impl Lexer<'_> {
     fn word(&mut self, spec: &Spec, i: usize, e: usize, end: usize) {
         let b = self.b;
         let w = &b[i..e];
-        let s = std::str::from_utf8(w).unwrap_or("");
-        let mut kind = self.words.get(s).copied();
-        if kind.is_none() && spec.case_insensitive_kw && w.iter().any(|c| c.is_ascii_uppercase()) {
-            kind = self
-                .words
-                .get(s.to_ascii_lowercase().as_str())
-                .copied()
-                .filter(|k| *k == Kind::Keyword || spec.case_insensitive_words);
+        let mut kind = if w.len() <= MAX_WORD { self.words.get(w).copied() } else { None };
+        if kind.is_none() && spec.case_insensitive_kw && w.len() <= MAX_WORD && w.iter().any(|c| c.is_ascii_uppercase()) {
+            // SQL, PHP: `SELECT` is `select`, lowered on the stack.
+            let mut lower = [0u8; MAX_WORD];
+            let lower = &mut lower[..w.len()];
+            lower.copy_from_slice(w);
+            lower.make_ascii_lowercase();
+            kind = self.words.get(&*lower).copied().filter(|k| *k == Kind::Keyword || spec.case_insensitive_words);
         }
         let def = std::mem::replace(&mut self.def_next, false);
         if let Some(k) = kind {
-            self.def_next = matches!(s, "fn" | "def" | "function" | "func" | "sub");
+            self.def_next = matches!(w, b"fn" | b"def" | b"function" | b"func" | b"sub");
             self.tok(i, e, k);
             return;
         }
@@ -903,7 +916,7 @@ impl Lexer<'_> {
         if c == b'%'
             && let Some((k, p)) = self.prev_significant(i, start)
             && (b")]}".contains(&p)
-                || (is_ident(p) && !std::str::from_utf8(self.word_before(k)).is_ok_and(|w| self.words.contains_key(w))))
+                || (is_ident(p) && !self.words.contains_key(self.word_before(k))))
         {
             return None;
         }
@@ -1175,15 +1188,9 @@ impl Lexer<'_> {
         // Vue single file components: `{{ … }}` and directives.
         let vue = self.lang == Lang::Vue;
         match state {
-            State::Comment => match find(b, i, end, b"-->") {
-                Some(p) => {
-                    self.tok(i, p + 3, Kind::Comment);
-                    i = p + 3;
-                }
-                None => {
-                    self.tok(i, end, Kind::Comment);
-                    return State::Comment;
-                }
+            State::Comment => match self.span_to(i, i, end, b"-->", Kind::Comment) {
+                Some(p) => i = p,
+                None => return State::Comment,
             },
             State::HtmlTag => match self.tag_inner(i, end) {
                 Some(p) => i = p,
@@ -1201,15 +1208,9 @@ impl Lexer<'_> {
         }
         while i < end {
             match b[i] {
-                b'<' if self.starts(i, end, "<!--") => match find(b, i + 4, end, b"-->") {
-                    Some(p) => {
-                        self.tok(i, p + 3, Kind::Comment);
-                        i = p + 3;
-                    }
-                    None => {
-                        self.tok(i, end, Kind::Comment);
-                        return State::Comment;
-                    }
+                b'<' if self.starts(i, end, "<!--") => match self.span_to(i, i + 4, end, b"-->", Kind::Comment) {
+                    Some(p) => i = p,
+                    None => return State::Comment,
                 },
                 b'<' if self.at(i + 1) == b'!' || self.at(i + 1) == b'?' => {
                     let e = find(b, i, end, b">").map_or(end, |p| p + 1);
@@ -1232,10 +1233,7 @@ impl Lexer<'_> {
                             i = p;
                             let self_closed = b[p - 2] == b'/';
                             if script && !self_closed {
-                                let attrs = &b[ne..p];
-                                let ts = [&b"lang=\"ts\""[..], b"lang='ts'", b"lang=\"tsx\"", b"lang='tsx'"]
-                                    .iter()
-                                    .any(|pat| attrs.windows(pat.len()).any(|w| w == *pat));
+                                let ts = crate::lang::script_is_ts(&b[ne..p]);
                                 match self.embedded_js(if ts { 3 } else { 0 }, i, end) {
                                     Ok(p) => i = p,
                                     Err(st) => return st,
@@ -1280,14 +1278,19 @@ impl Lexer<'_> {
         State::Normal
     }
 
+    /// Runs `f` lexing `lang` (embedded in the language of the document).
+    fn with_lang<R>(&mut self, lang: Lang, f: impl FnOnce(&mut Self) -> R) -> R {
+        let saved = (self.lang, self.words);
+        self.lang = lang;
+        self.words = word_table(lang);
+        let r = f(self);
+        (self.lang, self.words) = saved;
+        r
+    }
+
     /// A JavaScript expression inside a Vue template.
     fn embedded_expr(&mut self, start: usize, stop: usize) {
-        let (saved_lang, saved_words) = (self.lang, self.words);
-        self.lang = Lang::JavaScript;
-        self.words = word_table(Lang::JavaScript);
-        self.code(Lang::JavaScript.spec(), State::Normal, start, stop);
-        self.lang = saved_lang;
-        self.words = saved_words;
+        self.with_lang(Lang::JavaScript, |lx| lx.code(Lang::JavaScript.spec(), State::Normal, start, stop));
     }
 
     /// Attributes of a tag; returns the position after '>' if the tag
@@ -1368,12 +1371,7 @@ impl Lexer<'_> {
             2 => State::Str(b'`'),
             _ => State::Normal,
         };
-        let (saved_lang, saved_words) = (self.lang, self.words);
-        self.lang = lang;
-        self.words = word_table(lang);
-        let (st, _) = self.code(lang.spec(), st, i, stop);
-        self.lang = saved_lang;
-        self.words = saved_words;
+        let (st, _) = self.with_lang(lang, |lx| lx.code(lang.spec(), st, i, stop));
         if stop < end {
             return Ok(stop);
         }
@@ -1399,29 +1397,17 @@ impl Lexer<'_> {
         let mut depth = st & 0x7F;
         let mut i = start;
         if st & 0x80 != 0 {
-            match find(b, i, end, b"*/") {
-                Some(p) => {
-                    self.tok(i, p + 2, Kind::Comment);
-                    i = p + 2;
-                }
-                None => {
-                    self.tok(i, end, Kind::Comment);
-                    return st;
-                }
+            match self.span_to(i, i, end, b"*/", Kind::Comment) {
+                Some(p) => i = p,
+                None => return st,
             }
         }
         while i < end {
             let c = b[i];
             match c {
-                b'/' if self.at(i + 1) == b'*' => match find(b, i + 2, end, b"*/") {
-                    Some(p) => {
-                        self.tok(i, p + 2, Kind::Comment);
-                        i = p + 2;
-                    }
-                    None => {
-                        self.tok(i, end, Kind::Comment);
-                        return depth | 0x80;
-                    }
+                b'/' if self.at(i + 1) == b'*' => match self.span_to(i, i + 2, end, b"*/", Kind::Comment) {
+                    Some(p) => i = p,
+                    None => return depth | 0x80,
                 },
                 b'/' if self.at(i + 1) == b'/' => {
                     // SCSS / LESS line comment
@@ -1622,10 +1608,7 @@ impl Lexer<'_> {
                     let wl = w.strip_suffix(b":").unwrap_or(w);
                     let kind = if w.ends_with(b":") {
                         Some(Kind::Attr)
-                    } else if matches!(
-                        wl.to_ascii_lowercase().as_slice(),
-                        b"true" | b"false" | b"yes" | b"no" | b"on" | b"off" | b"null" | b"~"
-                    ) {
+                    } else if [&b"true"[..], b"false", b"yes", b"no", b"on", b"off", b"null", b"~"].iter().any(|c| wl.eq_ignore_ascii_case(c)) {
                         Some(Kind::Constant)
                     } else if !wl.is_empty() && (wl[0].is_ascii_digit() || (wl[0] == b'-' && wl.len() > 1 && wl[1].is_ascii_digit()) || wl[0] == b'.')
                         && wl.iter().all(|c| c.is_ascii_hexdigit() || b".-+_xXoO".contains(c))
@@ -1698,9 +1681,10 @@ impl Lexer<'_> {
                 self.tok(0, end, Kind::Str);
                 return state;
             }
-            let mut inner_toks = Vec::new();
-            let st = lex_line(lang, unpack(inner), line, &mut inner_toks);
-            self.out.extend(inner_toks);
+            // Nothing was added for this line yet: the inner lexer fills
+            // the output directly.
+            debug_assert!(self.out.is_empty());
+            let st = lex_line(lang, unpack(inner), line, self.out);
             return State::MdFence(li, fc, pack(st));
         }
 
@@ -1713,7 +1697,7 @@ impl Lexer<'_> {
                 self.tok(indent + n, end, Kind::Type);
             }
             let lang = Lang::from_fence(info);
-            let li = crate::lang::ALL.iter().position(|&l| l == lang).unwrap_or(0) as u8;
+            let li = lang as u8;
             return State::MdFence(li, fc, pack(initial_state(lang)));
         }
 
@@ -1726,8 +1710,8 @@ impl Lexer<'_> {
             }
             // Setext underline / thematic break.
             let first = t[0];
-            let body: Vec<u8> = t.iter().copied().filter(|c| !c.is_ascii_whitespace()).collect();
-            if body.len() >= 3 && body.iter().all(|&c| c == first) {
+            let mut body = t.iter().filter(|c| !c.is_ascii_whitespace());
+            if body.clone().all(|&c| c == first) && body.nth(2).is_some() {
                 match first {
                     b'=' => {
                         self.tok(0, end, Kind::Heading);

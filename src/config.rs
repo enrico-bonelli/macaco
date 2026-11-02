@@ -23,6 +23,23 @@ pub fn base_dir() -> PathBuf {
     home.join(".macaco")
 }
 
+/// `p` with the home folder written `~` (for menus and titles).
+pub fn tilde(p: &Path) -> String {
+    match std::env::var_os("HOME").map(PathBuf::from).filter(|h| !h.as_os_str().is_empty()).and_then(|h| p.strip_prefix(h).ok().map(Path::to_path_buf)) {
+        Some(rest) if rest.as_os_str().is_empty() => "~".to_string(),
+        Some(rest) => format!("~/{}", rest.display()),
+        None => p.display().to_string(),
+    }
+}
+
+/// `~/x` → absolute path.
+pub fn expand_home(p: &str) -> PathBuf {
+    match p.strip_prefix("~/") {
+        Some(rest) => PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(rest),
+        None => PathBuf::from(p),
+    }
+}
+
 pub fn config_dir() -> PathBuf {
     base_dir().join("config")
 }
@@ -36,7 +53,10 @@ pub fn write_atomic(path: &Path, data: &[u8]) -> io::Result<()> {
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir)?;
     }
-    let tmp = path.with_extension("tmp~");
+    // `name.tmp~`, not `with_extension`: `x.txt` and `x.meta` would share
+    // the temporary file.
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".tmp~");
     fs::write(&tmp, data)?;
     fs::rename(&tmp, path)
 }
@@ -73,6 +93,10 @@ pub struct Settings {
     pub height: i32,
     /// GSK renderer: "cairo" (lightest, default), "gl", "vulkan" or "auto".
     pub renderer: String,
+    /// The agent last chosen in the assistant panel and the width of the
+    /// panel.
+    pub agent: String,
+    pub agent_width: i32,
 }
 
 impl Default for Settings {
@@ -95,6 +119,8 @@ impl Default for Settings {
             width: 1000,
             height: 700,
             renderer: "cairo".into(),
+            agent: "claude".into(),
+            agent_width: 420,
         }
     }
 }
@@ -134,6 +160,8 @@ impl Settings {
                 "width" => s.width = v.parse().unwrap_or(s.width).max(300),
                 "height" => s.height = v.parse().unwrap_or(s.height).max(200),
                 "renderer" if !v.is_empty() => s.renderer = v.to_string(),
+                "agent" if !v.is_empty() => s.agent = v.to_string(),
+                "agent_width" => s.agent_width = v.parse().unwrap_or(s.agent_width).max(240),
                 _ => {}
             }
         }
@@ -142,7 +170,7 @@ impl Settings {
 
     pub fn save(&self) {
         let text = format!(
-            "# macaco settings\nfont_family={}\nfont_size={}\ntab_width={}\ninsert_spaces={}\nwrap={}\nline_numbers={}\nhighlight_line={}\ndark={}\nbell={}\ncursor_blink={}\nautocomplete={}\ngit_keyring={}\nsidebar={}\nsidebar_width={}\nwidth={}\nheight={}\n# renderer: cairo (lightest) | gl | vulkan | auto\nrenderer={}\n",
+            "# macaco settings\nfont_family={}\nfont_size={}\ntab_width={}\ninsert_spaces={}\nwrap={}\nline_numbers={}\nhighlight_line={}\ndark={}\nbell={}\ncursor_blink={}\nautocomplete={}\ngit_keyring={}\nsidebar={}\nsidebar_width={}\nwidth={}\nheight={}\n# renderer: cairo (lightest) | gl | vulkan | auto\nrenderer={}\n# assistant: agent last used (claude, codex) and panel width\nagent={}\nagent_width={}\n",
             self.font_family,
             self.font_size,
             self.tab_width,
@@ -159,7 +187,9 @@ impl Settings {
             self.sidebar_width,
             self.width,
             self.height,
-            self.renderer
+            self.renderer,
+            self.agent,
+            self.agent_width
         );
         if let Err(e) = write_atomic(&Self::path(), text.as_bytes()) {
             eprintln!("macaco: impossibile salvare le impostazioni: {e}");
@@ -167,38 +197,38 @@ impl Settings {
     }
 }
 
-// ---------------------------------------------------------------- bookmarks
+// ------------------------------------------------------------- path lists
 
-pub fn load_bookmarks() -> Vec<PathBuf> {
-    fs::read_to_string(base_dir().join("bookmarks"))
-        .map(|t| t.lines().filter(|l| !l.is_empty()).map(PathBuf::from).collect())
-        .unwrap_or_default()
+/// A list of paths, one per line, in `~/.macaco/<name>`.
+fn read_path_list(name: &str) -> Vec<PathBuf> {
+    fs::read_to_string(base_dir().join(name)).map(|t| t.lines().filter(|l| !l.is_empty()).map(PathBuf::from).collect()).unwrap_or_default()
 }
 
-pub fn save_bookmarks(list: &[PathBuf]) {
-    let text: String = list.iter().map(|p| format!("{}\n", p.to_string_lossy())).collect();
-    let _ = write_atomic(&base_dir().join("bookmarks"), text.as_bytes());
-}
-
-// ------------------------------------------------------------- recent files
-
-fn recent_path() -> PathBuf {
-    base_dir().join("recent")
-}
-
-pub fn load_recent() -> Vec<PathBuf> {
-    fs::read_to_string(recent_path())
-        .map(|t| t.lines().filter(|l| !l.is_empty()).map(PathBuf::from).take(MAX_RECENT).collect())
-        .unwrap_or_default()
-}
-
-pub fn save_recent(list: &[PathBuf]) {
+fn write_path_list(name: &str, list: &[PathBuf]) {
     let mut text = String::new();
     for p in list {
         text.push_str(&p.to_string_lossy());
         text.push('\n');
     }
-    let _ = write_atomic(&recent_path(), text.as_bytes());
+    let _ = write_atomic(&base_dir().join(name), text.as_bytes());
+}
+
+pub fn load_bookmarks() -> Vec<PathBuf> {
+    read_path_list("bookmarks")
+}
+
+pub fn save_bookmarks(list: &[PathBuf]) {
+    write_path_list("bookmarks", list);
+}
+
+pub fn load_recent() -> Vec<PathBuf> {
+    let mut list = read_path_list("recent");
+    list.truncate(MAX_RECENT);
+    list
+}
+
+pub fn save_recent(list: &[PathBuf]) {
+    write_path_list("recent", list);
 }
 
 /// Move `path` to the front of the list.
@@ -208,42 +238,22 @@ pub fn push_recent(list: &mut Vec<PathBuf>, path: &Path) {
     list.truncate(MAX_RECENT);
 }
 
-// ---------------------------------------------------------- indexed folders
-
-fn indexed_path() -> PathBuf {
-    base_dir().join("indexed")
-}
-
 /// Folders indexed for the quick file search.
 pub fn load_indexed() -> Vec<PathBuf> {
-    fs::read_to_string(indexed_path())
-        .map(|t| t.lines().filter(|l| !l.is_empty()).map(PathBuf::from).collect())
-        .unwrap_or_default()
+    read_path_list("indexed")
 }
 
 pub fn save_indexed(list: &[PathBuf]) {
-    let mut text = String::new();
-    for p in list {
-        text.push_str(&p.to_string_lossy());
-        text.push('\n');
-    }
-    let _ = write_atomic(&indexed_path(), text.as_bytes());
+    write_path_list("indexed", list);
 }
 
 /// Folders where the language servers are enabled.
 pub fn load_lsp_folders() -> Vec<PathBuf> {
-    fs::read_to_string(base_dir().join("lsp-folders"))
-        .map(|t| t.lines().filter(|l| !l.is_empty()).map(PathBuf::from).collect())
-        .unwrap_or_default()
+    read_path_list("lsp-folders")
 }
 
 pub fn save_lsp_folders(list: &[PathBuf]) {
-    let mut text = String::new();
-    for p in list {
-        text.push_str(&p.to_string_lossy());
-        text.push('\n');
-    }
-    let _ = write_atomic(&base_dir().join("lsp-folders"), text.as_bytes());
+    write_path_list("lsp-folders", list);
 }
 
 // ------------------------------------------------------------ git excluded
@@ -335,18 +345,29 @@ impl Session {
         s
     }
 
-    pub fn save(&self) {
+    /// Writes the session, unless it is the same as `last` (the text last
+    /// written, updated).
+    pub fn save_if_changed(&self, last: &mut String) {
+        let text = self.to_text();
+        if text != *last {
+            let _ = write_atomic(&session_path(), text.as_bytes());
+            *last = text;
+        }
+    }
+
+    fn to_text(&self) -> String {
+        use std::fmt::Write as _;
         let mut text = format!("split\t{}\nactive\t{}\t{}\n", self.split, self.active[0], self.active[1]);
         if let Some(w) = &self.workdir {
-            text.push_str(&format!("workdir\t{}\n", w.to_string_lossy()));
+            let _ = writeln!(text, "workdir\t{}", w.to_string_lossy());
         }
         for (pane, t) in &self.tabs {
-            match t {
-                TabRef::File(p) => text.push_str(&format!("{pane}\tfile\t{}\n", p.to_string_lossy())),
-                TabRef::Cache(id) => text.push_str(&format!("{pane}\tcache\t{id}\n")),
-            }
+            let _ = match t {
+                TabRef::File(p) => writeln!(text, "{pane}\tfile\t{}", p.to_string_lossy()),
+                TabRef::Cache(id) => writeln!(text, "{pane}\tcache\t{id}"),
+            };
         }
-        let _ = write_atomic(&session_path(), text.as_bytes());
+        text
     }
 }
 
@@ -403,6 +424,16 @@ pub fn read_cache_text(id: &str) -> io::Result<String> {
     fs::read_to_string(cache_files(id).0)
 }
 
+/// The first `n` bytes of the cached text of `id` (for its title).
+pub fn read_cache_head(id: &str, n: u64) -> String {
+    use std::io::Read;
+    let mut buf = Vec::new();
+    if let Ok(f) = fs::File::open(cache_files(id).0) {
+        let _ = f.take(n).read_to_end(&mut buf);
+    }
+    String::from_utf8_lossy(&buf).into_owned()
+}
+
 pub fn delete_cache(id: &str) {
     let (txt, mf) = cache_files(id);
     let _ = fs::remove_file(txt);
@@ -416,6 +447,11 @@ pub fn cached_ids() -> Vec<String> {
         .flatten()
         .filter_map(|e| {
             let name = e.file_name().into_string().ok()?;
+            // Left by a write interrupted by a crash.
+            if name.ends_with(".tmp~") {
+                let _ = fs::remove_file(e.path());
+                return None;
+            }
             let id = name.strip_suffix(".meta")?.to_string();
             let t = e.metadata().and_then(|m| m.modified()).unwrap_or(std::time::UNIX_EPOCH);
             Some((t, id))
@@ -431,4 +467,21 @@ pub fn new_id() -> String {
     static COUNTER: AtomicU32 = AtomicU32::new(0);
     let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
     format!("{:x}-{:x}-{}", t.as_secs(), std::process::id(), COUNTER.fetch_add(1, Ordering::Relaxed))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn home_as_tilde() {
+        let Some(home) = std::env::var_os("HOME").map(PathBuf::from).filter(|h| h.as_os_str().len() > 1) else { return };
+        assert_eq!(tilde(&home.join("a/b")), "~/a/b");
+        assert_eq!(tilde(&home), "~");
+        // Only whole folder names: /home/user2 is not inside /home/user.
+        let mut other = home.clone().into_os_string();
+        other.push("2");
+        assert_eq!(tilde(Path::new(&other)), Path::new(&other).display().to_string());
+        assert_eq!(expand_home("~/x"), home.join("x"));
+    }
 }

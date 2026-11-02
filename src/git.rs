@@ -1,11 +1,13 @@
 //! Git support: runs the `git` command asynchronously and parses
 //! `git status`.
 
-use gtk::{gio, glib};
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
+
+use crate::proc;
+pub use crate::proc::Output;
 
 /// How a file differs from the last commit, as shown in the file panel.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -83,12 +85,20 @@ pub struct Status {
     pub untracked_dirs: HashSet<PathBuf>,
     /// Most relevant mark of the files inside each folder.
     pub dirs: HashMap<PathBuf, Mark>,
+    /// Hash of the output of `git status`: equal digests, same status.
+    pub digest: u64,
 }
 
 impl Status {
     /// Parses `git status --porcelain=v1 -z --branch`.
     pub fn parse(root: &Path, git_dir: &Path, out: &[u8]) -> Status {
-        let mut st = Status { root: root.to_path_buf(), git_dir: git_dir.to_path_buf(), ..Default::default() };
+        let digest = {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            out.hash(&mut h);
+            h.finish()
+        };
+        let mut st = Status { root: root.to_path_buf(), git_dir: git_dir.to_path_buf(), digest, ..Default::default() };
         let mut recs = out.split(|&c| c == 0).filter(|r| !r.is_empty());
         while let Some(rec) = recs.next() {
             if let Some(head) = rec.strip_prefix(b"## ") {
@@ -112,8 +122,7 @@ impl Status {
             }
             let p = root.join(OsStr::from_bytes(rel));
             if let Some(dir) = p.parent() {
-                let dir = dir.to_path_buf();
-                st.add_to_dirs(&dir, e.mark());
+                st.add_to_dirs(dir, e.mark());
             }
             st.files.insert(p, e);
         }
@@ -155,9 +164,14 @@ impl Status {
             if !d.starts_with(&self.root) || d == self.root {
                 break;
             }
-            let m = self.dirs.entry(d.to_path_buf()).or_insert(mark);
-            if *m < mark {
-                *m = mark;
+            match self.dirs.get_mut(d) {
+                // The mark of a folder is the highest of its content, so its
+                // parents already have at least this one.
+                Some(m) if *m >= mark => break,
+                Some(m) => *m = mark,
+                None => {
+                    self.dirs.insert(d.to_path_buf(), mark);
+                }
             }
         }
     }
@@ -248,52 +262,63 @@ impl Excluded {
 /// spaces are alternatives; a word with `*` or `?` is a pattern for the
 /// file name (or the whole path if it contains `/`), otherwise any part of
 /// the path matches. Case is ignored.
-pub fn filter_matches(rel: &str, filter: &str) -> bool {
-    let rel = rel.to_lowercase();
-    let name = rel.rsplit('/').next().unwrap_or(&rel);
-    let mut words = filter.split_whitespace().peekable();
-    if words.peek().is_none() {
-        return true;
+pub struct Filter {
+    /// Lower case words: (word, has wildcards).
+    words: Vec<(String, bool)>,
+}
+
+impl Filter {
+    pub fn new(text: &str) -> Filter {
+        Filter { words: text.split_whitespace().map(|w| (w.to_lowercase(), w.contains(['*', '?']))).collect() }
     }
-    words.any(|w| {
-        let w = w.to_lowercase();
-        if w.contains(['*', '?']) {
-            glob(w.as_bytes(), if w.contains('/') { rel.as_bytes() } else { name.as_bytes() })
-        } else {
-            rel.contains(&w)
+
+    pub fn is_empty(&self) -> bool {
+        self.words.is_empty()
+    }
+
+    pub fn matches(&self, rel: &str) -> bool {
+        if self.words.is_empty() {
+            return true;
         }
-    })
+        let rel = rel.to_lowercase();
+        let name = rel.rsplit('/').next().unwrap_or(&rel);
+        self.words.iter().any(|(w, wild)| {
+            if *wild {
+                glob(w.as_bytes(), if w.contains('/') { rel.as_bytes() } else { name.as_bytes() })
+            } else {
+                rel.contains(w.as_str())
+            }
+        })
+    }
 }
 
+/// Without backtracking over every `*` (exponential with patterns such as
+/// `*a*a*a*b`): on a mismatch only the last `*` takes one more byte.
 fn glob(p: &[u8], s: &[u8]) -> bool {
-    match (p.first(), s.first()) {
-        (None, None) => true,
-        (Some(b'*'), _) => glob(&p[1..], s) || (!s.is_empty() && glob(p, &s[1..])),
-        (Some(b'?'), Some(_)) => glob(&p[1..], &s[1..]),
-        (Some(a), Some(b)) if a == b => glob(&p[1..], &s[1..]),
-        _ => false,
+    let (mut pi, mut si) = (0, 0);
+    // Position after the last `*` and the byte it would take next.
+    let mut star: Option<(usize, usize)> = None;
+    while si < s.len() {
+        match p.get(pi) {
+            Some(b'*') => {
+                pi += 1;
+                star = Some((pi, si));
+            }
+            Some(&c) if c == b'?' || c == s[si] => {
+                pi += 1;
+                si += 1;
+            }
+            _ => match star {
+                Some((sp, ss)) => {
+                    pi = sp;
+                    si = ss + 1;
+                    star = Some((sp, ss + 1));
+                }
+                None => return false,
+            },
+        }
     }
-}
-
-/// Output of a finished command.
-pub struct Output {
-    pub ok: bool,
-    pub stdout: Vec<u8>,
-    pub stderr: String,
-}
-
-impl Output {
-    /// Text to show to the user (errors first).
-    pub fn text(&self) -> String {
-        let out = String::from_utf8_lossy(&self.stdout);
-        let all = format!("{}\n{}", self.stderr.trim(), out.trim());
-        all.trim().to_string()
-    }
-
-    /// Last meaningful line, for the status bar.
-    pub fn summary(&self) -> String {
-        self.text().lines().rev().map(str::trim).find(|l| !l.is_empty() && !l.starts_with("hint:")).unwrap_or("").to_string()
-    }
+    p[pi..].iter().all(|&c| c == b'*')
 }
 
 /// Runs `git args` in `dir` and calls `done` on the main loop.
@@ -301,60 +326,53 @@ impl Output {
 /// Git must never wait for input: password prompts are disabled and the
 /// command runs without a controlling terminal (SSH then uses the agent
 /// or `SSH_ASKPASS`).
-pub fn run(dir: &Path, args: &[&OsStr], done: impl FnOnce(Output) + 'static) {
+fn run(dir: &Path, args: &[&OsStr], done: impl FnOnce(Output) + 'static) {
     run_with(dir, args, &[], None, done);
 }
 
+/// Environment of every git command: git never asks on the terminal and
+/// `git status` does not rewrite the index (that would wake the .git
+/// folder monitor again).
+pub const QUIET_ENV: [(&str, &str); 2] = [("GIT_TERMINAL_PROMPT", "0"), ("GIT_OPTIONAL_LOCKS", "0")];
+
 /// Like `run` with extra environment variables (the askpass helper of
 /// network commands) and an optional standard input.
-pub fn run_with(dir: &Path, args: &[&OsStr], env: &[(String, String)], input: Option<String>, done: impl FnOnce(Output) + 'static) {
-    let mut flags = gio::SubprocessFlags::STDOUT_PIPE | gio::SubprocessFlags::STDERR_PIPE;
-    if input.is_some() {
-        flags |= gio::SubprocessFlags::STDIN_PIPE;
-    }
-    let launcher = gio::SubprocessLauncher::new(flags);
-    launcher.set_cwd(dir);
-    for (k, v) in env {
-        launcher.setenv(k, v, true);
-    }
-    launcher.setenv("GIT_TERMINAL_PROMPT", "0", true);
+pub fn run_with(dir: &Path, args: &[&OsStr], env: &[(String, String)], input: Option<Vec<u8>>, done: impl FnOnce(Output) + 'static) {
+    let mut all: Vec<(&str, &str)> = env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    all.extend(QUIET_ENV);
     // Merges (also by `git pull`) never open an editor for the message.
-    launcher.setenv("GIT_MERGE_AUTOEDIT", "no", true);
-    // `git status` must not rewrite the index: that would wake the
-    // .git folder monitor again.
-    launcher.setenv("GIT_OPTIONAL_LOCKS", "0", true);
-    launcher.set_child_setup(|| {
-        // SAFETY: setsid is async-signal-safe.
-        unsafe { libc::setsid() };
-    });
+    all.push(("GIT_MERGE_AUTOEDIT", "no"));
     let mut argv: Vec<&OsStr> = vec![OsStr::new("git")];
     argv.extend_from_slice(args);
-    let proc = match launcher.spawn(&argv) {
-        Ok(p) => p,
-        Err(e) => {
-            done(Output { ok: false, stdout: Vec::new(), stderr: format!("impossibile eseguire git: {e}") });
-            return;
-        }
-    };
-    glib::MainContext::default().spawn_local(async move {
-        let stdin = input.map(|s| glib::Bytes::from_owned(s.into_bytes()));
-        let res = proc.communicate_future(stdin.as_ref()).await;
-        let out = match res {
-            Ok((stdout, stderr)) => Output {
-                ok: proc.is_successful(),
-                stdout: stdout.map(|b| b.to_vec()).unwrap_or_default(),
-                stderr: stderr.map(|b| String::from_utf8_lossy(&b).into_owned()).unwrap_or_default(),
-            },
-            Err(e) => Output { ok: false, stdout: Vec::new(), stderr: e.to_string() },
-        };
-        done(out);
-    });
+    let opts = proc::Options { cwd: Some(dir), env: &all, input, timeout: None, detach: true };
+    proc::run(&argv, opts, done);
 }
 
 /// Like `run` with string arguments.
 pub fn run_str(dir: &Path, args: &[&str], done: impl FnOnce(Output) + 'static) {
     let args: Vec<&OsStr> = args.iter().map(OsStr::new).collect();
     run(dir, &args, done);
+}
+
+/// Runs several git commands at the same time; `done` gets their outputs,
+/// in the same order, when all have finished.
+pub fn run_many(dir: &Path, cmds: &[&[&str]], done: impl FnOnce(Vec<Output>) + 'static) {
+    type Pending = (Vec<Option<Output>>, Option<Box<dyn FnOnce(Vec<Output>)>>);
+    let state: std::rc::Rc<std::cell::RefCell<Pending>> =
+        std::rc::Rc::new(std::cell::RefCell::new(((0..cmds.len()).map(|_| None).collect(), Some(Box::new(done)))));
+    for (i, args) in cmds.iter().enumerate() {
+        let state = state.clone();
+        run_str(dir, args, move |out| {
+            let finished = {
+                let mut s = state.borrow_mut();
+                s.0[i] = Some(out);
+                if s.0.iter().all(Option::is_some) { s.1.take().map(|f| (f, s.0.drain(..).flatten().collect::<Vec<_>>())) } else { None }
+            };
+            if let Some((f, outs)) = finished {
+                f(outs);
+            }
+        });
+    }
 }
 
 /// Finds the repository containing `dir` and reads its status.
@@ -365,8 +383,37 @@ pub fn status(dir: &Path, done: impl FnOnce(Option<Status>) + 'static) {
 /// Like `status`, limited to the files under `only` and listing every
 /// untracked file (instead of their folders).
 pub fn status_of(dir: &Path, only: Option<&Path>, done: impl FnOnce(Option<Status>) + 'static) {
+    thread_local! {
+        /// Folder → (working tree, .git folder): `rev-parse` runs once per
+        /// folder, not at every refresh.
+        static REPOS: std::cell::RefCell<HashMap<PathBuf, (PathBuf, PathBuf)>> = Default::default();
+    }
     let only = only.map(Path::to_path_buf);
-    run_str(dir, &["rev-parse", "--show-toplevel", "--absolute-git-dir"], move |out| {
+    let read_status = move |dir: PathBuf, root: PathBuf, git_dir: PathBuf, done: Box<dyn FnOnce(Option<Status>)>| {
+        let mut args: Vec<&OsStr> = ["status", "--porcelain=v1", "-z", "--branch"].map(OsStr::new).to_vec();
+        if let Some(p) = &only {
+            args.extend([OsStr::new("--untracked-files=all"), OsStr::new("--"), p.as_os_str()]);
+        }
+        run(&root.clone(), &args, move |out| {
+            if !out.ok {
+                // No more a repository? Asked again next time.
+                REPOS.with(|r| r.borrow_mut().remove(&dir));
+                done(None);
+                return;
+            }
+            // Parsed in a thread: 20,000 files take a while.
+            gtk::glib::spawn_future_local(async move {
+                let st = gtk::gio::spawn_blocking(move || Status::parse(&root, &git_dir, &out.stdout)).await.ok();
+                done(st);
+            });
+        });
+    };
+    let dir = dir.to_path_buf();
+    if let Some((root, git_dir)) = REPOS.with(|r| r.borrow().get(&dir).cloned()) {
+        read_status(dir, root, git_dir, Box::new(done));
+        return;
+    }
+    run_str(&dir.clone(), &["rev-parse", "--show-toplevel", "--absolute-git-dir"], move |out| {
         let text = String::from_utf8_lossy(&out.stdout).into_owned();
         let mut lines = text.lines();
         let (Some(root), Some(git_dir), true) = (lines.next(), lines.next(), out.ok) else {
@@ -374,13 +421,8 @@ pub fn status_of(dir: &Path, only: Option<&Path>, done: impl FnOnce(Option<Statu
             return;
         };
         let (root, git_dir) = (PathBuf::from(root), PathBuf::from(git_dir));
-        let mut args: Vec<&OsStr> = ["status", "--porcelain=v1", "-z", "--branch"].map(OsStr::new).to_vec();
-        if let Some(p) = &only {
-            args.extend([OsStr::new("--untracked-files=all"), OsStr::new("--"), p.as_os_str()]);
-        }
-        run(&root.clone(), &args, move |out| {
-            done(out.ok.then(|| Status::parse(&root, &git_dir, &out.stdout)));
-        });
+        REPOS.with(|r| r.borrow_mut().insert(dir.clone(), (root.clone(), git_dir.clone())));
+        read_status(dir, root, git_dir, Box::new(done));
     });
 }
 
@@ -389,8 +431,8 @@ pub fn status_of(dir: &Path, only: Option<&Path>, done: impl FnOnce(Option<Statu
 /// How a remote is reached, from its URL.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RemoteKind {
-    /// `https://host/…`: user name and password (or token).
-    Https { host: String },
+    /// `https://host/…` (or `http://`): user name and password (or token).
+    Https { host: String, scheme: &'static str },
     /// `ssh://[user@]host[:port]/…` or `user@host:path`: SSH keys.
     Ssh { user: Option<String>, host: String, port: Option<u16> },
     /// A folder or `file://`: no authentication.
@@ -401,10 +443,11 @@ pub enum RemoteKind {
 
 pub fn remote_kind(url: &str) -> RemoteKind {
     let u = url.trim();
-    if let Some(rest) = u.strip_prefix("https://").or_else(|| u.strip_prefix("http://")) {
+    let http = u.strip_prefix("https://").map(|r| (r, "https")).or_else(|| u.strip_prefix("http://").map(|r| (r, "http")));
+    if let Some((rest, scheme)) = http {
         let authority = rest.split('/').next().unwrap_or("");
         let host = authority.rsplit('@').next().unwrap_or(authority);
-        return RemoteKind::Https { host: host.to_string() };
+        return RemoteKind::Https { host: host.to_string(), scheme };
     }
     let ssh = |authority: &str| {
         let (user, hostport) = match authority.rsplit_once('@') {
@@ -587,8 +630,9 @@ mod tests {
 
     #[test]
     fn remotes() {
-        assert_eq!(remote_kind("https://github.com/enrico/macaco.git"), RemoteKind::Https { host: "github.com".into() });
-        assert_eq!(remote_kind("https://tok@git.example.it/x"), RemoteKind::Https { host: "git.example.it".into() });
+        assert_eq!(remote_kind("https://github.com/enrico/macaco.git"), RemoteKind::Https { host: "github.com".into(), scheme: "https" });
+        assert_eq!(remote_kind("https://tok@git.example.it/x"), RemoteKind::Https { host: "git.example.it".into(), scheme: "https" });
+        assert_eq!(remote_kind("http://git.local/x"), RemoteKind::Https { host: "git.local".into(), scheme: "http" });
         assert_eq!(
             remote_kind("git@github.com:enrico/macaco.git"),
             RemoteKind::Ssh { user: Some("git".into()), host: "github.com".into(), port: None }
@@ -647,14 +691,18 @@ mod tests {
         assert_eq!(ex.rule_for("buildx"), None);
         ex.restore("build/a");
         assert_eq!(ex.rules, vec!["notes.txt".to_string()]);
-        assert!(filter_matches("doc/Guida.PDF", ".pdf"));
-        assert!(filter_matches("doc/guida.pdf", "*.pdf"));
-        assert!(!filter_matches("doc/guida.pdf.txt", "*.pdf"));
-        assert!(filter_matches("a/x.png", ".pdf .png"));
-        assert!(filter_matches("src/a.rs", "src/"));
-        assert!(filter_matches("src/a.rs", "src/*.rs"));
-        assert!(!filter_matches("lib/a.rs", "src/*.rs"));
-        assert!(filter_matches("x", "  "));
+        assert!(Filter::new(".pdf").matches("doc/Guida.PDF"));
+        assert!(Filter::new("*.pdf").matches("doc/guida.pdf"));
+        assert!(!Filter::new("*.pdf").matches("doc/guida.pdf.txt"));
+        assert!(Filter::new(".pdf .png").matches("a/x.png"));
+        assert!(Filter::new("src/").matches("src/a.rs"));
+        assert!(Filter::new("src/*.rs").matches("src/a.rs"));
+        assert!(!Filter::new("src/*.rs").matches("lib/a.rs"));
+        assert!(Filter::new("  ").matches("x"));
+        assert!(Filter::new("*a*a*a*a*a*a*a*a*b").matches("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaab"));
+        assert!(!Filter::new("*a*a*a*a*a*a*a*a*b").matches("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"));
+        assert!(Filter::new("a?c*").matches("abcdef"));
+        assert!(!Filter::new("a?c").matches("abcd"));
         let st = Status::parse(Path::new("/r"), Path::new("/r/.git"), b"## No commits yet on dev\0");
         assert_eq!(st.branch.as_deref(), Some("dev"));
         assert!(st.upstream.is_none());

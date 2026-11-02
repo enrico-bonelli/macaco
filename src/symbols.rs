@@ -8,6 +8,8 @@
 use crate::lang::Lang;
 use crate::lexer::{self, Kind};
 use regex::Regex;
+use std::borrow::Cow;
+use std::collections::HashMap;
 use std::sync::OnceLock;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -157,7 +159,10 @@ fn col_of(line: &str, byte: usize) -> u32 {
 }
 
 /// `line` with comments and strings replaced by spaces.
-fn mask(line: &str, toks: &[lexer::Token]) -> String {
+fn mask<'a>(line: &'a str, toks: &[lexer::Token]) -> Cow<'a, str> {
+    if !toks.iter().any(|t| matches!(t.kind, Kind::Comment | Kind::Str)) {
+        return Cow::Borrowed(line);
+    }
     let mut out: Vec<u8> = line.as_bytes().to_vec();
     for t in toks.iter().filter(|t| matches!(t.kind, Kind::Comment | Kind::Str)) {
         for b in &mut out[t.start as usize..(t.end as usize).min(line.len())] {
@@ -166,7 +171,7 @@ fn mask(line: &str, toks: &[lexer::Token]) -> String {
     }
     // Spaces replace whole tokens, so the result is still valid UTF-8 except
     // when a token boundary splits a character: fall back to a lossy copy.
-    String::from_utf8(out).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned())
+    Cow::Owned(String::from_utf8(out).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned()))
 }
 
 /// Definitions in the `<script>` blocks of an HTML or Vue file.
@@ -181,7 +186,7 @@ fn extract_scripts(text: &str) -> Vec<Symbol> {
             continue;
         };
         let tag = &lower[open..lower[open..].find('>').map_or(lower.len(), |e| open + e)];
-        let ts = ["lang=\"ts\"", "lang='ts'", "lang=\"tsx\"", "lang='tsx'"].iter().any(|p| tag.contains(p));
+        let ts = crate::lang::script_is_ts(tag.as_bytes());
         let first = i + 1;
         let mut last = first;
         while last < lines.len() && !lines[last].to_ascii_lowercase().contains("</script") {
@@ -222,8 +227,11 @@ pub fn extract_file(lang: Lang, path: &std::path::Path, text: &str) -> Vec<Symbo
 
 /// Definitions found in `text`.
 pub fn extract(lang: Lang, text: &str) -> Vec<Symbol> {
-    if matches!(lang, Lang::Vue | Lang::Html) {
-        return extract_scripts(text);
+    match lang {
+        Lang::Vue | Lang::Html => return extract_scripts(text),
+        // No definitions.
+        Lang::Markdown | Lang::Css | Lang::Yaml | Lang::Plain => return Vec::new(),
+        _ => {}
     }
     let keywords = def_keywords(lang);
     let reserved = lang.spec();
@@ -236,21 +244,21 @@ pub fn extract(lang: Lang, text: &str) -> Vec<Symbol> {
     for (n, line) in lines.iter().enumerate() {
         let before = state;
         state = lexer::lex_line(lang, state, line, &mut toks);
-        if matches!(lang, Lang::Html | Lang::Markdown | Lang::Css | Lang::Yaml | Lang::Plain)
-            || (matches!(before, lexer::State::Comment) && toks.is_empty())
-        {
+        if matches!(before, lexer::State::Comment) && toks.is_empty() {
             continue;
         }
         let m = mask(line, &toks);
+        let m = m.as_ref();
         let ln = n as u32;
         let mut push = |name: &str, byte: usize, kind: SymKind| {
-            if !name.is_empty() && !out.iter().any(|s: &Symbol| s.line == ln && s.name == name) {
+            // `out` is sorted by line: only the symbols of this line can clash.
+            if !name.is_empty() && !out.iter().rev().take_while(|s: &&Symbol| s.line == ln).any(|s| s.name == name) {
                 out.push(Symbol { name: name.to_string(), kind, line: ln, col: col_of(line, byte) });
             }
         };
 
         if lang == Lang::Sql {
-            for c in sql_def().captures_iter(&m) {
+            for c in sql_def().captures_iter(m) {
                 let g = c.get(2).unwrap();
                 let name = g.as_str().rsplit('.').next().unwrap_or("").trim_matches(|c| c == '"' || c == '`');
                 let kind = match c[1].to_ascii_lowercase().as_str() {
@@ -284,7 +292,7 @@ pub fn extract(lang: Lang, text: &str) -> Vec<Symbol> {
                         None => continue,
                     }
                 }
-                if let Some((start, name)) = ident_at(&m, i)
+                if let Some((start, name)) = ident_at(m, i)
                     && !is_reserved(name)
                 {
                     push(name, start, kind);
@@ -295,18 +303,18 @@ pub fn extract(lang: Lang, text: &str) -> Vec<Symbol> {
         let t = m.trim();
         // const name = (…) => / function
         if matches!(lang, Lang::JavaScript | Lang::TypeScript | Lang::Tsx) {
-            for c in js_arrow().captures_iter(&m) {
+            for c in js_arrow().captures_iter(m) {
                 let g = c.get(1).unwrap();
                 push(g.as_str(), g.start(), SymKind::Function);
             }
             // Module level constants (Vue <script setup> bindings…).
-            if let Some(c) = js_top_const().captures(&m) {
+            if let Some(c) = js_top_const().captures(m) {
                 let g = c.get(1).unwrap();
                 push(g.as_str(), g.start(), SymKind::Constant);
             }
         }
         if lang == Lang::Bash
-            && let Some(c) = shell_func().captures(&m)
+            && let Some(c) = shell_func().captures(m)
         {
             let g = c.get(1).unwrap();
             push(g.as_str(), g.start(), SymKind::Function);
@@ -341,16 +349,28 @@ pub fn extract(lang: Lang, text: &str) -> Vec<Symbol> {
     out
 }
 
-/// Identifiers of `text` (for completion), without duplicates.
-pub fn words(text: &str, min_len: usize) -> Vec<String> {
+/// Identifiers of `text` (for completion) starting with `prefix` (in any
+/// case; `prefix` is lowercase), without duplicates.
+pub fn words<'a>(text: &'a str, min_len: usize, prefix: &str) -> Vec<&'a str> {
     let mut seen = std::collections::HashSet::new();
     let mut out = Vec::new();
     for w in text.split(|c: char| !is_ident_char(c)) {
-        if w.chars().count() >= min_len && !w.starts_with(|c: char| c.is_ascii_digit()) && seen.insert(w) {
-            out.push(w.to_string());
+        if w.len() >= min_len
+            && starts_with_lower(w, prefix)
+            && w.chars().count() >= min_len
+            && !w.starts_with(|c: char| c.is_ascii_digit())
+            && seen.insert(w)
+        {
+            out.push(w);
         }
     }
     out
+}
+
+/// Whether `s` starts with `lower` ignoring case (`lower` is lowercase).
+pub fn starts_with_lower(s: &str, lower: &str) -> bool {
+    let mut s = s.chars().flat_map(char::to_lowercase);
+    lower.chars().all(|c| s.next() == Some(c))
 }
 
 // --------------------------------------------------------------- project
@@ -359,36 +379,109 @@ pub fn words(text: &str, min_len: usize) -> Vec<String> {
 #[derive(Clone, Debug)]
 pub struct Entry {
     pub sym: Symbol,
-    /// Path relative to the folder.
+    /// Index of the file in `ProjectSymbols::files`.
     pub file: u32,
+}
+
+/// Modification time (ns) and size of a file: its symbols are read again
+/// only when this changes.
+pub type Stamp = (u128, u64);
+
+pub fn stamp_of(m: &std::fs::Metadata) -> Stamp {
+    let t = m.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map_or(0, |d| d.as_nanos());
+    (t, m.len())
+}
+
+/// Symbols of a file after a new scan of the folder.
+pub enum FileSymbols {
+    /// Unchanged since the last scan: the file had this index.
+    Same(u32),
+    New(Vec<Symbol>),
+}
+
+/// Symbols and lower case names, sorted by name.
+pub type Sorted = Vec<(String, Entry)>;
+
+/// Sorts the new symbols (done in the background before `apply_scan`).
+pub fn sort_new(per_file: &mut [FileSymbols]) -> Sorted {
+    let mut out: Sorted = Vec::new();
+    for (f, fs) in per_file.iter_mut().enumerate() {
+        if let FileSymbols::New(syms) = fs {
+            out.extend(std::mem::take(syms).into_iter().map(|sym| (sym.name.to_lowercase(), Entry { sym, file: f as u32 })));
+        }
+    }
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
 }
 
 /// Definitions of the files of a folder, sorted by lower case name.
 #[derive(Default)]
 pub struct ProjectSymbols {
     pub files: Vec<String>,
+    stamps: Vec<Stamp>,
     entries: Vec<Entry>,
     keys: Vec<String>,
 }
 
 impl ProjectSymbols {
+    #[cfg(test)]
     pub fn build(files: Vec<String>, per_file: Vec<Vec<Symbol>>) -> ProjectSymbols {
-        let mut entries: Vec<Entry> = per_file
-            .into_iter()
-            .enumerate()
-            .flat_map(|(f, syms)| syms.into_iter().map(move |sym| Entry { sym, file: f as u32 }))
-            .collect();
-        entries.sort_by_cached_key(|e| e.sym.name.to_lowercase());
-        let keys = entries.iter().map(|e| e.sym.name.to_lowercase()).collect();
-        ProjectSymbols { files, entries, keys }
+        let stamps = vec![(0, 0); files.len()];
+        let mut per_file: Vec<FileSymbols> = per_file.into_iter().map(FileSymbols::New).collect();
+        let sorted = sort_new(&mut per_file);
+        let mut p = ProjectSymbols::default();
+        p.apply_scan(files, stamps, &per_file, sorted);
+        p
+    }
+
+    /// Files and stamps of the last scan: file → (stamp, index).
+    pub fn stamps(&self) -> HashMap<String, (Stamp, u32)> {
+        self.files.iter().zip(&self.stamps).enumerate().map(|(i, (f, s))| (f.clone(), (*s, i as u32))).collect()
+    }
+
+    /// Whether a scan found the same files, all unchanged.
+    pub fn unchanged(&self, files: &[String], per_file: &[FileSymbols]) -> bool {
+        files.len() == self.files.len() && per_file.iter().enumerate().all(|(i, f)| matches!(f, FileSymbols::Same(o) if *o as usize == i))
+    }
+
+    /// Takes the result of a new scan: symbols of unchanged files are kept,
+    /// `sorted` (from `sort_new`) replaces the others.
+    pub fn apply_scan(&mut self, files: Vec<String>, stamps: Vec<Stamp>, per_file: &[FileSymbols], sorted: Sorted) {
+        let mut remap = vec![None; self.files.len()];
+        for (new, f) in per_file.iter().enumerate() {
+            if let FileSymbols::Same(old) = f {
+                remap[*old as usize] = Some(new as u32);
+            }
+        }
+        self.merge(|f| remap.get(f as usize).copied().flatten(), sorted);
+        self.files = files;
+        self.stamps = stamps;
+    }
+
+    /// Keeps the entries whose file `keep` maps to a (new) index, and adds
+    /// `new`, both sorted: a linear merge instead of a new sort.
+    fn merge(&mut self, keep: impl Fn(u32) -> Option<u32>, new: Sorted) {
+        let old = std::mem::take(&mut self.entries).into_iter().zip(std::mem::take(&mut self.keys)).filter_map(|(mut e, k)| {
+            e.file = keep(e.file)?;
+            Some((k, e))
+        });
+        let mut old = old.peekable();
+        let mut new = new.into_iter().peekable();
+        loop {
+            let take_old = match (old.peek(), new.peek()) {
+                (Some(a), Some(b)) => a.0 <= b.0,
+                (Some(_), None) => true,
+                (None, Some(_)) => false,
+                (None, None) => break,
+            };
+            let (k, e) = if take_old { old.next() } else { new.next() }.expect("peeked");
+            self.keys.push(k);
+            self.entries.push(e);
+        }
     }
 
     pub fn len(&self) -> usize {
         self.entries.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
     }
 
     /// Definitions named exactly `name`.
@@ -418,19 +511,21 @@ impl ProjectSymbols {
     }
 
     /// Replaces the symbols of `file` (after it was saved).
-    pub fn update_file(&mut self, rel: &str, syms: Vec<Symbol>) {
+    pub fn update_file(&mut self, rel: &str, stamp: Stamp, syms: Vec<Symbol>) {
         let idx = match self.files.iter().position(|f| f == rel) {
-            Some(i) => i as u32,
+            Some(i) => {
+                self.stamps[i] = stamp;
+                i as u32
+            }
             None => {
                 self.files.push(rel.to_string());
+                self.stamps.push(stamp);
                 (self.files.len() - 1) as u32
             }
         };
-        let mut all: Vec<Entry> = std::mem::take(&mut self.entries).into_iter().filter(|e| e.file != idx).collect();
-        all.extend(syms.into_iter().map(|sym| Entry { sym, file: idx }));
-        all.sort_by_cached_key(|e| e.sym.name.to_lowercase());
-        self.keys = all.iter().map(|e| e.sym.name.to_lowercase()).collect();
-        self.entries = all;
+        let mut new: Sorted = syms.into_iter().map(|sym| (sym.name.to_lowercase(), Entry { sym, file: idx })).collect();
+        new.sort_by(|a, b| a.0.cmp(&b.0));
+        self.merge(|f| (f != idx).then_some(f), new);
     }
 }
 
@@ -498,9 +593,19 @@ mod tests {
         assert_eq!(p.with_prefix("ap", 10).len(), 3);
         assert!(p.find("Apri").is_empty());
         let mut p = p;
-        p.update_file("b.rs", vec![]);
+        p.update_file("b.rs", (0, 0), vec![]);
         assert_eq!(p.find("apri").len(), 1);
-        assert_eq!(words("a bb cc_d bb 9x é_é", 2), vec!["bb", "cc_d", "é_é"]);
+        // A new scan: a.rs unchanged (moved to index 1), c.rs new, b.rs gone.
+        let mut per_file = vec![FileSymbols::New(extract(Lang::Rust, "fn apri() {}\n")), FileSymbols::Same(0)];
+        let sorted = sort_new(&mut per_file);
+        p.apply_scan(vec!["c.rs".into(), "a.rs".into()], vec![(1, 1), (0, 0)], &per_file, sorted);
+        let files: Vec<&str> = p.find("apri").iter().map(|e| p.files[e.file as usize].as_str()).collect();
+        assert_eq!(files.len(), 2);
+        assert!(files.contains(&"a.rs") && files.contains(&"c.rs"));
+        assert_eq!(p.with_prefix("a", 10).len(), 3);
+        assert!(p.keys.windows(2).all(|w| w[0] <= w[1]));
+        assert_eq!(words("a bb cc_d bb 9x é_é", 2, ""), vec!["bb", "cc_d", "é_é"]);
+        assert_eq!(words("Foo fob bar FOOD", 2, "fo"), vec!["Foo", "fob", "FOOD"]);
     }
 }
 

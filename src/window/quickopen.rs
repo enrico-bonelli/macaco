@@ -51,16 +51,20 @@ fn is_indexed(dir: &Path) -> bool {
 /// Pango markup of `text` with the characters at `positions` (counted from
 /// `offset`) in bold.
 fn highlight(text: &str, positions: &[usize], offset: usize) -> String {
-    let mut out = String::new();
+    let mut out = String::with_capacity(text.len() + 16);
     let mut bold = false;
-    for (i, c) in text.chars().enumerate() {
+    // Runs of characters with the same weight, escaped at once.
+    let mut run_start = 0;
+    for (i, (b, _)) in text.char_indices().enumerate() {
         let hit = positions.binary_search(&(i + offset)).is_ok();
         if hit != bold {
+            out.push_str(&glib::markup_escape_text(&text[run_start..b]));
+            run_start = b;
             out.push_str(if hit { "<b>" } else { "</b>" });
             bold = hit;
         }
-        out.push_str(&glib::markup_escape_text(&c.to_string()));
     }
+    out.push_str(&glib::markup_escape_text(&text[run_start..]));
     if bold {
         out.push_str("</b>");
     }
@@ -69,11 +73,7 @@ fn highlight(text: &str, positions: &[usize], offset: usize) -> String {
 
 impl Editor {
     pub(super) fn setup_quickopen_actions(self: &Rc<Self>) {
-        let a = gio::SimpleAction::new("quick-open", None);
-        let ed = self.clone();
-        a.connect_activate(move |_, _| ed.quick_open());
-        self.win.add_action(&a);
-        self.app.set_accels_for_action("win.quick-open", &["<Control>p"]);
+        self.add_action("quick-open", &["<Control>p"], |ed| ed.quick_open());
 
         let a = gio::SimpleAction::new_stateful("index-folder", None, &false.to_variant());
         let ed = self.clone();
@@ -89,7 +89,7 @@ impl Editor {
     pub(super) fn sync_index(self: &Rc<Self>) {
         let workdir = self.workdir.borrow().clone();
         let indexed = workdir.as_deref().is_some_and(is_indexed);
-        if let Some(a) = self.win.lookup_action("index-folder").and_downcast::<gio::SimpleAction>() {
+        if let Some(a) = self.action("index-folder") {
             a.set_enabled(workdir.is_some());
             a.set_state(&indexed.to_variant());
         }
@@ -145,7 +145,6 @@ impl Editor {
             .await
             .unwrap_or_default();
             let Some(ed) = ed.upgrade() else { return };
-            let files: Vec<String> = (0..paths.len()).map(|i| paths.get(i).to_string()).collect();
             let current = if let Some(i) = ed.index.borrow_mut().as_mut().filter(|i| i.root == root) {
                 i.paths = Rc::new(paths);
                 i.scanning.set(false);
@@ -157,12 +156,26 @@ impl Editor {
             };
             // Definitions for "go to definition" and the completion.
             if current {
-                ed.rebuild_symbols(root.clone(), files);
+                let paths = ed.index.borrow().as_ref().map(|i| (*i.paths).clone()).unwrap_or_default();
+                ed.rebuild_symbols(root.clone(), paths);
             }
             ed.refresh_quick();
             // The scan allocated a lot in its thread.
             ed.release_memory();
         });
+    }
+
+    /// Files of the index of `root`, when it has been loaded.
+    pub(super) fn index_paths(&self, root: &Path) -> Option<Rc<Paths>> {
+        self.index.borrow().as_ref().filter(|i| i.root == root && i.loaded.get()).map(|i| i.paths.clone())
+    }
+
+    /// Files of the index of `root`, if scanned recently enough to be
+    /// trusted (otherwise the caller lists the folder again).
+    pub(super) fn fresh_index(&self, root: &Path) -> Option<Paths> {
+        let index = self.index.borrow();
+        let i = index.as_ref().filter(|i| i.root == root && !i.scanning.get())?;
+        i.scanned_at.get().is_some_and(|t| t.elapsed() < RESCAN_AFTER).then(|| (*i.paths).clone())
     }
 
     pub(super) fn index_active(&self) -> bool {
@@ -197,21 +210,14 @@ impl Editor {
             return;
         };
         if self.index.borrow().is_none() {
-            let dialog = gtk::AlertDialog::builder()
-                .modal(true)
-                .message("Cartella non indicizzata")
-                .detail(format!(
-                    "Per cercare i file in «{}» la cartella va indicizzata: l'elenco dei file viene salvato e \
-                     aggiornato in background. Le cartelle nascoste e i file ignorati da git sono esclusi.",
-                    root.display()
-                ))
-                .buttons(["Annulla", "Indicizza ora"])
-                .cancel_button(0)
-                .default_button(1)
-                .build();
+            let detail = format!(
+                "Per cercare i file in «{}» la cartella va indicizzata: l'elenco dei file viene salvato e \
+                 aggiornato in background. Le cartelle nascoste e i file ignorati da git sono esclusi.",
+                root.display()
+            );
             let ed = self.clone();
-            dialog.choose(Some(&self.win), None::<&gio::Cancellable>, move |res| {
-                if res == Ok(1) {
+            crate::ui::confirm(Some(self.win.upcast_ref()), "Cartella non indicizzata", &detail, "Indicizza ora", true, move |ok| {
+                if ok {
                     ed.set_indexed(true);
                     ed.quick_open();
                 }
@@ -257,41 +263,14 @@ impl Editor {
 impl QuickOpen {
     fn new(ed: &Rc<Editor>, root: &Path) -> Rc<QuickOpen> {
         let name = root.file_name().map_or_else(|| root.display().to_string(), |n| n.to_string_lossy().into_owned());
-        let win = gtk::Window::builder()
-            .title(format!("Cerca file — {name}"))
-            .transient_for(&ed.win)
-            .modal(true)
-            .default_width(640)
-            .default_height(460)
-            .build();
-        let entry = gtk::SearchEntry::builder().placeholder_text("Nome del file…").search_delay(50).build();
         let store = gtk::StringList::new(&[]);
         let sel = gtk::SingleSelection::new(Some(store.clone()));
         sel.set_autoselect(true);
         let view = gtk::ListView::new(Some(sel.clone()), None::<gtk::ListItemFactory>);
         view.set_single_click_activate(true);
         view.add_css_class("quick-open");
-        let scroll = gtk::ScrolledWindow::builder()
-            .child(&view)
-            .vexpand(true)
-            .hscrollbar_policy(gtk::PolicyType::Never)
-            .build();
-        scroll.add_css_class("frame");
-        let status = gtk::Label::new(None);
-        status.set_xalign(0.0);
-        status.add_css_class("dim-label");
-        let b = gtk::Box::builder()
-            .orientation(gtk::Orientation::Vertical)
-            .spacing(8)
-            .margin_top(10)
-            .margin_bottom(10)
-            .margin_start(10)
-            .margin_end(10)
-            .build();
-        b.append(&entry);
-        b.append(&scroll);
-        b.append(&status);
-        win.set_child(Some(&b));
+        let entry = gtk::SearchEntry::builder().placeholder_text("Nome del file…").search_delay(50).build();
+        let (win, entry, status) = crate::ui::picker_window(&ed.win, &format!("Cerca file — {name}"), (640, 460), entry, &view);
 
         let q = Rc::new(QuickOpen {
             ed: Rc::downgrade(ed),
@@ -434,7 +413,7 @@ impl QuickOpen {
         let mut text = if paths.is_empty() && (scanning || !loaded) {
             "Indicizzazione in corso…".to_string()
         } else if query.trim().is_empty() {
-            let syms = ed.symbols.borrow().as_ref().map_or(0, |s| if s.project.borrow().is_empty() { 0 } else { s.project.borrow().len() });
+            let syms = ed.symbols.borrow().as_ref().map_or(0, |s| s.project.borrow().len());
             if syms > 0 { format!("{} file indicizzati · {syms} simboli", paths.len()) } else { format!("{} file indicizzati", paths.len()) }
         } else {
             format!("{} risultati su {} file", rels.len(), paths.len())
@@ -450,5 +429,17 @@ impl QuickOpen {
         let Some(root) = ed.index.borrow().as_ref().map(|i| i.root.clone()) else { return };
         self.win.close();
         ed.open_path(&root.join(rel.as_str()));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::highlight;
+
+    #[test]
+    fn bold_runs() {
+        assert_eq!(highlight("a<b>c", &[1, 2], 0), "a<b>&lt;b</b>&gt;c");
+        assert_eq!(highlight("èx", &[3], 2), "è<b>x</b>");
+        assert_eq!(highlight("ab", &[], 0), "ab");
     }
 }

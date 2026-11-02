@@ -6,41 +6,11 @@
 
 use crate::lang::Lang;
 use crate::lexer::{self, Kind, State, Token};
-use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 
 pub struct Formatted {
     pub text: String,
     pub tool: String,
-}
-
-fn find_in_path(cmd: &str) -> Option<PathBuf> {
-    std::env::var_os("PATH").and_then(|paths| {
-        std::env::split_paths(&paths).map(|d| d.join(cmd)).find(|p| p.is_file())
-    })
-}
-
-fn run(cmd: &Path, args: &[String], input: &str) -> Result<String, String> {
-    let mut child = Command::new(cmd)
-        .args(args)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| e.to_string())?;
-    let mut stdin = child.stdin.take().ok_or("stdin")?;
-    let data = input.to_owned();
-    // Write from a thread so a large output cannot dead-lock the pipes.
-    let writer = std::thread::spawn(move || stdin.write_all(data.as_bytes()));
-    let out = child.wait_with_output().map_err(|e| e.to_string())?;
-    let _ = writer.join();
-    if out.status.success() {
-        String::from_utf8(out.stdout).map_err(|_| "output non UTF-8".to_string())
-    } else {
-        let err = String::from_utf8_lossy(&out.stderr);
-        Err(err.lines().take(3).collect::<Vec<_>>().join(" "))
-    }
 }
 
 fn has_clang_format_config(path: Option<&Path>) -> bool {
@@ -97,16 +67,15 @@ fn external(lang: Lang, path: Option<&Path>, tab: u32) -> Vec<(&'static str, Vec
     }
 }
 
-/// Format `text`. Returns an error message if an external tool failed
-/// (e.g. because of a syntax error).
-pub fn format(lang: Lang, path: Option<&Path>, text: &str, tab: u32, spaces: bool) -> Result<Formatted, String> {
-    for (cmd, args) in external(lang, path, tab) {
-        if let Some(exe) = find_in_path(cmd) {
-            return run(&exe, &args, text)
-                .map(|t| Formatted { text: t, tool: cmd.to_string() })
-                .map_err(|e| format!("{cmd}: {e}"));
-        }
-    }
+/// An installed external formatter for `lang`: (name, program, args).
+/// The text goes to its standard input, the result comes from its output.
+pub fn external_formatter(lang: Lang, path: Option<&Path>, tab: u32) -> Option<(&'static str, PathBuf, Vec<String>)> {
+    external(lang, path, tab).into_iter().find_map(|(cmd, args)| crate::proc::find_in_path(cmd).map(|exe| (cmd, exe, args)))
+}
+
+/// Format `text` with the built-in formatter (used when no external one
+/// is installed).
+pub fn format_internal(lang: Lang, text: &str, tab: u32, spaces: bool) -> Formatted {
     let unit = if spaces && !lang.prefers_tabs() { " ".repeat(tab as usize) } else { "\t".to_string() };
     let text = match lang {
         Lang::C | Lang::Cpp | Lang::CSharp | Lang::Rust | Lang::Java | Lang::JavaScript | Lang::TypeScript
@@ -116,7 +85,7 @@ pub fn format(lang: Lang, path: Option<&Path>, text: &str, tab: u32, spaces: boo
         Lang::Markdown => tidy_markdown(text),
         _ => tidy(text, (lang == Lang::Python || lang == Lang::Yaml).then_some(tab)),
     };
-    Ok(Formatted { text, tool: "formattatore interno".into() })
+    Formatted { text, tool: "formattatore interno".into() }
 }
 
 /// Trim trailing whitespace, expand leading tabs (if `tab` is set) and end
@@ -358,10 +327,6 @@ const VOID_TAGS: &[&str] = &[
 ];
 
 /// Position of `needle` in `hay` (bytes).
-fn find_bytes(hay: &[u8], needle: &[u8]) -> Option<usize> {
-    hay.windows(needle.len()).position(|w| w == needle)
-}
-
 /// Re-indent HTML by tag nesting (and braces inside script/style).
 /// The scan works on bytes: positions may fall inside multi-byte characters.
 pub fn reindent_html(text: &str, unit: &str) -> String {
@@ -387,10 +352,10 @@ pub fn reindent_html(text: &str, unit: &str) -> String {
         let mut i = 0;
         while i < b.len() {
             if in_comment {
-                match find_bytes(&b[i..], b"-->") {
+                match lexer::find(b, i, b.len(), b"-->") {
                     Some(p) => {
                         in_comment = false;
-                        i += p + 3;
+                        i = p + 3;
                     }
                     None => break,
                 }
@@ -447,31 +412,30 @@ pub fn reindent_html(text: &str, unit: &str) -> String {
     finish(out)
 }
 
-/// Comment or uncomment the given lines (all commented -> uncomment).
+/// Last position of `needle` (lowercase ASCII) in `hay`, ignoring case.
+fn rfind_ignore_case(hay: &[u8], needle: &[u8]) -> Option<usize> {
+    hay.windows(needle.len()).rposition(|w| w.eq_ignore_ascii_case(needle))
+}
+
 /// Language at the end of `before` in an HTML or Vue document: the script
 /// (TypeScript with `lang="ts"`), the style, or the markup.
 pub fn embedded_lang(lang: Lang, before: &str) -> Lang {
     if !matches!(lang, Lang::Html | Lang::Vue) {
         return lang;
     }
-    let lower = before.to_ascii_lowercase();
-    let open = |tag: &str| lower.rfind(&format!("<{tag}"));
-    let close = |tag: &str| lower.rfind(&format!("</{tag}"));
-    if let Some(s) = open("script")
-        && close("script").is_none_or(|e| e < s)
-    {
-        let tag = &lower[s..lower[s..].find('>').map_or(lower.len(), |e| s + e)];
-        let ts = ["lang=\"ts\"", "lang='ts'", "lang=\"tsx\"", "lang='tsx'"].iter().any(|p| tag.contains(p));
-        return if ts { Lang::TypeScript } else { Lang::JavaScript };
+    let b = before.as_bytes();
+    let inside = |open: &[u8], close: &[u8]| rfind_ignore_case(b, open).filter(|&s| rfind_ignore_case(b, close).is_none_or(|e| e < s));
+    if let Some(s) = inside(b"<script", b"</script") {
+        let tag = &b[s..b[s..].iter().position(|&c| c == b'>').map_or(b.len(), |e| s + e)];
+        return if crate::lang::script_is_ts(tag) { Lang::TypeScript } else { Lang::JavaScript };
     }
-    if let Some(s) = open("style")
-        && close("style").is_none_or(|e| e < s)
-    {
+    if inside(b"<style", b"</style").is_some() {
         return Lang::Css;
     }
     lang
 }
 
+/// Comment or uncomment the given lines (all commented -> uncomment).
 pub fn toggle_comment(lang: Lang, lines: &[&str]) -> Option<Vec<String>> {
     let (pre, post) = lang.comment_tokens()?;
     Some(toggle_comment_with(pre, post, lines))

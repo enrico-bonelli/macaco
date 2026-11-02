@@ -123,15 +123,11 @@ pub fn language_id(lang: Lang, path: &Path) -> &'static str {
     }
 }
 
-fn find_in_path(cmd: &str) -> Option<PathBuf> {
-    std::env::var_os("PATH").and_then(|paths| std::env::split_paths(&paths).map(|d| d.join(cmd)).find(|p| p.is_file()))
-}
-
 /// The first installed command of `spec`.
 pub fn find_command(spec: &ServerSpec) -> Option<(PathBuf, Vec<String>)> {
     spec.commands
         .iter()
-        .find_map(|(cmd, args)| find_in_path(cmd).map(|p| (p, args.iter().map(|a| a.to_string()).collect())))
+        .find_map(|(cmd, args)| crate::proc::find_in_path(cmd).map(|p| (p, args.iter().map(|a| a.to_string()).collect())))
 }
 
 pub fn path_to_uri(path: &Path) -> String {
@@ -346,10 +342,10 @@ fn take_message(buf: &mut Vec<u8>) -> Option<Value> {
         if buf.len() < end + 4 + len {
             return None;
         }
-        let body: Vec<u8> = buf.drain(..end + 4 + len).skip(end + 4).collect();
-        match serde_json::from_slice(&body) {
-            Ok(v) => return Some(v),
-            Err(_) => continue,
+        let parsed = serde_json::from_slice(&buf[end + 4..end + 4 + len]);
+        buf.drain(..end + 4 + len);
+        if let Ok(v) = parsed {
+            return Some(v);
         }
     }
 }
@@ -391,6 +387,9 @@ pub struct Client {
     stderr: RefCell<String>,
     /// Running progress operations (token -> title).
     progress: RefCell<HashMap<String, String>>,
+    /// When the status was last shown for a progress report (indexing
+    /// sends hundreds of them).
+    progress_shown: std::cell::Cell<Option<std::time::Instant>>,
     events: Events,
 }
 
@@ -432,6 +431,7 @@ impl Client {
             docs: RefCell::new(HashMap::new()),
             stderr: RefCell::new(String::new()),
             progress: RefCell::new(HashMap::new()),
+            progress_shown: std::cell::Cell::new(None),
             events,
         });
         c.read_loop(stdout);
@@ -514,9 +514,17 @@ impl Client {
     }
 
     fn write(self: &Rc<Self>, msg: &Value) {
-        let body = msg.to_string();
-        let mut data = format!("Content-Length: {}\r\n\r\n", body.len()).into_bytes();
-        data.extend_from_slice(body.as_bytes());
+        // The body is serialized after room for the header, which is then
+        // written in front of it: one buffer, no copy of the (whole) text.
+        const ROOM: usize = 40;
+        let mut data = vec![b' '; ROOM];
+        if serde_json::to_writer(&mut data, msg).is_err() {
+            return;
+        }
+        let header = format!("Content-Length: {}\r\n\r\n", data.len() - ROOM);
+        let start = ROOM - header.len();
+        data[start..ROOM].copy_from_slice(header.as_bytes());
+        data.drain(..start);
         self.outbox.borrow_mut().push_back(data);
         if self.writing.replace(true) {
             return;
@@ -551,15 +559,25 @@ impl Client {
         }
     }
 
-    pub fn request(self: &Rc<Self>, method: &str, params: Value, reply: impl FnOnce(Result<Value, String>) + 'static) {
-        self.request_inner(method, params, false, Box::new(reply));
+    /// Sends a request; returns its id (for `cancel`).
+    pub fn request(self: &Rc<Self>, method: &str, params: Value, reply: impl FnOnce(Result<Value, String>) + 'static) -> i64 {
+        self.request_inner(method, params, false, Box::new(reply))
     }
 
-    fn request_inner(self: &Rc<Self>, method: &str, params: Value, early: bool, reply: Reply) {
+    fn request_inner(self: &Rc<Self>, method: &str, params: Value, early: bool, reply: Reply) -> i64 {
         let id = self.next_id.get();
         self.next_id.set(id + 1);
         self.pending.borrow_mut().insert(id, reply);
         self.send(json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}), early);
+        id
+    }
+
+    /// Request `id` is no more needed: the server can stop working on it
+    /// and its answer is ignored.
+    pub fn cancel(self: &Rc<Self>, id: i64) {
+        if self.pending.borrow_mut().remove(&id).is_some() {
+            self.notify("$/cancelRequest", json!({"id": id}));
+        }
     }
 
     pub fn notify(self: &Rc<Self>, method: &str, params: Value) {
@@ -622,7 +640,7 @@ impl Client {
         );
     }
 
-    fn handle(self: &Rc<Self>, msg: Value) {
+    fn handle(self: &Rc<Self>, mut msg: Value) {
         let method = msg.get("method").and_then(Value::as_str).map(str::to_string);
         let id = msg.get("id").cloned();
         match (method, id) {
@@ -631,7 +649,8 @@ impl Client {
                 let Some(reply) = id.as_i64().and_then(|i| self.pending.borrow_mut().remove(&i)) else { return };
                 match msg.get("error") {
                     Some(e) => reply(Err(e.get("message").and_then(Value::as_str).unwrap_or("errore").to_string())),
-                    None => reply(Ok(msg.get("result").cloned().unwrap_or(Value::Null))),
+                    // Taken, not cloned: completion lists can be large.
+                    None => reply(Ok(msg.get_mut("result").map(Value::take).unwrap_or(Value::Null))),
                 }
             }
             // Request from the server: answer so that it does not wait.
@@ -659,10 +678,16 @@ impl Client {
         let token = p.get("token").map(|t| t.to_string()).unwrap_or_default();
         let v = p.get("value").unwrap_or(&Value::Null);
         let kind = v.get("kind").and_then(Value::as_str).unwrap_or("");
+        // Reports at most five times a second (begin and end always).
+        const REPORT_EVERY: std::time::Duration = std::time::Duration::from_millis(200);
+        if kind == "report" && self.progress_shown.get().is_some_and(|t| t.elapsed() < REPORT_EVERY) {
+            return;
+        }
         {
             let mut prog = self.progress.borrow_mut();
             match kind {
                 "begin" | "report" => {
+                    self.progress_shown.set(Some(std::time::Instant::now()));
                     let title = v.get("title").and_then(Value::as_str).map(str::to_string).or_else(|| prog.get(&token).cloned()).unwrap_or_default();
                     let pct = v.get("percentage").and_then(Value::as_u64).map(|p| format!(" {p}%")).unwrap_or_default();
                     let text = format!("{title}{pct}");
@@ -692,6 +717,16 @@ impl Client {
         }
         self.docs.borrow_mut().insert(uri.to_string(), 1);
         self.notify("textDocument/didOpen", json!({"textDocument": {"uri": uri, "languageId": language_id, "version": 1, "text": text}}));
+    }
+
+    /// Sends the current text of a document: a change if the server has it,
+    /// else (when the server is ready) an open.
+    pub fn sync_text(self: &Rc<Self>, uri: &str, language_id: &str, text: &str) {
+        if self.docs.borrow().contains_key(uri) {
+            self.did_change(uri, text);
+        } else if self.ready.get() {
+            self.did_open(uri, language_id, text);
+        }
     }
 
     /// Sends the whole text (accepted whatever sync kind the server asks).

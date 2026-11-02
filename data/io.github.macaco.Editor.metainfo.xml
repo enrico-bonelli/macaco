@@ -21,6 +21,7 @@
       <li>Avviso quando un file aperto viene modificato da un altro programma, con ricarica dal disco</li>
       <li>Integrazione con git: cronologia dei file, pull e push con richiesta delle credenziali (portachiavi di sistema, chiavi SSH per repository)</li>
       <li>Terminale integrato</li>
+      <li>Assistente con Claude Code e Codex (Agent Client Protocol), avviato su richiesta dalla barra di stato</li>
       <li>Recupero automatico dei documenti non salvati</li>
     </ul>
   </description>
@@ -39,6 +40,11 @@
   </categories>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="0.6.0" date="2026-11-02">
+      <description>
+        <p>Assistente con Claude Code e Codex tramite l'Agent Client Protocol: pannello di conversazione con piano, permessi e modifiche mostrate come diff, avviato su richiesta dai pulsanti nella barra di stato. Formattazione esterna in background con tempo massimo; meno lavoro a ogni tasto (completamento, language server, ricerca) e al cambio di scheda (git, language server); indice dei simboli aggiornato solo per i file cambiati; correzioni (chiusura in «vai alla definizione», push e pull segnati come annullati, commit di molti file).</p>
+      </description>
+    </release>
     <release version="0.5.0" date="2026-10-28">
       <description>
         <p>Confronto e unione a tre colonne con frecce sui blocchi e risoluzione dei conflitti di git; cronologia git di un file con ripristino delle versioni; pull e push con richiesta di nome utente, password, token e passphrase, password HTTPS nel portachiavi di sistema (KWallet, GNOME Portachiavi) e chiave SSH per repository; scelta del ramo remoto al primo pull o push.</p>

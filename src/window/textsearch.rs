@@ -10,7 +10,7 @@ use crate::finder::{self, Progress, TextResults};
 use crate::lang;
 use crate::search::{Options, Query};
 use gtk::prelude::*;
-use gtk::{gdk, gio, glib};
+use gtk::{gio, glib};
 use std::cell::{Cell, RefCell};
 use std::path::{Path, PathBuf};
 use std::rc::{Rc, Weak};
@@ -57,11 +57,7 @@ fn snippet_markup(text: &str, hl: (u32, u32)) -> String {
 
 impl Editor {
     pub(super) fn setup_textsearch_actions(self: &Rc<Self>) {
-        let a = gio::SimpleAction::new("find-in-folder", None);
-        let ed = self.clone();
-        a.connect_activate(move |_, _| ed.find_in_folder());
-        self.win.add_action(&a);
-        self.app.set_accels_for_action("win.find-in-folder", &["<Control><Shift>f"]);
+        self.add_action("find-in-folder", &["<Control><Shift>f"], |ed| ed.find_in_folder());
     }
 
     fn find_in_folder(self: &Rc<Self>) {
@@ -140,13 +136,7 @@ impl Editor {
             return;
         }
         let buf = &d.buffer;
-        let mut it = buf.iter_at_line(line as i32).unwrap_or_else(|| buf.end_iter());
-        let mut end = it;
-        if !end.ends_line() {
-            end.forward_to_line_end();
-        }
-        it.set_line_offset((col as i32).min(end.line_offset()));
-        buf.place_cursor(&it);
+        buf.place_cursor(&d.iter_at_line_col(line as i32, col as i32));
         let view = d.view.clone();
         // Scroll once the view has its size.
         glib::idle_add_local_once(move || {
@@ -332,18 +322,7 @@ impl TextSearch {
                 t.open(t.sel.selected());
             }
         });
-        let esc = gtk::EventControllerKey::new();
-        let w = t.win.downgrade();
-        esc.connect_key_pressed(move |_, key, _, _| {
-            if key == gdk::Key::Escape {
-                if let Some(w) = w.upgrade() {
-                    w.close();
-                }
-                return glib::Propagation::Stop;
-            }
-            glib::Propagation::Proceed
-        });
-        t.win.add_controller(esc);
+        crate::ui::close_on_escape(&t.win);
         let w = Rc::downgrade(&t);
         t.win.connect_close_request(move |_| {
             if let Some(t) = w.upgrade() {
@@ -458,21 +437,14 @@ impl TextSearch {
 
         let w = Rc::downgrade(self);
         let root = self.root.clone();
-        let query = text.clone();
-        let opts = self.options();
+        let paths = self.ed.upgrade().and_then(|ed| ed.fresh_index(&root));
+        let q2 = q.clone();
         let code_only = self.code_only.is_active();
         glib::spawn_future_local(async move {
             let p = progress.clone();
-            // The query is compiled again in the thread (a Regex is cheap to
-            // build and keeps this code simple).
-            let res = gio::spawn_blocking(move || match Query::new(&query, opts) {
-                Ok(q) => finder::grep(&root, &q, code_only, &p),
-                Err(_) => TextResults::default(),
-            })
-            .await
-            .unwrap_or_default();
+            let res = gio::spawn_blocking(move || finder::grep(&root, paths, &q2, code_only, &p)).await.unwrap_or_default();
             let Some(t) = w.upgrade().filter(|t| t.generation.get() == generation) else { return };
-            t.finish(res, q);
+            t.show(res, Some(q));
         });
     }
 
@@ -480,10 +452,6 @@ impl TextSearch {
         if let Some(p) = self.running.borrow().as_ref() {
             p.cancel.store(true, Ordering::Relaxed);
         }
-    }
-
-    fn finish(self: &Rc<Self>, res: TextResults, q: Query) {
-        self.show(res, Some(q));
     }
 
     fn show(self: &Rc<Self>, res: TextResults, q: Option<Query>) {
@@ -509,9 +477,8 @@ impl TextSearch {
         // Results first: binding the rows reads them.
         *self.results.borrow_mut() = res;
         *self.query.borrow_mut() = q;
-        let rows: Vec<String> = (0..n).map(|i| i.to_string()).collect();
-        let refs: Vec<&str> = rows.iter().map(String::as_str).collect();
-        self.store.splice(0, self.store.n_items(), &refs);
+        // The rows only need their position (the bind reads the results).
+        self.store.splice(0, self.store.n_items(), &vec![""; n]);
         self.sel.set_selected(gtk::INVALID_LIST_POSITION);
         if n > 0 {
             self.sel.set_selected(0);
@@ -545,8 +512,7 @@ impl TextSearch {
                 return;
             };
             d.set_content(&text, false, 0);
-            let head: String = text.chars().take(256).collect();
-            d.set_lang(lang::detect(Some(&path), &head));
+            d.set_lang(lang::detect(Some(&path), &text));
             // Highlight every occurrence in the file.
             if let Some(q) = self.query.borrow().as_ref() {
                 let buf = &d.buffer;
@@ -564,14 +530,12 @@ impl TextSearch {
             }
             *self.preview_file.borrow_mut() = Some(path.clone());
         }
-        let rel = path.strip_prefix(&self.root).unwrap_or(&path).display().to_string();
+        let rel = finder::rel_or_full(&self.root, &path);
         self.preview_title.set_text(&format!("{rel}:{}", line + 1));
         self.preview_title.set_tooltip_text(Some(&rel));
         self.preview_open.set_sensitive(true);
         let buf = &d.buffer;
-        let mut it = buf.iter_at_line(line as i32).unwrap_or_else(|| buf.end_iter());
-        it.set_line_offset(col as i32);
-        buf.place_cursor(&it);
+        buf.place_cursor(&d.iter_at_line_col(line as i32, col as i32));
         let view = d.view.clone();
         glib::idle_add_local_once(move || {
             view.scroll_to_mark(&view.buffer().get_insert(), 0.0, true, 0.0, 0.35);

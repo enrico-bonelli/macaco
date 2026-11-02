@@ -17,10 +17,12 @@ ogni giorno a chi lavora su progetti:
 - avviso quando un file aperto viene modificato da un altro programma;
 - integrazione con git: cronologia dei file, pull e push con le tue
   credenziali (portachiavi di sistema, chiavi SSH);
-- terminale integrato.
+- terminale integrato;
+- assistente con **Claude Code** e **Codex**, su richiesta (non parte
+  niente finché non lo apri).
 
 Tutto questo senza rinunciare alla leggerezza: all'avvio occupa circa
-**65 MB** di memoria, il binario pesa **3,5 MB** e le funzioni più pesanti
+**65 MB** di memoria, il binario pesa circa **4 MB** e le funzioni più pesanti
 (terminale, indice dei file, language server) si caricano solo quando le usi.
 
 ---
@@ -45,6 +47,7 @@ Tutto questo senza rinunciare alla leggerezza: all'avvio occupa circa
   - [Analisi del codice](#analisi-del-codice)
   - [Git](#git)
   - [Terminale integrato](#terminale-integrato)
+  - [Assistente (Claude Code, Codex)](#assistente-claude-code-codex)
   - [Aspetto e preferenze](#aspetto-e-preferenze)
 - [Scorciatoie da tastiera](#scorciatoie-da-tastiera)
 - [Prestazioni e uso della memoria](#prestazioni-e-uso-della-memoria)
@@ -283,7 +286,10 @@ Se nessuno è disponibile interviene un **formattatore interno**:
 - per il Markdown pulisce il testo conservando gli a capo forzati e i
   blocchi di codice.
 
-La formattazione è un'unica operazione annullabile.
+La formattazione è un'unica operazione annullabile. Il formattatore esterno
+lavora in background (l'editor resta utilizzabile) e viene fermato dopo
+20 secondi; se nel frattempo il documento è stato modificato, il risultato
+viene scartato.
 
 ### Cerca e sostituisci
 
@@ -736,6 +742,47 @@ cartella di lavoro o, se non c'è, del file attivo.
   caricata solo alla prima apertura del pannello, quindi se non usi il
   terminale non occupa memoria.
 
+### Assistente (Claude Code, Codex)
+
+Un pannello a destra per lavorare con un agente di programmazione dentro
+l'editor. macaco parla con gli agenti tramite l'[Agent Client
+Protocol](https://agentclientprotocol.com) (ACP), lo stesso usato da Zed.
+
+- **Su richiesta:** nella barra di stato c'è un piccolo pulsante per ogni
+  agente installato ("Claude", "Codex"). Un clic apre il pannello con
+  quell'agente, un altro clic lo nasconde; anche `Ctrl+Maiusc+A` o `F6`
+  (Visualizza → Assistente) mostrano e nascondono il pannello. Finché non lo
+  usi non parte niente; se nessun adattatore è installato i pulsanti non
+  compaiono.
+- **L'agente:** parte al primo messaggio, nella cartella di lavoro (o in
+  quella del file attivo). Il pulsante dell'agente in esecuzione è in
+  grassetto e la memoria che usa compare nella barra di stato (Claude Code
+  occupa qualche centinaio di MB). Nascondendo il pannello l'agente resta
+  attivo; il pulsante ⏹ nel pannello lo termina e libera la memoria, e alla
+  chiusura dell'editor viene comunque fermato.
+- **Conversazione:** `Invio` invia, `Maiusc+Invio` va a capo. Con "File
+  corrente" il messaggio indica all'agente il file attivo e il testo
+  selezionato. Le risposte arrivano mentre vengono scritte, con il
+  ragionamento (in corsivo), il piano di lavoro aggiornato e ogni operazione
+  dell'agente con il suo stato. "Interrompi" ferma il turno, il pulsante
+  accanto all'agente inizia una nuova conversazione.
+- **File:** l'agente legge e scrive i file attraverso l'editor, quindi vede
+  anche le modifiche non salvate. Una modifica a un file aperto è un'unica
+  operazione annullabile (`Ctrl+Z`) e viene salvata; le modifiche si vedono
+  come diff colorati, e i file citati si aprono con un clic.
+- **Permessi:** quando l'agente chiede il permesso (per esempio per
+  modificare un file o eseguire un comando) compaiono i pulsanti con le sue
+  opzioni ("Consenti", "Consenti sempre", "Rifiuta"…).
+- **Accesso:** se l'agente chiede di accedere, un pulsante esegue nel
+  terminale `claude /login` o `codex login`.
+- **Requisiti:** l'agente e il suo adattatore ACP, installati a parte (macaco
+  non scarica nulla da solo):
+
+  | Agente | Adattatore | Installazione |
+  |---|---|---|
+  | Claude Code | `claude-agent-acp` | `npm install -g @agentclientprotocol/claude-agent-acp` |
+  | Codex | `codex-acp` | `npm install -g @zed-industries/codex-acp` |
+
 ### Aspetto e preferenze
 
 **Preferenze** (`Ctrl+,`):
@@ -798,6 +845,7 @@ cartella di lavoro o, se non c'è, del file attivo.
 | `F5` | verifica il file (language server) |
 | `F12`, ``Ctrl+` `` | terminale |
 | `Maiusc+F12` | terminale nella cartella del file |
+| `Ctrl+Maiusc+A`, `F6` | assistente (Claude Code, Codex) |
 | `F2` / `Canc` (nel pannello file) | rinomina / sposta nel cestino |
 | `Ctrl+,` | preferenze |
 
@@ -810,7 +858,7 @@ cartella di lavoro o, se non c'è, del file attivo.
 - renderer GTK `cairo` predefinito, invece dei circa 350 MB con GL/Vulkan.
   Si può cambiare con `renderer=gl|vulkan|auto` in `settings.conf` o con la
   variabile `GSK_RENDERER`.
-- Binario di 3,5 MB (LTO, strip).
+- Binario di circa 4 MB (LTO, strip).
 
 **Colorazione della sintassi:**
 - incrementale: per ogni riga si memorizza lo stato del lexer, e dopo una
@@ -853,6 +901,7 @@ Tutto si trova in `~/.macaco/`:
 | `session` | schede aperte e cartella di lavoro |
 | `cache/<id>.txt`, `.meta` | contenuto delle schede non salvate |
 | `recent` | file recenti |
+| `bookmarks` | file preferiti |
 | `indexed` | cartelle indicizzate per la ricerca veloce |
 | `lsp-folders` | cartelle con l'analisi del codice tramite language server |
 | `index/<id>.paths` | elenco dei file di ogni cartella indicizzata |
@@ -872,6 +921,7 @@ Tutto si trova in `~/.macaco/`:
 | `vte4` | terminale integrato |
 | `clang`, `rust-analyzer`, `pyright`, `gopls`, `typescript-language-server`… | analisi del codice con language server (vedi [sopra](#livello-avanzato-language-server)) |
 | `git` | integrazione git |
+| `nodejs`, `npm` + gli adattatori ACP | assistente (vedi [sopra](#assistente-claude-code-codex)) |
 | `rust` (rustfmt), `clang`, `go`, `ruff` / `python-black`, `shfmt`, `prettier`, `pgformatter` | formattazione dei rispettivi linguaggi |
 
 **Per compilare:**
@@ -883,7 +933,7 @@ Le librerie Rust usate sono:
 - `gtk4` (con `pangocairo`) per l'interfaccia;
 - `regex` per la ricerca;
 - `similar` per il confronto;
-- `serde_json` per i messaggi dei language server;
+- `serde_json` per i messaggi dei language server e degli agenti;
 - `libc` per le chiamate di sistema.
 
 ---
@@ -928,23 +978,44 @@ cargo build --profile perf     # ottimizzato, con gli strumenti di debug attivi
 | File | Contenuto |
 |---|---|
 | `main.rs` | avvio, istanza singola, apertura dei file |
-| `window.rs` | finestra principale: menu, schede, ricerca, preferenze, sessione, pannelli |
+| `window.rs` | finestra principale: stato, azioni, documenti, schede e pannelli |
+| `window/menus.rs` | barra dei menu, barra di stato, file recenti |
+| `window/searchbar.rs` | barra di ricerca e sostituzione |
+| `window/editing.rs` | commenti, duplica/elimina/unisci righe, formattazione |
+| `window/diffview.rs` | confronto tra le due schede visibili |
+| `window/prefs.rs` | preferenze, caratteri, colori |
+| `window/session.rs` | sessione, salvataggio automatico, cache delle schede non salvate |
+| `window/term.rs` | pannello del terminale |
+| `window/workdir.rs` | cartella di lavoro e pannello file |
+| `window/bookmarks.rs` | preferiti |
+| `window/external.rs` | file modificati da altri programmi |
 | `window/gitui.rs` | interfaccia git: stato, comandi, finestre di commit, rami e modifiche |
+| `window/history.rs` | cronologia git di un file |
+| `window/merge.rs` | confronto e unione a tre colonne, risoluzione dei conflitti |
+| `window/credentials.rs` | credenziali git e chiavi SSH, domande di git e ssh |
 | `window/quickopen.rs` | ricerca veloce dei file (`Ctrl+P`) |
 | `window/textsearch.rs` | ricerca nei file con anteprima |
+| `window/inspect.rs` | vai alla definizione, trova utilizzi, completamento |
+| `window/lspui.rs` | language server della cartella di lavoro: avvio, sincronizzazione, richieste |
+| `window/problems.rs` | verifica del file con i language server, pannello dei problemi |
+| `window/debug.rs` | script di prova (`MACACO_DEBUG`, solo build di debug) |
 | `doc.rs` | documento: buffer, colorazione incrementale, margine, indentazione |
+| `fold.rs` | blocchi piegabili |
 | `lexer.rs`, `lang.rs` | lexer e definizioni dei linguaggi |
 | `format.rs` | formattatori esterni e interni, commenti |
-| `search.rs`, `diff.rs` | ricerca con espressioni regolari, confronto tra testi |
+| `search.rs`, `diff.rs` | ricerca con espressioni regolari, confronto tra testi e unione a tre vie |
 | `encoding.rs` | rilevamento e conversione delle codifiche |
 | `sidebar.rs` | pannello file |
 | `git.rs` | esecuzione di git e lettura dello stato |
+| `askpass.rs` | risposte alle domande di git e ssh dall'editor |
+| `proc.rs` | programmi esterni eseguiti senza bloccare l'interfaccia (con tempo massimo) |
+| `ui.rs` | parti di interfaccia comuni: finestre di dialogo, conferme, menu di file |
 | `finder.rs` | elenco dei file, corrispondenza fuzzy, indice, ricerca nei file |
 | `terminal.rs` | terminale (VTE caricata dinamicamente) |
 | `symbols.rs` | definizioni estratte con i lexer, indice dei simboli del progetto |
 | `lsp.rs` | client del Language Server Protocol |
-| `window/inspect.rs` | vai alla definizione, trova utilizzi, completamento |
-| `window/lspui.rs` | language server della cartella di lavoro: avvio, sincronizzazione, richieste |
+| `acp.rs` | client dell'Agent Client Protocol (Claude Code, Codex) |
+| `window/agentui.rs` | pannello dell'assistente: conversazione, permessi, diff, accesso ai file |
 | `config.rs` | preferenze, sessione, cache, file in `~/.macaco/` |
 
 **Script di prova:** nelle build di debug la variabile `MACACO_DEBUG` esegue

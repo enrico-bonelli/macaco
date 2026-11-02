@@ -489,7 +489,11 @@ impl Sidebar {
             };
             is_dir(b)
                 .cmp(&is_dir(a))
-                .then_with(|| a.display_name().to_lowercase().cmp(&b.display_name().to_lowercase()))
+                // Without lowercase copies: this runs for every comparison.
+                .then_with(|| {
+                    let (a, b) = (a.display_name(), b.display_name());
+                    a.chars().flat_map(char::to_lowercase).cmp(b.chars().flat_map(char::to_lowercase))
+                })
                 .into()
         });
         gtk::SortListModel::new(Some(filtered), Some(sorter)).upcast()
@@ -695,18 +699,7 @@ impl Sidebar {
                 d.close();
             }
         });
-        let esc = gtk::EventControllerKey::new();
-        let d = dlg.downgrade();
-        esc.connect_key_pressed(move |_, key, _, _| {
-            if key == gdk::Key::Escape {
-                if let Some(d) = d.upgrade() {
-                    d.close();
-                }
-                return glib::Propagation::Stop;
-            }
-            glib::Propagation::Proceed
-        });
-        dlg.add_controller(esc);
+        crate::ui::close_on_escape(&dlg);
         dlg.present();
         entry.grab_focus();
         entry.select_region(0, select as i32);
@@ -788,17 +781,10 @@ impl Sidebar {
     fn trash(self: &Rc<Self>) {
         let Some(path) = self.context.borrow().clone() else { return };
         let name = path.file_name().map_or_else(|| path.to_string_lossy().into_owned(), |n| n.to_string_lossy().into_owned());
-        let dialog = gtk::AlertDialog::builder()
-            .modal(true)
-            .message(format!("Spostare «{name}» nel cestino?"))
-            .buttons(["Annulla", "Sposta nel cestino"])
-            .cancel_button(0)
-            .default_button(1)
-            .build();
         let w = Rc::downgrade(self);
         let parent = self.widget.root().and_downcast::<gtk::Window>();
-        dialog.choose(parent.as_ref(), None::<&gio::Cancellable>, move |res| {
-            let (Ok(1), Some(s)) = (res, w.upgrade()) else { return };
+        crate::ui::confirm(parent.as_ref(), &format!("Spostare «{name}» nel cestino?"), "", "Sposta nel cestino", true, move |ok| {
+            let (true, Some(s)) = (ok, w.upgrade()) else { return };
             if let Err(e) = gio::File::for_path(&path).trash(None::<&gio::Cancellable>) {
                 (s.handlers.error)("Impossibile spostare nel cestino", &format!("{}: {e}", path.display()));
             }

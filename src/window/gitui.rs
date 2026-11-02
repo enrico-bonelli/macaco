@@ -7,7 +7,7 @@ use crate::doc;
 use crate::git::{self, Mark, Status};
 use gtk::prelude::*;
 use gtk::{gdk, gio, glib};
-use std::ffi::{OsStr, OsString};
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::Duration;
@@ -61,45 +61,11 @@ fn dir_of(path: &Path) -> PathBuf {
     if path.is_dir() { path.to_path_buf() } else { path.parent().map_or_else(|| PathBuf::from("/"), Path::to_path_buf) }
 }
 
-fn dialog_window(parent: &impl IsA<gtk::Window>, title: &str) -> gtk::Window {
-    let w = gtk::Window::builder().title(title).transient_for(parent).modal(true).default_width(520).build();
-    let esc = gtk::EventControllerKey::new();
-    let wk = w.downgrade();
-    esc.connect_key_pressed(move |_, key, _, _| {
-        if key == gdk::Key::Escape {
-            if let Some(w) = wk.upgrade() {
-                w.close();
-            }
-            return glib::Propagation::Stop;
-        }
-        glib::Propagation::Proceed
-    });
-    w.add_controller(esc);
-    w
-}
 
-fn vbox() -> gtk::Box {
-    gtk::Box::builder()
-        .orientation(gtk::Orientation::Vertical)
-        .spacing(10)
-        .margin_top(14)
-        .margin_bottom(14)
-        .margin_start(14)
-        .margin_end(14)
-        .build()
-}
 
 impl Editor {
     pub(super) fn setup_git_actions(self: &Rc<Self>) {
-        let add = |name: &str, accels: &[&str], f: fn(&Rc<Editor>)| {
-            let a = gio::SimpleAction::new(name, None);
-            let ed = self.clone();
-            a.connect_activate(move |_, _| f(&ed));
-            self.win.add_action(&a);
-            if !accels.is_empty() {
-                self.app.set_accels_for_action(&format!("win.{name}"), accels);
-            }
-        };
+        let add = |name: &str, accels: &[&str], f: fn(&Rc<Editor>)| self.add_action(name, accels, f);
         add("git-refresh", &[], |ed| {
             ed.git_refresh();
             ed.sidebar_refresh();
@@ -178,11 +144,11 @@ impl Editor {
 
     fn enable_git_actions(&self, in_repo: bool) {
         for name in REPO_ACTIONS {
-            if let Some(a) = self.win.lookup_action(name).and_downcast::<gio::SimpleAction>() {
+            if let Some(a) = self.action(name) {
                 a.set_enabled(in_repo);
             }
         }
-        if let Some(a) = self.win.lookup_action("git-init").and_downcast::<gio::SimpleAction>() {
+        if let Some(a) = self.action("git-init") {
             a.set_enabled(!in_repo);
         }
     }
@@ -210,6 +176,19 @@ impl Editor {
         self.git.borrow().clone()
     }
 
+    /// Another tab became active: without a working folder the shown
+    /// repository follows the document, so it may have changed.
+    pub(super) fn git_tab_switched(self: &Rc<Self>) {
+        if self.workdir.borrow().is_some() {
+            return;
+        }
+        let Some(base) = self.git_base() else { return };
+        let same_repo = self.git.borrow().as_ref().is_some_and(|s| base.starts_with(&s.root));
+        if !same_repo {
+            self.git_refresh();
+        }
+    }
+
     /// Reads the status again shortly (several requests are merged).
     pub(super) fn git_refresh(self: &Rc<Self>) {
         if self.git_refresh_pending.replace(true) {
@@ -235,7 +214,15 @@ impl Editor {
         let ed = self.clone();
         git::status(&base, move |st| {
             ed.git_refreshing.set(false);
-            ed.set_git_status(st.map(Rc::new));
+            // Nothing changed (the usual case on focus or save): the file
+            // panel and the change lists stay as they are.
+            let same = match (&st, ed.git.borrow().as_ref()) {
+                (Some(new), Some(old)) => new.root == old.root && new.digest == old.digest,
+                _ => false,
+            };
+            if !same {
+                ed.set_git_status(st.map(Rc::new));
+            }
             if ed.git_refresh_again.replace(false) {
                 ed.git_refresh();
             }
@@ -318,23 +305,49 @@ impl Editor {
         reload: bool,
         then: impl FnOnce(&Rc<Editor>, bool) + 'static,
     ) {
+        self.git_op_input(dir, args, None, what, reload, then);
+    }
+
+    /// `git args` on the files `paths`, given on the standard input: a
+    /// command line with tens of thousands of paths would be too long.
+    fn git_op_paths(
+        self: &Rc<Self>,
+        dir: &Path,
+        mut args: Vec<OsString>,
+        paths: Vec<OsString>,
+        what: &str,
+        then: impl FnOnce(&Rc<Editor>, bool) + 'static,
+    ) {
+        args.extend(os(&["--pathspec-from-file=-", "--pathspec-file-nul"]));
+        let mut input = Vec::new();
+        for p in paths {
+            input.extend_from_slice(p.as_encoded_bytes());
+            input.push(0);
+        }
+        self.git_op_input(dir, args, Some(input), what, false, then);
+    }
+
+    fn git_op_input(
+        self: &Rc<Self>,
+        dir: &Path,
+        args: Vec<OsString>,
+        input: Option<Vec<u8>>,
+        what: &str,
+        reload: bool,
+        then: impl FnOnce(&Rc<Editor>, bool) + 'static,
+    ) {
         if self.git_busy.replace(true) {
             self.message("Un comando git è già in esecuzione");
             return;
         }
         self.message(&format!("git {what}…"));
-        let ed = self.clone();
         let what = what.to_string();
-        let dir2 = dir.to_path_buf();
-        // Network commands: questions of git and ssh go to a dialog.
-        self.prepare_git(dir, args, move |args, env| {
-        let argv: Vec<&OsStr> = args.iter().map(|a| a.as_os_str()).collect();
-        git::run_with(&dir2, &argv, &env, None, move |out| {
+        self.run_git(dir, args, input, move |ed, out, cancelled| {
             ed.git_busy.set(false);
             if out.ok {
                 let s = out.summary();
                 ed.message(&if s.is_empty() { format!("git {what}: fatto") } else { format!("git {what}: {s}") });
-            } else if ed.askpass_was_cancelled() {
+            } else if cancelled {
                 ed.message(&format!("git {what}: annullato"));
             } else {
                 let mut detail = tail(&out.text(), 25);
@@ -351,8 +364,7 @@ impl Editor {
                 ed.reload_changed_docs();
             }
             ed.git_refresh();
-            then(&ed, out.ok);
-        });
+            then(ed, out.ok);
         });
     }
 
@@ -391,17 +403,10 @@ impl Editor {
             "unstage" => self.git_op(&dir, vec!["restore".into(), "--staged".into(), "--".into(), p], "restore --staged", false),
             "restore" => {
                 let name = path.file_name().map_or_else(|| path.display().to_string(), |n| n.to_string_lossy().into_owned());
-                let dialog = gtk::AlertDialog::builder()
-                    .modal(true)
-                    .message(format!("Annullare le modifiche a «{name}»?"))
-                    .detail("Il contenuto tornerà quello dell'ultimo commit (o dell'area di stage). Le modifiche andranno perse.")
-                    .buttons(["Annulla", "Scarta le modifiche"])
-                    .cancel_button(0)
-                    .default_button(0)
-                    .build();
                 let ed = self.clone();
-                dialog.choose(Some(&self.win), None::<&gio::Cancellable>, move |res| {
-                    if res == Ok(1) {
+                let detail = "Il contenuto tornerà quello dell'ultimo commit (o dell'area di stage). Le modifiche andranno perse.";
+                crate::ui::confirm(Some(self.win.upcast_ref()), &format!("Annullare le modifiche a «{name}»?"), detail, "Scarta le modifiche", false, move |ok| {
+                    if ok {
                         ed.git_op(&dir, vec!["restore".into(), "--".into(), p], "restore", true);
                     }
                 });
@@ -497,14 +502,10 @@ impl Editor {
         } else {
             choices.iter().position(|r| r == "origin").unwrap_or(0)
         };
-        let parent = gtk::Window::list_toplevels()
-            .into_iter()
-            .filter_map(|w| w.downcast::<gtk::Window>().ok())
-            .find(|w| w.is_active())
-            .unwrap_or_else(|| self.win.clone().upcast());
+        let parent = crate::ui::active_window().unwrap_or_else(|| self.win.clone().upcast());
         let title = if pull { "Pull: da quale ramo remoto?" } else { "Push: su quale ramo remoto?" };
-        let win = dialog_window(&parent, title);
-        let b = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(10).margin_top(14).margin_bottom(14).margin_start(14).margin_end(14).build();
+        let win = crate::ui::dialog_window(&parent, title, 520);
+        let b = crate::ui::dialog_box(10);
         let text = if pull {
             format!("Il ramo locale «{branch}» non è collegato a nessun ramo del server. Scegli quello da cui scaricare e unire le modifiche.")
         } else {
@@ -595,6 +596,10 @@ impl Editor {
             if !d.is_loaded() {
                 continue;
             }
+            // Files git did not touch keep their date and size.
+            if !d.maybe_changed_on_disk() {
+                continue;
+            }
             let Some(path) = d.path.borrow().clone() else { continue };
             let Ok((text, enc, eol)) = doc::read_file(&path, Some(d.encoding.get())) else { continue };
             if text == d.text() {
@@ -622,20 +627,28 @@ impl Editor {
 
     fn commit_dialog(self: &Rc<Self>) {
         let Some(st) = self.git_status() else { return };
-        let win = dialog_window(&self.win, &format!("Commit su {}", st.branch.as_deref().unwrap_or("HEAD")));
-        let b = vbox();
+        let win = crate::ui::dialog_window(&self.win, &format!("Commit su {}", st.branch.as_deref().unwrap_or("HEAD")), 520);
+        let b = crate::ui::dialog_box(10);
 
         // Changed files, staged first.
+        // Only the first ones are listed.
+        const SHOWN: usize = 200;
+        use std::fmt::Write as _;
         let mut files: Vec<(&PathBuf, &git::Entry)> = st.files.iter().collect();
-        files.sort_by_key(|(p, e)| (e.mark() != Mark::Staged, (*p).clone()));
-        let mut list = String::new();
-        for (p, e) in files.iter().take(200) {
-            let rel = p.strip_prefix(&st.root).unwrap_or(p);
-            list.push_str(&format!("{}{}  {}\n", e.x as char, e.y as char, rel.display()));
+        let order = |a: &(&PathBuf, &git::Entry), b: &(&PathBuf, &git::Entry)| (a.1.mark() != Mark::Staged, a.0).cmp(&(b.1.mark() != Mark::Staged, b.0));
+        if files.len() > SHOWN {
+            files.select_nth_unstable_by(SHOWN, order);
+            files.truncate(SHOWN);
         }
-        for d in &st.untracked_dirs {
+        files.sort_unstable_by(order);
+        let mut list = String::new();
+        for (p, e) in &files {
+            let rel = p.strip_prefix(&st.root).unwrap_or(p);
+            let _ = writeln!(list, "{}{}  {}", e.x as char, e.y as char, rel.display());
+        }
+        for d in st.untracked_dirs.iter().take(SHOWN.saturating_sub(files.len())) {
             let rel = d.strip_prefix(&st.root).unwrap_or(d);
-            list.push_str(&format!("??  {}/\n", rel.display()));
+            let _ = writeln!(list, "??  {}/", rel.display());
         }
         let staged = st.staged();
         let modified = st.count(Mark::Modified);
@@ -779,9 +792,9 @@ impl Editor {
     }
 
     fn show_branch_dialog(self: &Rc<Self>, st: &Status, branches: Vec<(String, bool, bool)>) {
-        let win = dialog_window(&self.win, "Rami e merge");
+        let win = crate::ui::dialog_window(&self.win, "Rami e merge", 520);
         win.set_default_height(460);
-        let b = vbox();
+        let b = crate::ui::dialog_box(10);
         let current = gtk::Label::new(Some(&format!("Ramo corrente: {}", st.branch_label())));
         current.set_xalign(0.0);
         current.add_css_class("heading");
@@ -978,9 +991,9 @@ impl Editor {
 }
 
 /// Relative path shown by a row (the text of its name label).
-fn row_rel(row: &gtk::Widget) -> Option<String> {
-    let name = row.first_child()?.next_sibling()?.next_sibling()?;
-    Some(name.downcast_ref::<gtk::Label>()?.text().to_string())
+/// Relative path of the file shown by a row of the list.
+fn item_rel(li: &glib::WeakRef<gtk::ListItem>) -> Option<String> {
+    li.upgrade()?.item().and_downcast::<gtk::StringObject>().map(|s| s.string().to_string())
 }
 
 impl Changes {
@@ -996,7 +1009,7 @@ impl Changes {
             .default_width(640)
             .default_height(640)
             .build();
-        let b = vbox();
+        let b = crate::ui::dialog_box(10);
         let summary = gtk::Label::new(Some("Lettura dello stato…"));
         summary.set_xalign(0.0);
         summary.set_wrap(true);
@@ -1145,21 +1158,11 @@ impl Changes {
                 && let Some(ed) = c.ed.upgrade()
             {
                 ed.changes.borrow_mut().retain(|x| !Rc::ptr_eq(x, &c));
+                ed.release_memory();
             }
             glib::Propagation::Proceed
         });
-        let esc = gtk::EventControllerKey::new();
-        let w = c.win.downgrade();
-        esc.connect_key_pressed(move |_, key, _, _| {
-            if key == gdk::Key::Escape {
-                if let Some(w) = w.upgrade() {
-                    w.close();
-                }
-                return glib::Propagation::Stop;
-            }
-            glib::Propagation::Proceed
-        });
-        c.win.add_controller(esc);
+        crate::ui::close_on_escape(&c.win);
 
         let w = Rc::downgrade(&c);
         c.view.connect_activate(move |_, pos| {
@@ -1282,12 +1285,13 @@ impl Changes {
             li.set_child(Some(&row));
 
             let w1 = w.clone();
+            let li1 = li.downgrade();
             check.connect_toggled(move |cb| {
                 let Some(c) = w1.upgrade() else { return };
                 if c.binding.get() {
                     return;
                 }
-                let Some(rel) = cb.parent().and_then(|r| row_rel(&r)) else { return };
+                let Some(rel) = item_rel(&li1) else { return };
                 if cb.is_active() {
                     c.unchecked.borrow_mut().remove(&rel);
                 } else {
@@ -1296,8 +1300,9 @@ impl Changes {
                 c.update_count();
             });
             let w2 = w.clone();
+            let li2 = li.downgrade();
             more.connect_clicked(move |b| {
-                if let (Some(c), Some(rel)) = (w2.upgrade(), b.parent().and_then(|r| row_rel(&r))) {
+                if let (Some(c), Some(rel)) = (w2.upgrade(), item_rel(&li2)) {
                     let (x, y) = (b.width() as f64 / 2.0, b.height() as f64);
                     c.popup_menu(&rel, b.upcast_ref(), x, y);
                 }
@@ -1305,9 +1310,10 @@ impl Changes {
             let g = gtk::GestureClick::new();
             g.set_button(gdk::BUTTON_SECONDARY);
             let w3 = w.clone();
+            let li3 = li.downgrade();
             g.connect_pressed(move |g, _, x, y| {
                 if let (Some(c), Some(row)) = (w3.upgrade(), g.widget())
-                    && let Some(rel) = row_rel(&row)
+                    && let Some(rel) = item_rel(&li3)
                 {
                     c.popup_menu(&rel, &row, x, y);
                 }
@@ -1377,6 +1383,7 @@ impl Changes {
                 *c.excluded.borrow_mut() = new_root.as_deref().map(crate::config::load_git_excluded).unwrap_or_default();
             }
             *c.status.borrow_mut() = st;
+            c.rebuild_items();
             c.render();
             if c.reload_again.replace(false) {
                 c.reload();
@@ -1384,11 +1391,29 @@ impl Changes {
         });
     }
 
-    /// Rebuilds the list from the last status.
-    fn render(self: &Rc<Self>) {
+    /// Rebuilds the files from the last status and the exclusions.
+    fn rebuild_items(&self) {
         let st = self.status.borrow();
         let Some(st) = st.as_ref() else {
             self.items.borrow_mut().clear();
+            return;
+        };
+        let excluded = self.excluded.borrow();
+        *self.items.borrow_mut() = st
+            .files
+            .iter()
+            .map(|(path, e)| {
+                let rel = path.strip_prefix(&st.root).unwrap_or(path).to_string_lossy().into_owned();
+                let excluded = excluded.rule_for(&rel).is_some();
+                (rel, ChangeItem { path: path.clone(), entry: *e, excluded })
+            })
+            .collect();
+    }
+
+    /// Shows the files that pass the filter (after `rebuild_items`).
+    fn render(self: &Rc<Self>) {
+        let st = self.status.borrow();
+        let Some(st) = st.as_ref() else {
             self.store.splice(0, self.store.n_items(), &[]);
             self.summary.set_text(&format!("{} non è in un repository git", self.folder.display()));
             for b in &self.actions {
@@ -1399,31 +1424,21 @@ impl Changes {
         for b in &self.actions {
             b.set_sensitive(true);
         }
-        let excluded = self.excluded.borrow();
-        let items: std::collections::HashMap<String, ChangeItem> = st
-            .files
-            .iter()
-            .map(|(path, e)| {
-                let rel = path.strip_prefix(&st.root).unwrap_or(path).to_string_lossy().into_owned();
-                let excluded = excluded.rule_for(&rel).is_some();
-                (rel, ChangeItem { path: path.clone(), entry: *e, excluded })
-            })
-            .collect();
         let show_excluded = self.show_excluded.is_active();
-        let filter = self.filter.text();
-        let mut shown: Vec<String> = items
-            .iter()
-            .filter(|(r, it)| (show_excluded || !it.excluded) && git::filter_matches(r, &filter))
-            .map(|(r, _)| r.clone())
-            .collect();
-        shown.sort();
-        let changed = items.values().filter(|it| !it.excluded).count();
-        let hidden = items.len() - changed;
-        // Items first: binding the new rows reads them.
-        *self.items.borrow_mut() = items;
+        let filter = git::Filter::new(&self.filter.text());
+        // Binding the new rows reads the items: no borrow may be held by
+        // `splice`.
+        let (shown, changed, total) = {
+            let items = self.items.borrow();
+            let mut shown: Vec<String> =
+                items.iter().filter(|(r, it)| (show_excluded || !it.excluded) && filter.matches(r)).map(|(r, _)| r.clone()).collect();
+            shown.sort_unstable();
+            (shown, items.values().filter(|it| !it.excluded).count(), items.len())
+        };
+        let hidden = total - changed;
         let refs: Vec<&str> = shown.iter().map(String::as_str).collect();
         self.store.splice(0, self.store.n_items(), &refs);
-        self.empty.set_label(if filter.trim().is_empty() { "Nessuna modifica da aggiungere" } else { "Nessun file corrisponde al filtro" });
+        self.empty.set_label(if filter.is_empty() { "Nessuna modifica da aggiungere" } else { "Nessun file corrisponde al filtro" });
         self.empty.set_visible(shown.is_empty());
         self.update_count();
 
@@ -1446,7 +1461,10 @@ impl Changes {
     }
 
     fn update_count(&self) {
-        let selected = self.selected().len();
+        let selected = {
+            let unchecked = self.unchecked.borrow();
+            self.items.borrow().iter().filter(|(rel, it)| !it.excluded && !unchecked.contains(*rel)).count()
+        };
         let shown = self.store.n_items();
         let text = if self.filter.text().trim().is_empty() {
             format!("{selected} selezionati")
@@ -1482,6 +1500,7 @@ impl Changes {
             }
         }
         ed.message(&format!("{} file nascosti dall'elenco (ripristinabili da «Mostra esclusi»)", rels.len()));
+        self.rebuild_items();
         self.render();
     }
 
@@ -1544,6 +1563,7 @@ impl Changes {
         let w = Rc::downgrade(self);
         glib::idle_add_local_once(move || {
             if let Some(c) = w.upgrade() {
+                c.rebuild_items();
                 c.render();
             }
         });
@@ -1572,9 +1592,7 @@ impl Changes {
             ed.message("Nessun file selezionato");
             return;
         }
-        let mut args = os(&["add", "-A", "--"]);
-        args.extend(files);
-        ed.save_all_then(move |ed| ed.git_op_then(&root, args, "add", false, move |_, ok| then(ok)));
+        ed.save_all_then(move |ed| ed.git_op_paths(&root, os(&["add", "-A"]), files, "add", move |_, ok| then(ok)));
     }
 
     /// Commit of the selected files only (and push).
@@ -1596,12 +1614,8 @@ impl Changes {
             let Some(ed) = c.ed.upgrade() else { return };
             let mut args = os(&["commit", "-m"]);
             args.push(text.into());
-            if !merging {
-                args.push("--".into());
-                args.extend(files);
-            }
             let w = Rc::downgrade(&c);
-            ed.git_op_then(&st.root, args, "commit", false, move |ed, ok| {
+            let done = move |ed: &Rc<Editor>, ok: bool| {
                 if !ok {
                     return;
                 }
@@ -1611,7 +1625,12 @@ impl Changes {
                 if push {
                     ed.git_push();
                 }
-            });
+            };
+            if merging {
+                ed.git_op_then(&st.root, args, "commit", false, done);
+            } else {
+                ed.git_op_paths(&st.root, args, files, "commit", done);
+            }
         });
     }
 }

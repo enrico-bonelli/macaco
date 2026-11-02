@@ -55,10 +55,10 @@ pub fn supported(lang: Lang) -> bool {
 /// Foldable blocks of `text`, sorted by header; when several blocks start
 /// on the same line only the largest is kept.
 pub fn ranges(lang: Lang, text: &str) -> Vec<Range> {
-    let lines: Vec<&str> = text.split('\n').collect();
+    let lines = text.split('\n');
     let mut out = match style(lang) {
-        Some(Style::Brackets) => brackets(lang, &lines),
-        Some(Style::Indent) => indent(lang, &lines),
+        Some(Style::Brackets) => brackets(lang, lines),
+        Some(Style::Indent) => indent(lang, lines),
         None => Vec::new(),
     };
     out.sort_by(|a, b| a.header.cmp(&b.header).then(b.last.cmp(&a.last)));
@@ -70,13 +70,16 @@ fn first_non_blank(line: &str) -> Option<usize> {
     line.bytes().position(|c| !c.is_ascii_whitespace())
 }
 
-fn brackets(lang: Lang, lines: &[&str]) -> Vec<Range> {
+fn brackets<'a>(lang: Lang, lines: impl Iterator<Item = &'a str>) -> Vec<Range> {
     let mut out = Vec::new();
     let mut state = lexer::initial_state(lang);
     let mut toks = Vec::new();
-    // (opening bracket, line, whether it is the first thing on its line)
+    // (opening bracket, line, whether it is alone on its line below a
+    // signature: Allman style, where the block belongs to the line above)
     let mut stack: Vec<(u8, usize, bool)> = Vec::new();
-    for (n, line) in lines.iter().enumerate() {
+    // Whether the previous line can be the header of a lone `{`.
+    let mut prev_signature = false;
+    for (n, line) in lines.enumerate() {
         state = lexer::lex_line(lang, state, line, &mut toks);
         let first = first_non_blank(line);
         let mut ti = 0;
@@ -95,27 +98,21 @@ fn brackets(lang: Lang, lines: &[&str]) -> Vec<Range> {
                 continue;
             }
             let Some(open) = open else {
-                stack.push((c, n, first == Some(i)));
+                stack.push((c, n, c == b'{' && first == Some(i) && prev_signature));
                 continue;
             };
             let Some(pos) = stack.iter().rposition(|e| e.0 == open) else { continue };
-            let (_, a, alone) = stack[pos];
+            let (_, a, allman) = stack[pos];
             stack.truncate(pos);
             // A closing bracket that starts its line stays visible.
             let last = if first == Some(i) { n.saturating_sub(1) } else { n };
-            // Allman style: a lone `{` belongs to the line above.
-            let header = if open == b'{' && alone && a > 0 && {
-                let prev = lines[a - 1].trim_end();
-                !prev.trim_start().is_empty() && !prev.ends_with([';', '{', '}'])
-            } {
-                a - 1
-            } else {
-                a
-            };
+            let header = if allman { a - 1 } else { a };
             if last > a {
                 out.push(Range { header: header as u32, last: last as u32, block: open == b'{' });
             }
         }
+        let t = line.trim();
+        prev_signature = !t.is_empty() && !t.ends_with([';', '{', '}']);
     }
     out
 }
@@ -132,7 +129,7 @@ fn indent_width(line: &str) -> usize {
     w
 }
 
-fn indent(lang: Lang, lines: &[&str]) -> Vec<Range> {
+fn indent<'a>(lang: Lang, lines: impl Iterator<Item = &'a str>) -> Vec<Range> {
     let mut out = Vec::new();
     let mut state = lexer::initial_state(lang);
     let mut toks = Vec::new();
@@ -151,7 +148,7 @@ fn indent(lang: Lang, lines: &[&str]) -> Vec<Range> {
             }
         }
     };
-    for (n, line) in lines.iter().enumerate() {
+    for (n, line) in lines.enumerate() {
         // Lines inside a multi-line string do not count.
         let inside = lang == Lang::Python && state != State::Normal;
         if lang == Lang::Python {

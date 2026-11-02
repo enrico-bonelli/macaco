@@ -541,28 +541,19 @@ impl Lang {
     /// Language named by the info string of a Markdown code fence.
     pub fn from_fence(info: &str) -> Lang {
         let name = info.split(|c: char| c.is_whitespace() || c == ',' || c == '{').next().unwrap_or("");
-        match name.trim_start_matches('.').to_ascii_lowercase().as_str() {
-            "c" | "h" => Lang::C,
-            "cpp" | "c++" | "cc" | "cxx" | "hpp" => Lang::Cpp,
-            "rust" | "rs" => Lang::Rust,
-            "php" => Lang::Php,
-            "bash" | "sh" | "shell" | "zsh" | "console" | "shellsession" => Lang::Bash,
-            "python" | "py" | "python3" => Lang::Python,
-            "js" | "javascript" | "jsx" | "json" | "jsonc" | "node" => Lang::JavaScript,
-            "ts" | "typescript" => Lang::TypeScript,
-            "tsx" => Lang::Tsx,
-            "cs" | "csharp" | "c#" => Lang::CSharp,
-            "perl" | "pl" | "pm" => Lang::Perl,
-            "yaml" | "yml" => Lang::Yaml,
-            "html" | "xml" | "svg" | "xhtml" => Lang::Html,
-            "css" | "scss" | "less" => Lang::Css,
-            "java" => Lang::Java,
-            "go" | "golang" => Lang::Go,
-            "md" | "markdown" => Lang::Markdown,
-            "sql" | "pgsql" | "postgresql" | "postgres" | "psql" | "mysql" | "sqlite" | "plsql" | "plpgsql"
-            | "tsql" | "mssql" | "mariadb" => Lang::Sql,
-            "vue" => Lang::Vue,
-            _ => Lang::Plain,
+        let name = name.trim_start_matches('.').to_ascii_lowercase();
+        // Names used in fences besides the file extensions.
+        match name.as_str() {
+            "rust" => Lang::Rust,
+            "shell" | "console" | "shellsession" => Lang::Bash,
+            "python" | "python3" => Lang::Python,
+            "javascript" | "node" => Lang::JavaScript,
+            "typescript" => Lang::TypeScript,
+            "csharp" | "c#" => Lang::CSharp,
+            "perl" => Lang::Perl,
+            "golang" => Lang::Go,
+            "postgresql" | "postgres" | "sqlite" | "plsql" | "plpgsql" | "tsql" | "mssql" | "mariadb" => Lang::Sql,
+            ext => from_ext(ext),
         }
     }
 
@@ -577,7 +568,8 @@ impl Lang {
     }
 }
 
-/// Detect the language from the file name and, failing that, the content.
+/// Detect the language from the file name and, failing that, the content
+/// (only its first line is read: the whole text can be passed).
 pub fn detect(path: Option<&Path>, head: &str) -> Lang {
     if let Some(p) = path {
         let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
@@ -591,35 +583,40 @@ pub fn detect(path: Option<&Path>, head: &str) -> Lang {
             _ => {}
         }
         if let Some(ext) = lower.rsplit_once('.').map(|(_, e)| e) {
-            let l = match ext {
-                "c" | "h" => Lang::C,
-                "cpp" | "cc" | "cxx" | "c++" | "hpp" | "hh" | "hxx" | "h++" | "ino" | "tpp"
-                | "ipp" => Lang::Cpp,
-                "rs" => Lang::Rust,
-                "php" | "phtml" | "php3" | "php4" | "php5" | "php7" | "php8" | "phps" => Lang::Php,
-                "sh" | "bash" | "zsh" | "ksh" | "ebuild" | "install" => Lang::Bash,
-                "py" | "pyw" | "pyi" => Lang::Python,
-                "js" | "mjs" | "cjs" | "jsx" | "json" | "jsonc" => Lang::JavaScript,
-                "ts" | "mts" | "cts" => Lang::TypeScript,
-                "tsx" => Lang::Tsx,
-                "cs" | "csx" => Lang::CSharp,
-                "pl" | "pm" | "t" | "psgi" | "pod" => Lang::Perl,
-                "yml" | "yaml" => Lang::Yaml,
-                "html" | "htm" | "xhtml" | "xml" | "svg" => Lang::Html,
-                "vue" => Lang::Vue,
-                "css" | "scss" | "less" => Lang::Css,
-                "java" => Lang::Java,
-                "go" => Lang::Go,
-                "md" | "markdown" | "mdown" | "mkd" | "mkdn" | "mdx" => Lang::Markdown,
-                "sql" | "pgsql" | "psql" | "mysql" | "ddl" | "dml" => Lang::Sql,
-                _ => Lang::Plain,
-            };
+            let l = from_ext(ext);
             if l != Lang::Plain {
                 return l;
             }
         }
     }
     detect_content(head)
+}
+
+/// Language of a (lower case) file extension.
+fn from_ext(ext: &str) -> Lang {
+    match ext {
+        "c" | "h" => Lang::C,
+        "cpp" | "cc" | "cxx" | "c++" | "hpp" | "hh" | "hxx" | "h++" | "ino" | "tpp"
+        | "ipp" => Lang::Cpp,
+        "rs" => Lang::Rust,
+        "php" | "phtml" | "php3" | "php4" | "php5" | "php7" | "php8" | "phps" => Lang::Php,
+        "sh" | "bash" | "zsh" | "ksh" | "ebuild" | "install" => Lang::Bash,
+        "py" | "pyw" | "pyi" => Lang::Python,
+        "js" | "mjs" | "cjs" | "jsx" | "json" | "jsonc" => Lang::JavaScript,
+        "ts" | "mts" | "cts" => Lang::TypeScript,
+        "tsx" => Lang::Tsx,
+        "cs" | "csx" => Lang::CSharp,
+        "pl" | "pm" | "t" | "psgi" | "pod" => Lang::Perl,
+        "yml" | "yaml" => Lang::Yaml,
+        "html" | "htm" | "xhtml" | "xml" | "svg" => Lang::Html,
+        "vue" => Lang::Vue,
+        "css" | "scss" | "less" => Lang::Css,
+        "java" => Lang::Java,
+        "go" => Lang::Go,
+        "md" | "markdown" | "mdown" | "mkd" | "mkdn" | "mdx" => Lang::Markdown,
+        "sql" | "pgsql" | "psql" | "mysql" | "ddl" | "dml" => Lang::Sql,
+        _ => Lang::Plain,
+    }
 }
 
 fn detect_content(head: &str) -> Lang {
@@ -652,9 +649,27 @@ fn detect_content(head: &str) -> Lang {
     }
 }
 
+/// Whether the attributes of a `<script …>` tag ask for TypeScript
+/// (`lang="ts"`, `lang='tsx'`…).
+pub fn script_is_ts(attrs: &[u8]) -> bool {
+    [&b"lang=\"ts\""[..], b"lang='ts'", b"lang=\"tsx\"", b"lang='tsx'"]
+        .iter()
+        .any(|pat| attrs.windows(pat.len()).any(|w| w.eq_ignore_ascii_case(pat)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn all_in_enum_order() {
+        // The lexer indexes its tables with `lang as usize`.
+        for (i, l) in ALL.iter().enumerate() {
+            assert_eq!(*l as usize, i);
+        }
+        assert!(script_is_ts(b" setup lang=\"TS\""));
+        assert!(!script_is_ts(b" setup"));
+    }
 
     #[test]
     fn detection() {

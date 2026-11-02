@@ -157,7 +157,7 @@ fn encode_char(enc: Encoding, c: char) -> Option<u8> {
 }
 
 fn decode_utf16(bytes: &[u8], le: bool) -> String {
-    let units = bytes.chunks_exact(2).map(|p| {
+    let units = bytes.as_chunks::<2>().0.iter().map(|p| {
         if le {
             u16::from_le_bytes([p[0], p[1]])
         } else {
@@ -178,7 +178,7 @@ fn sniff_utf16(bytes: &[u8]) -> Option<Encoding> {
     }
     let pairs = sample.len() / 2;
     let (mut even0, mut odd0) = (0usize, 0usize);
-    for p in sample.chunks_exact(2) {
+    for p in sample.as_chunks::<2>().0 {
         even0 += (p[0] == 0) as usize;
         odd0 += (p[1] == 0) as usize;
     }
@@ -218,6 +218,18 @@ pub fn detect(bytes: &[u8]) -> Encoding {
     } else {
         Encoding::Iso8859_1
     }
+}
+
+/// `decode` taking the bytes: valid UTF-8 (the common case) becomes the
+/// string without a copy.
+pub fn decode_owned(mut bytes: Vec<u8>, enc: Encoding) -> String {
+    if matches!(enc, Encoding::Utf8 | Encoding::Utf8Bom) {
+        if bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {
+            bytes.drain(..3);
+        }
+        return String::from_utf8(bytes).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned());
+    }
+    decode(&bytes, enc)
 }
 
 /// Decode raw bytes with the given encoding (BOMs are stripped).
@@ -292,8 +304,26 @@ pub fn normalize_eol(text: String) -> (String, Eol) {
         return (text, Eol::Lf);
     }
     let eol = if text.contains("\r\n") { Eol::CrLf } else { Eol::Lf };
-    let t = text.replace("\r\n", "\n").replace('\r', "\n");
-    (t, eol)
+    // In place, in one pass: "\r\n" and a lone '\r' become '\n'.
+    let mut bytes = text.into_bytes();
+    let mut w = 0;
+    let mut r = 0;
+    while r < bytes.len() {
+        let b = bytes[r];
+        r += 1;
+        if b == b'\r' {
+            if bytes.get(r) == Some(&b'\n') {
+                r += 1;
+            }
+            bytes[w] = b'\n';
+        } else {
+            bytes[w] = b;
+        }
+        w += 1;
+    }
+    bytes.truncate(w);
+    // Only ASCII bytes were replaced by ASCII bytes.
+    (String::from_utf8(bytes).expect("still UTF-8"), eol)
 }
 
 pub fn apply_eol(text: &str, eol: Eol) -> std::borrow::Cow<'_, str> {
@@ -343,5 +373,9 @@ mod tests {
         let (t, e) = normalize_eol("a\r\nb\r\n".into());
         assert_eq!((t.as_str(), e), ("a\nb\n", Eol::CrLf));
         assert_eq!(apply_eol(&t, e), "a\r\nb\r\n");
+        assert_eq!(normalize_eol("a\rb\r\r\nc\r".into()).0, "a\nb\n\nc\n");
+        assert_eq!(normalize_eol("è\r\nà".into()), ("è\nà".to_string(), Eol::CrLf));
+        assert_eq!(decode_owned(vec![0xEF, 0xBB, 0xBF, b'a'], Encoding::Utf8Bom), "a");
+        assert_eq!(decode_owned(vec![b'a', 0xFF], Encoding::Utf8), "a\u{FFFD}");
     }
 }

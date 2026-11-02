@@ -36,6 +36,13 @@ fn cursor_position(d: &Doc) -> (u32, u32) {
     (it.line() as u32, lsp::utf16_col(&line, it.line_offset() as usize))
 }
 
+/// Whether the cursor of the Vue document `d` is in its `<script>` block.
+fn in_vue_script(d: &Doc) -> bool {
+    let buf = &d.buffer;
+    let before = buf.text(&buf.start_iter(), &buf.iter_at_mark(&buf.get_insert()), true);
+    matches!(format::embedded_lang(Lang::Vue, &before), Lang::JavaScript | Lang::TypeScript)
+}
+
 /// Folder of the installed Vue language server: the Vue TypeScript plugin
 /// is found from there.
 fn vue_plugin_location() -> Option<String> {
@@ -51,13 +58,7 @@ fn vue_plugin_location() -> Option<String> {
 fn line_of(ed: &Editor, path: &Path, n: u32) -> String {
     let doc = ed.docs.borrow().iter().find(|d| d.path.borrow().as_deref() == Some(path) && d.is_loaded()).cloned();
     match doc {
-        Some(d) => d.buffer.iter_at_line(n as i32).map_or_else(String::new, |a| {
-            let mut b = a;
-            if !b.ends_line() {
-                b.forward_to_line_end();
-            }
-            d.buffer.text(&a, &b, true).to_string()
-        }),
+        Some(d) => d.line_text(n as i32),
         None => finder::read_text(path).and_then(|t| t.lines().nth(n as usize).map(str::to_string)).unwrap_or_default(),
     }
 }
@@ -73,8 +74,18 @@ impl Editor {
         self.win.add_action(&a);
     }
 
+    /// Whether the servers are enabled for the working folder (asked
+    /// several times per key press: the saved list is read once per folder).
     pub(super) fn lsp_enabled(&self) -> bool {
-        self.workdir.borrow().as_ref().is_some_and(|w| config::load_lsp_folders().contains(w))
+        let Some(w) = self.workdir.borrow().clone() else { return false };
+        if let Some((dir, on)) = self.lsp_enabled_cache.borrow().as_ref()
+            && *dir == w
+        {
+            return *on;
+        }
+        let on = config::load_lsp_folders().contains(&w);
+        *self.lsp_enabled_cache.borrow_mut() = Some((w, on));
+        on
     }
 
     fn set_lsp_folder(self: &Rc<Self>, on: bool) {
@@ -85,6 +96,7 @@ impl Editor {
             list.push(root);
         }
         config::save_lsp_folders(&list);
+        *self.lsp_enabled_cache.borrow_mut() = None;
         if on {
             self.message("Analisi del codice attiva: i language server partono quando apri un file del loro linguaggio");
         } else {
@@ -97,7 +109,7 @@ impl Editor {
     /// starts the ones needed by the open documents.
     pub(super) fn sync_lsp(self: &Rc<Self>) {
         let enabled = self.lsp_enabled();
-        if let Some(a) = self.win.lookup_action("lsp-folder").and_downcast::<gio::SimpleAction>() {
+        if let Some(a) = self.action("lsp-folder") {
             a.set_enabled(self.workdir.borrow().is_some());
             a.set_state(&enabled.to_variant());
         }
@@ -255,6 +267,10 @@ impl Editor {
         if self.docs.borrow().iter().any(|d| d.lang.get() == Lang::Vue) {
             return true;
         }
+        // The file index already lists the project.
+        if let Some(paths) = self.index_paths(root).filter(|p| !p.is_empty()) {
+            return (0..paths.len()).any(|i| paths.get(i).ends_with(".vue"));
+        }
         // A quick look at the folder (without dependencies and hidden folders).
         let mut stack = vec![root.to_path_buf()];
         let mut seen = 0;
@@ -315,15 +331,20 @@ impl Editor {
         );
     }
 
-    /// Tells the servers of `d` that the document is open.
+    /// Tells the servers of `d` (started if needed) that the document is
+    /// open. Servers that already have it get its changes from
+    /// `lsp_changed`, not here.
     pub(super) fn lsp_open(self: &Rc<Self>, d: &Rc<Doc>) {
         if !d.is_loaded() {
             return;
         }
         let Some(path) = d.path.borrow().clone() else { return };
+        let uri = lsp::path_to_uri(&path);
+        let mut text = None;
         for c in self.lsp_clients_for(d) {
-            if c.ready.get() {
-                c.did_open(&lsp::path_to_uri(&path), lsp::language_id(d.lang.get(), &path), &d.text());
+            if c.ready.get() && !c.docs.borrow().contains_key(&uri) {
+                let text = text.get_or_insert_with(|| d.text());
+                c.did_open(&uri, lsp::language_id(d.lang.get(), &path), text);
             }
         }
     }
@@ -351,15 +372,15 @@ impl Editor {
         let dirty: Vec<String> = self.lsp_dirty.borrow_mut().drain().collect();
         for id in dirty {
             let Some(d) = self.docs.borrow().iter().find(|d| *d.id.borrow() == id).cloned() else { continue };
+            // Unloaded meanwhile: sent again when it is loaded.
+            if !d.is_loaded() {
+                continue;
+            }
             let Some(path) = d.path.borrow().clone() else { continue };
             let uri = lsp::path_to_uri(&path);
             let text = d.text();
             for c in self.lsp_clients_for(&d) {
-                if c.docs.borrow().contains_key(&uri) {
-                    c.did_change(&uri, &text);
-                } else if c.ready.get() {
-                    c.did_open(&uri, lsp::language_id(d.lang.get(), &path), &text);
-                }
+                c.sync_text(&uri, lsp::language_id(d.lang.get(), &path), &text);
             }
         }
     }
@@ -387,6 +408,7 @@ impl Editor {
         for c in self.lsp_clients.borrow().iter() {
             c.did_close(&uri);
         }
+        self.lsp_diags.borrow_mut().retain(|(_, u), _| *u != uri);
     }
 
     fn update_lsp_status(&self) {
@@ -421,12 +443,7 @@ impl Editor {
                 let mut total = 0;
                 let mut stack = vec![pid];
                 while let Some(p) = stack.pop() {
-                    let status = std::fs::read_to_string(format!("/proc/{p}/status")).unwrap_or_default();
-                    total += status
-                        .lines()
-                        .find_map(|l| l.strip_prefix("VmRSS:"))
-                        .and_then(|v| v.split_whitespace().next()?.parse::<u64>().ok())
-                        .unwrap_or(0);
+                    total += crate::proc::rss_kb(&p);
                     if let Ok(children) = std::fs::read_to_string(format!("/proc/{p}/task/{p}/children")) {
                         stack.extend(children.split_whitespace().map(str::to_string));
                     }
@@ -447,11 +464,7 @@ impl Editor {
         }
         let clients = self.lsp_clients_for(d);
         let named = |n: &str| clients.iter().find(|c| c.spec.name == n).cloned();
-        let in_script = {
-            let buf = &d.buffer;
-            let before = buf.text(&buf.start_iter(), &buf.iter_at_mark(&buf.get_insert()), true);
-            matches!(format::embedded_lang(Lang::Vue, &before), Lang::JavaScript | Lang::TypeScript)
-        };
+        let in_script = in_vue_script(d);
         if completion && !in_script { named(lsp::VUE_SERVER) } else { named(lsp::TS_SERVER).or_else(|| named(lsp::VUE_SERVER)) }
     }
 
@@ -459,9 +472,9 @@ impl Editor {
     /// gets the current text first).
     fn lsp_target(self: &Rc<Self>, c: &Rc<Client>, d: &Rc<Doc>) -> Option<Value> {
         let path = d.path.borrow().clone()?;
-        // The server must see the current text.
-        if d.is_unsaved() || self.lsp_dirty.borrow().contains(&*d.id.borrow()) {
-            self.lsp_dirty.borrow_mut().insert(d.id.borrow().clone());
+        // The server must see the current text (every change marks the
+        // document as dirty).
+        if self.lsp_dirty.borrow().contains(&*d.id.borrow()) {
             self.lsp_flush();
         }
         if !c.docs.borrow().contains_key(&lsp::path_to_uri(&path)) {
@@ -538,11 +551,7 @@ impl Editor {
     /// the tags, directives and events), otherwise one.
     fn lsp_completion_servers(self: &Rc<Self>, d: &Rc<Doc>) -> Vec<Rc<Client>> {
         let servers: Vec<Rc<Client>> = if d.lang.get() == Lang::Vue {
-            let in_script = {
-                let buf = &d.buffer;
-                let before = buf.text(&buf.start_iter(), &buf.iter_at_mark(&buf.get_insert()), true);
-                matches!(format::embedded_lang(Lang::Vue, &before), Lang::JavaScript | Lang::TypeScript)
-            };
+            let in_script = in_vue_script(d);
             self.lsp_clients_for(d).into_iter().filter(|c| !in_script || c.spec.name == lsp::TS_SERVER).collect()
         } else {
             self.lsp_client(d).into_iter().collect()
@@ -561,6 +570,14 @@ impl Editor {
         let mut before = it;
         before.backward_char();
         let prev = buf.text(&before, &it, true).to_string();
+        // Answers to the previous key press are not needed any more.
+        if let Some(c) = self.completion.borrow().as_ref() {
+            for (client, id) in c.requests.borrow_mut().drain(..) {
+                if let Some(client) = client.upgrade() {
+                    client.cancel(id);
+                }
+            }
+        }
         // (answers still expected, answers received)
         let answers: Rc<RefCell<(usize, Vec<Value>)>> = Rc::new(RefCell::new((0, Vec::new())));
         for c in servers {
@@ -573,7 +590,8 @@ impl Editor {
             answers.borrow_mut().0 += 1;
             let ed = Rc::downgrade(self);
             let (d, answers) = (d.clone(), answers.clone());
-            c.request("textDocument/completion", params, move |res| {
+            let client = Rc::downgrade(&c);
+            let id = c.request("textDocument/completion", params, move |res| {
                 let all = {
                     let mut a = answers.borrow_mut();
                     a.0 -= 1;
@@ -593,7 +611,7 @@ impl Editor {
                 }
                 let prefix = super::inspect::word_at_cursor(&d).map_or(String::new(), |(w, a, _)| {
                     // Only the part before the cursor.
-                    let cur = d.buffer.iter_at_mark(&d.buffer.get_insert()).offset();
+                    let cur = d.cursor_iter().offset();
                     w.chars().take((cur - a).max(0) as usize).collect()
                 });
                 let mut items: Vec<Item> = Vec::new();
@@ -610,6 +628,9 @@ impl Editor {
                 }
                 ed.show_completion(&d, items);
             });
+            if let Some(comp) = self.completion.borrow().as_ref() {
+                comp.requests.borrow_mut().push((client, id));
+            }
         }
         answers.borrow().0 > 0
     }
@@ -620,34 +641,46 @@ fn completion_items(d: &Doc, v: &Value, prefix: &str) -> Vec<Item> {
     let list = v.get("items").unwrap_or(v);
     let Some(arr) = list.as_array() else { return Vec::new() };
     let lower = prefix.to_lowercase();
-    let mut items: Vec<(String, Item)> = arr
+    // Servers send thousands of proposals: they are filtered and sorted
+    // first, and only the rows shown are built.
+    let mut keyed: Vec<(bool, &str, &Value)> = arr
         .iter()
         .filter_map(|it| {
-            let label = it.get("label")?.as_str()?.trim().to_string();
-            let filter = it.get("filterText").and_then(Value::as_str).unwrap_or(&label).to_lowercase();
-            if !lower.is_empty() && !filter.starts_with(&lower) && !filter.contains(&lower) {
+            let label = it.get("label")?.as_str()?.trim();
+            let filter = it.get("filterText").and_then(Value::as_str).unwrap_or(label).to_lowercase();
+            let starts = filter.starts_with(&lower);
+            if !lower.is_empty() && !starts && !filter.contains(&lower) {
                 return None;
             }
+            let sort = it.get("sortText").and_then(Value::as_str).unwrap_or(label);
+            // Prefix matches before the others.
+            Some((!starts, sort, it))
+        })
+        .collect();
+    keyed.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
+    // Text of the lines of the edit ranges (usually all the same line).
+    let mut line_cache: Option<(i32, String)> = None;
+    keyed
+        .into_iter()
+        .take(MAX_ITEMS)
+        .filter_map(|(_, _, it)| {
+            let label = it.get("label")?.as_str()?.trim().to_string();
+            // Snippets are not announced (`snippetSupport: false`), but some
+            // servers send them anyway.
             let snippet = it.get("insertTextFormat").and_then(Value::as_u64) == Some(2);
             let edit = it.get("textEdit");
-            let raw = edit
-                .and_then(|e| e.get("newText"))
-                .or_else(|| it.get("insertText"))
-                .and_then(Value::as_str)
-                .unwrap_or(&label)
-                .to_string();
-            let insert = if snippet { lsp::strip_snippet(&raw) } else { raw };
+            let raw = edit.and_then(|e| e.get("newText")).or_else(|| it.get("insertText")).and_then(Value::as_str).unwrap_or(&label);
+            let insert = if snippet { lsp::strip_snippet(raw) } else { raw.to_string() };
             // Start of the replaced text, from the edit range.
-            let replace_from = edit.and_then(|e| e.get("range").or_else(|| e.get("replace"))).and_then(|r| {
+            let replace_from = edit.and_then(|e| e.get("range")).and_then(|r| {
                 let line = r.pointer("/start/line")?.as_u64()? as i32;
                 let u16 = r.pointer("/start/character")?.as_u64()? as u32;
                 let start = d.buffer.iter_at_line(line)?;
-                let mut end = start;
-                if !end.ends_line() {
-                    end.forward_to_line_end();
+                if line_cache.as_ref().is_none_or(|(l, _)| *l != line) {
+                    line_cache = Some((line, d.line_text(line)));
                 }
-                let text = d.buffer.text(&start, &end, true);
-                Some(start.offset() + lsp::char_col(&text, u16) as i32)
+                let text = &line_cache.as_ref()?.1;
+                Some(start.offset() + lsp::char_col(text, u16) as i32)
             });
             let kind = it.get("kind").and_then(Value::as_u64).map_or("", lsp::completion_kind);
             let detail = it.get("detail").and_then(Value::as_str).unwrap_or("").trim();
@@ -656,43 +689,45 @@ fn completion_items(d: &Doc, v: &Value, prefix: &str) -> Vec<Item> {
                 (false, true) => kind.to_string(),
                 _ => detail.to_string(),
             };
-            let sort = it.get("sortText").and_then(Value::as_str).unwrap_or(&label).to_string();
-            // Prefix matches before the others.
-            let rank = if filter.starts_with(&lower) { "0" } else { "1" };
-            Some((format!("{rank}{sort}"), Item { label, insert, detail, replace_from }))
+            Some(Item { label, insert, detail, replace_from })
         })
-        .collect();
-    items.sort_by(|a, b| a.0.cmp(&b.0));
-    items.into_iter().take(MAX_ITEMS).map(|(_, i)| i).collect()
+        .collect()
 }
 
 /// Locations from a server, shown like search results.
 fn location_results(ed: &Editor, root: &Path, locs: &[Location], word: &str) -> TextResults {
-    let mut res = TextResults::default();
-    let mut lines: HashMap<PathBuf, Vec<String>> = HashMap::new();
+    // The lines needed from each file, read once: from the open document
+    // (the server has its unsaved text), else from the disk.
+    let mut wanted: HashMap<&Path, HashMap<u32, String>> = HashMap::new();
     for l in locs {
-        let line = match lines.get(&l.path) {
-            Some(ls) => ls.get(l.line as usize).cloned().unwrap_or_default(),
-            None => {
-                let ls: Vec<String> = finder::read_text(&l.path).map(|t| t.lines().map(str::to_string).collect()).unwrap_or_default();
-                let one = ls.get(l.line as usize).cloned().unwrap_or_else(|| line_of(ed, &l.path, l.line));
-                lines.insert(l.path.clone(), ls);
-                one
+        wanted.entry(l.path.as_path()).or_default().insert(l.line, String::new());
+    }
+    for (path, lines) in &mut wanted {
+        let doc = ed.docs.borrow().iter().find(|d| d.path.borrow().as_deref() == Some(*path) && d.is_loaded()).cloned();
+        match doc {
+            Some(d) => {
+                for (n, text) in lines.iter_mut() {
+                    *text = d.line_text(*n as i32);
+                }
             }
-        };
-        let col = lsp::char_col(&line, l.u16col) as usize;
+            None => {
+                let Some(text) = finder::read_text(path) else { continue };
+                let last = lines.keys().max().copied().unwrap_or(0) as usize;
+                for (n, l) in text.lines().enumerate().take(last + 1) {
+                    if let Some(t) = lines.get_mut(&(n as u32)) {
+                        *t = l.to_string();
+                    }
+                }
+            }
+        }
+    }
+    let mut res = TextResults::default();
+    for l in locs {
+        let line = wanted.get(l.path.as_path()).and_then(|m| m.get(&l.line)).map_or("", String::as_str);
+        let col = lsp::char_col(line, l.u16col) as usize;
         let start = line.char_indices().nth(col).map_or(line.len(), |(b, _)| b);
-        let end = (start + word.len()).min(line.len());
-        let end = if line.is_char_boundary(end) { end } else { start };
-        let (snippet, hl, col) = finder::snippet(&line, start, end);
-        let rel = l.path.strip_prefix(root).map_or_else(|_| l.path.to_string_lossy().into_owned(), |r| r.to_string_lossy().into_owned());
-        let file = match res.files.iter().position(|f| *f == rel) {
-            Some(i) => i as u32,
-            None => {
-                res.files.push(rel);
-                (res.files.len() - 1) as u32
-            }
-        };
+        let (snippet, hl, col) = finder::snippet(line, start, start + word.len());
+        let file = res.file_index(finder::rel_or_full(root, &l.path));
         res.matches.push(TextMatch { file, line: l.line, col, snippet, hl });
     }
     res

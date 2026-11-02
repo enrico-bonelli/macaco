@@ -6,6 +6,7 @@
 
 use super::Editor;
 use crate::askpass::{self, Request};
+use crate::config::{expand_home, tilde as short_home};
 use crate::git::{self, RemoteKind};
 use gtk::prelude::*;
 use gtk::{gio, glib, pango};
@@ -34,19 +35,27 @@ fn keyring_helper_installed() -> bool {
     })
 }
 
-/// `~/x` → absolute path.
-fn expand_home(p: &str) -> PathBuf {
-    match p.strip_prefix("~/") {
-        Some(rest) => PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(rest),
-        None => PathBuf::from(p),
+/// The existing keys ssh would try for `target` (from `~/.ssh/config`),
+/// read in the background: `ssh -G` can run `Match exec` commands.
+fn ssh_identity_files(target: &str, port: Option<u16>, done: impl FnOnce(Vec<PathBuf>) + 'static) {
+    let port = port.map(|p| p.to_string());
+    let mut argv: Vec<&OsStr> = vec![OsStr::new("ssh"), OsStr::new("-G")];
+    if let Some(p) = &port {
+        argv.extend([OsStr::new("-p"), OsStr::new(p)]);
     }
+    argv.push(OsStr::new(target));
+    let opts = crate::proc::Options { timeout: Some(std::time::Duration::from_secs(5)), detach: true, ..Default::default() };
+    crate::proc::run(&argv, opts, move |out| {
+        let keys = String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter_map(|l| l.strip_prefix("identityfile "))
+            .map(expand_home)
+            .filter(|p| p.exists())
+            .collect();
+        done(keys);
+    });
 }
 
-fn short_home(p: &Path) -> String {
-    let s = p.display().to_string();
-    let home = std::env::var("HOME").unwrap_or_default();
-    if !home.is_empty() && s.starts_with(&home) { format!("~{}", &s[home.len()..]) } else { s }
-}
 
 /// What a prompt of git or ssh asks.
 enum Question {
@@ -76,11 +85,32 @@ fn classify(prompt: &str) -> Question {
     } else if low.contains("passphrase") {
         Question::Passphrase { key: quoted(prompt) }
     } else {
-        Question::Other { secret: low.contains("password") || low.contains("pin") }
+        // Whole words: "pin" is not in "mapping" or "ping".
+        let secret = low.split(|c: char| !c.is_alphanumeric()).any(|w| matches!(w, "password" | "pin" | "passcode" | "otp"));
+        Question::Other { secret }
     }
 }
 
 impl Editor {
+    /// Runs `git args` in `dir`; network commands get the askpass helper.
+    /// `done` also tells whether a question was cancelled.
+    pub(super) fn run_git(
+        self: &Rc<Self>,
+        dir: &Path,
+        args: Vec<OsString>,
+        input: Option<Vec<u8>>,
+        done: impl FnOnce(&Rc<Editor>, git::Output, bool) + 'static,
+    ) {
+        let (ed, dir2) = (self.clone(), dir.to_path_buf());
+        self.prepare_git(dir, args, move |args, env| {
+            let argv: Vec<&OsStr> = args.iter().map(|a| a.as_os_str()).collect();
+            git::run_with(&dir2, &argv, &env, input, move |out| {
+                let cancelled = ed.askpass_was_cancelled();
+                done(&ed, out, cancelled);
+            });
+        });
+    }
+
     /// Arguments and environment of a git command: network commands get
     /// the askpass helper and, if wanted, the keyring helper. Calls `then`
     /// when they are ready.
@@ -172,13 +202,11 @@ impl Editor {
         };
 
         // A child of the window in front (the changes window, if open).
-        let parent = gtk::Window::list_toplevels()
-            .into_iter()
-            .filter_map(|w| w.downcast::<gtk::Window>().ok())
-            .find(|w| w.is_active())
-            .unwrap_or_else(|| self.win.clone().upcast());
-        let win = gtk::Window::builder().title(&title).transient_for(&parent).modal(true).default_width(480).resizable(false).build();
-        let b = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(10).margin_top(14).margin_bottom(14).margin_start(14).margin_end(14).build();
+        let parent = crate::ui::active_window().unwrap_or_else(|| self.win.clone().upcast());
+        // Escape closes it, which answers "cancel".
+        let win = crate::ui::dialog_window(&parent, &title, 480);
+        win.set_resizable(false);
+        let b = crate::ui::dialog_box(10);
         let head = gtk::Label::new(Some(&title));
         head.add_css_class("title-4");
         head.set_xalign(0.0);
@@ -226,14 +254,15 @@ impl Editor {
         let answer = {
             let (reply, ed, win) = (reply.clone(), Rc::downgrade(self), win.downgrade());
             move |a: Option<String>| {
+                // Closing the window after an answer comes back here: only
+                // the first call counts.
+                let Some(r) = reply.borrow_mut().take() else { return };
                 if a.is_none()
                     && let Some(ed) = ed.upgrade()
                 {
                     ed.askpass_cancelled.set(true);
                 }
-                if let Some(r) = reply.borrow_mut().take() {
-                    r(a);
-                }
+                r(a);
                 if let Some(w) = win.upgrade() {
                     w.close();
                 }
@@ -275,23 +304,18 @@ impl Editor {
         };
         let root = st.root.clone();
         let ed = self.clone();
-        git::run_str(&root.clone(), &["remote", "-v"], move |out| {
-            let remotes = git::parse_remotes(&String::from_utf8_lossy(&out.stdout));
-            let ed2 = ed.clone();
-            git::run_str(&root.clone(), &["config", "--get-all", "credential.helper"], move |helpers| {
-                let own_helper = String::from_utf8_lossy(&helpers.stdout).trim().to_string();
-                let ed3 = ed2.clone();
-                git::run_str(&root.clone(), &["config", "--local", "--get", "core.sshCommand"], move |cmd| {
-                    let ssh_cmd = String::from_utf8_lossy(&cmd.stdout).trim().to_string();
-                    ed3.show_credentials(root, remotes, own_helper, ssh_cmd);
-                });
-            });
+        let cmds: [&[&str]; 3] = [&["remote", "-v"], &["config", "--get-all", "credential.helper"], &["config", "--local", "--get", "core.sshCommand"]];
+        git::run_many(&root.clone(), &cmds, move |outs| {
+            let text = |i: usize| String::from_utf8_lossy(&outs[i].stdout).into_owned();
+            let remotes = git::parse_remotes(&text(0));
+            ed.show_credentials(root, remotes, text(1).trim().to_string(), text(2).trim().to_string());
         });
     }
 
     fn show_credentials(self: &Rc<Self>, root: PathBuf, remotes: Vec<(String, String)>, own_helper: String, ssh_cmd: String) {
-        let win = gtk::Window::builder().title("Credenziali e chiavi SSH").transient_for(&self.win).modal(true).default_width(720).default_height(520).build();
-        let b = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(12).margin_top(14).margin_bottom(14).margin_start(14).margin_end(14).build();
+        let win = crate::ui::dialog_window(&self.win, "Credenziali e chiavi SSH", 720);
+        win.set_default_height(520);
+        let b = crate::ui::dialog_box(12);
         let head = gtk::Label::new(Some(&format!("Repository {}", short_home(&root))));
         head.add_css_class("title-4");
         head.set_xalign(0.0);
@@ -390,38 +414,27 @@ impl Editor {
                     None => host.clone(),
                 };
                 let port = *port;
-                let key_label = info.clone();
+                let key_label = info.downgrade();
                 let show_key = {
                     let (target, ssh_cmd) = (target.clone(), ssh_cmd.clone());
                     move || {
+                        let Some(label) = key_label.upgrade() else { return };
                         let cmd = ssh_cmd.borrow().clone();
                         if let Some(k) = git::ssh_command_key(&cmd) {
-                            key_label.set_text(&format!(
+                            label.set_text(&format!(
                                 "Chiave scelta per questo repository: {} (provata per prima; ssh può provare anche quelle di ~/.ssh/config per lo stesso server)",
                                 short_home(&expand_home(&k))
                             ));
                             return;
                         }
-                        // The keys ssh would try, from ~/.ssh/config.
-                        let mut c = std::process::Command::new("ssh");
-                        c.arg("-G");
-                        if let Some(p) = port {
-                            c.arg("-p").arg(p.to_string());
-                        }
-                        let keys: Vec<PathBuf> = c
-                            .arg(&target)
-                            .output()
-                            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
-                            .unwrap_or_default()
-                            .lines()
-                            .filter_map(|l| l.strip_prefix("identityfile "))
-                            .map(expand_home)
-                            .filter(|p| p.exists())
-                            .collect();
-                        key_label.set_text(&match keys.as_slice() {
-                            [] => "Nessuna chiave trovata per questo server: creane una (ssh-keygen) o scegline una.".to_string(),
-                            [k] => format!("Chiave: {} (dalla configurazione di ssh)", short_home(k)),
-                            ks => format!("Chiavi provate: {}", ks.iter().map(|k| short_home(k)).collect::<Vec<_>>().join(", ")),
+                        let key_label = key_label.clone();
+                        ssh_identity_files(&target, port, move |keys| {
+                            let Some(label) = key_label.upgrade() else { return };
+                            label.set_text(&match keys.as_slice() {
+                                [] => "Nessuna chiave trovata per questo server: creane una (ssh-keygen) o scegline una.".to_string(),
+                                [k] => format!("Chiave: {} (dalla configurazione di ssh)", short_home(k)),
+                                ks => format!("Chiavi provate: {}", ks.iter().map(|k| short_home(k)).collect::<Vec<_>>().join(", ")),
+                            });
                         });
                     }
                 };
@@ -468,34 +481,38 @@ impl Editor {
                 let copy = button("Copia chiave pubblica");
                 let (ed, ssh_cmd2, target2) = (Rc::downgrade(self), ssh_cmd.clone(), target.clone());
                 copy.connect_clicked(move |btn| {
-                    let Some(ed) = ed.upgrade() else { return };
-                    let chosen = git::ssh_command_key(&ssh_cmd2.borrow()).map(|k| expand_home(&k));
-                    let key = chosen.or_else(|| {
-                        let o = std::process::Command::new("ssh").arg("-G").arg(&target2).output().ok()?;
-                        String::from_utf8_lossy(&o.stdout).lines().filter_map(|l| l.strip_prefix("identityfile ")).map(expand_home).find(|p| p.exists())
-                    });
-                    let Some(key) = key else {
-                        ed.message("Nessuna chiave da copiare");
-                        return;
-                    };
-                    let mut public = key.clone().into_os_string();
-                    public.push(".pub");
-                    match std::fs::read_to_string(&public) {
-                        Ok(text) => {
-                            btn.clipboard().set_text(text.trim());
-                            ed.message(&format!("Copiata {}: incollala tra le chiavi SSH del server (GitHub → Settings → SSH keys)", short_home(Path::new(&public))));
+                    let copy_key = {
+                        let (ed, btn) = (ed.clone(), btn.clone());
+                        move |key: Option<PathBuf>| {
+                            let Some(ed) = ed.upgrade() else { return };
+                            let Some(key) = key else {
+                                ed.message("Nessuna chiave da copiare");
+                                return;
+                            };
+                            let mut public = key.into_os_string();
+                            public.push(".pub");
+                            match std::fs::read_to_string(&public) {
+                                Ok(text) => {
+                                    btn.clipboard().set_text(text.trim());
+                                    ed.message(&format!("Copiata {}: incollala tra le chiavi SSH del server (GitHub → Settings → SSH keys)", short_home(Path::new(&public))));
+                                }
+                                Err(e) => ed.message(&format!("{}: {e}", short_home(Path::new(&public)))),
+                            }
                         }
-                        Err(e) => ed.message(&format!("{}: {e}", short_home(Path::new(&public)))),
+                    };
+                    match git::ssh_command_key(&ssh_cmd2.borrow()) {
+                        Some(k) => copy_key(Some(expand_home(&k))),
+                        None => ssh_identity_files(&target2, port, move |keys| copy_key(keys.into_iter().next())),
                     }
                 });
             }
-            RemoteKind::Https { host } => {
+            RemoteKind::Https { host, scheme } => {
                 info.set_text("Al primo push o pull macaco chiede nome utente e password (o token); con il portachiavi attivo git li ricorda.");
                 let forget = button("Dimentica la password salvata");
-                let (ed, root2, host) = (Rc::downgrade(self), root.to_path_buf(), host.clone());
+                let (ed, root2, host, scheme) = (Rc::downgrade(self), root.to_path_buf(), host.clone(), *scheme);
                 forget.connect_clicked(move |_| {
                     let ed = ed.clone();
-                    let input = format!("protocol=https\nhost={host}\n\n");
+                    let input = format!("protocol={scheme}\nhost={host}\n\n").into_bytes();
                     let args: Vec<&OsStr> = ["-c", "credential.helper=", "-c", "credential.helper=libsecret", "credential", "reject"].iter().map(OsStr::new).collect();
                     let host2 = host.clone();
                     git::run_with(&root2, &args, &[], Some(input), move |out| {
@@ -519,29 +536,30 @@ impl Editor {
             let (ed, root2, name2, result2) = (Rc::downgrade(self), root.to_path_buf(), name.to_string(), result.clone());
             test.connect_clicked(move |btn| {
                 let Some(ed) = ed.upgrade() else { return };
+                // Its password questions would mix with those of a push or pull.
+                if ed.git_busy.get() {
+                    ed.message("Un comando git è già in esecuzione");
+                    return;
+                }
                 btn.set_sensitive(false);
                 result2.set_visible(true);
                 result2.remove_css_class("error");
                 result2.set_text("Connessione in corso…");
                 let args = vec![OsString::from("ls-remote"), OsString::from("--heads"), OsString::from(&name2)];
-                let (root, result, btn) = (root2.clone(), result2.clone(), btn.downgrade());
-                let ed2 = ed.clone();
-                ed.prepare_git(&root2, args, move |args, env| {
-                    let argv: Vec<&OsStr> = args.iter().map(|a| a.as_os_str()).collect();
-                    git::run_with(&root, &argv, &env, None, move |out| {
-                        if let Some(b) = btn.upgrade() {
-                            b.set_sensitive(true);
-                        }
-                        if out.ok {
-                            let n = String::from_utf8_lossy(&out.stdout).lines().count();
-                            result.set_text(&format!("✓ Connessione riuscita: {n} rami sul server"));
-                        } else if ed2.askpass_was_cancelled() {
-                            result.set_text("Annullato");
-                        } else {
-                            result.add_css_class("error");
-                            result.set_text(&format!("Non riuscita: {}", out.summary()));
-                        }
-                    });
+                let (result, btn) = (result2.clone(), btn.downgrade());
+                ed.run_git(&root2, args, None, move |_, out, cancelled| {
+                    if let Some(b) = btn.upgrade() {
+                        b.set_sensitive(true);
+                    }
+                    if out.ok {
+                        let n = String::from_utf8_lossy(&out.stdout).lines().count();
+                        result.set_text(&format!("✓ Connessione riuscita: {n} rami sul server"));
+                    } else if cancelled {
+                        result.set_text("Annullato");
+                    } else {
+                        result.add_css_class("error");
+                        result.set_text(&format!("Non riuscita: {}", out.summary()));
+                    }
                 });
             });
         }
