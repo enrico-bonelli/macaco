@@ -5,25 +5,33 @@ use super::*;
 /// Delay between an edit and writing unsaved content to the cache.
 pub(super) const AUTOSAVE_DELAY: Duration = Duration::from_millis(1500);
 
+/// Serializes background autosaves and the final synchronous `persist` at
+/// window shutdown so they never write or clean `~/.macaco/cache` at the
+/// same time.
+static PERSIST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 impl Editor {
     pub(super) fn schedule_autosave(self: &Rc<Self>) {
-        if self.restoring.get() || self.autosave_pending.replace(true) {
+        if self.restoring.get() || self.shut_down.get() {
+            return;
+        }
+        if self.autosave_writing.get() {
+            self.autosave_again.set(true);
+            return;
+        }
+        if self.autosave_pending.replace(true) {
             return;
         }
         let ed = Rc::downgrade(self);
         glib::timeout_add_local_once(AUTOSAVE_DELAY, move || {
             if let Some(ed) = ed.upgrade() {
                 ed.autosave_pending.set(false);
-                ed.persist();
+                ed.persist_async();
             }
         });
     }
 
-    /// Write stale caches and the session file; remove unused cache files.
-    pub(super) fn persist(&self) {
-        if self.shut_down.get() {
-            return;
-        }
+    fn collect_session(&self) -> (Session, Vec<String>) {
         let mut session = Session {
             split: self.notebooks[1].is_visible(),
             workdir: self.workdir.borrow().clone(),
@@ -35,10 +43,6 @@ impl Editor {
             for i in 0..nb.n_pages() {
                 let Some(d) = nb.nth_page(Some(i)).and_then(|w| self.doc_for_widget(&w)) else { continue };
                 if d.is_unsaved() {
-                    if d.cache_is_stale()
-                        && let Err(e) = d.write_cache() {
-                            self.message(&format!("Impossibile scrivere la cache: {e}"));
-                        }
                     let id = d.id.borrow().clone();
                     keep.push(id.clone());
                     session.tabs.push((pane, TabRef::Cache(id)));
@@ -47,12 +51,128 @@ impl Editor {
                 }
             }
         }
+        keep.sort_unstable();
+        (session, keep)
+    }
+
+    /// Periodic autosave: snapshots changed buffers on the main loop and
+    /// writes all cache and session files on a worker thread.
+    fn persist_async(self: &Rc<Self>) {
+        if self.shut_down.get() {
+            return;
+        }
+        if self.autosave_writing.replace(true) {
+            self.autosave_again.set(true);
+            return;
+        }
+        let (session, keep) = self.collect_session();
+        let session_text = session.to_text();
+        let mut doc_refs: Vec<(Weak<Doc>, String, u64)> = Vec::new();
+        let mut io_jobs: Vec<(String, String, config::CacheMeta)> = Vec::new();
+        for nb in &self.notebooks {
+            for i in 0..nb.n_pages() {
+                let Some(d) = nb.nth_page(Some(i)).and_then(|w| self.doc_for_widget(&w)) else { continue };
+                if d.is_unsaved() && d.cache_is_stale() {
+                    let id = d.id.borrow().clone();
+                    doc_refs.push((d.weak(), id.clone(), d.edit_gen()));
+                    io_jobs.push((id, d.text(), d.cache_meta()));
+                }
+            }
+        }
+        let (write_session, clean_unused) = {
+            let last = self.persisted.borrow();
+            (session_text != last.0, keep != last.1)
+        };
+        if io_jobs.is_empty() && !write_session && !clean_unused {
+            self.autosave_writing.set(false);
+            if self.autosave_again.replace(false) {
+                self.schedule_autosave();
+            }
+            return;
+        }
+        let ed = Rc::downgrade(self);
+        let session_written = session_text.clone();
+        let keep_written = keep.clone();
+        glib::spawn_future_local(async move {
+            let results = gio::spawn_blocking(move || {
+                let _guard = PERSIST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+                let res: Vec<Result<(), String>> = io_jobs
+                    .into_iter()
+                    .map(|(id, text, meta)| config::write_cache(&id, &text, &meta).map_err(|e| e.to_string()))
+                    .collect();
+                if write_session {
+                    let _ = Session::write_text(&session_written);
+                }
+                if clean_unused {
+                    for id in config::cached_ids() {
+                        if keep_written.binary_search(&id).is_err() {
+                            config::delete_cache(&id);
+                        }
+                    }
+                }
+                res
+            })
+            .await;
+            let Some(ed) = ed.upgrade() else { return };
+            ed.autosave_writing.set(false);
+            if ed.shut_down.get() {
+                return;
+            }
+            let mut orphan_written = false;
+            if let Ok(results) = results {
+                for ((wd, id, written_gen), res) in doc_refs.into_iter().zip(results) {
+                    match res {
+                        Ok(()) => {
+                            if let Some(d) = wd.upgrade().filter(|d| d.is_unsaved() && *d.id.borrow() == id) {
+                                d.set_cache_gen(written_gen);
+                            } else {
+                                orphan_written = true;
+                            }
+                        }
+                        Err(e) => ed.message(&format!("Impossibile scrivere la cache: {e}")),
+                    }
+                }
+                let mut last = ed.persisted.borrow_mut();
+                if write_session {
+                    last.0 = session_text;
+                }
+                if orphan_written {
+                    last.1.clear();
+                } else if clean_unused {
+                    last.1 = keep;
+                }
+            }
+            if ed.autosave_again.replace(false) || orphan_written {
+                ed.schedule_autosave();
+            }
+        });
+    }
+
+    /// Write stale caches and the session file synchronously (at shutdown);
+    /// remove unused cache files.
+    pub(super) fn persist(&self) {
+        if self.shut_down.get() {
+            return;
+        }
+        let _guard = PERSIST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        for nb in &self.notebooks {
+            for i in 0..nb.n_pages() {
+                let Some(d) = nb.nth_page(Some(i)).and_then(|w| self.doc_for_widget(&w)) else { continue };
+                if d.is_unsaved()
+                    && d.cache_is_stale()
+                    && let Err(e) = d.write_cache()
+                {
+                    self.message(&format!("Impossibile scrivere la cache: {e}"));
+                }
+            }
+        }
+        let (session, keep) = self.collect_session();
         let mut last = self.persisted.borrow_mut();
         session.save_if_changed(&mut last.0);
         // Caches of closed documents: looked for only when the set of
-        // cached documents changed (closing a tab removes its own cache).
-        keep.sort_unstable();
-        if keep != last.1 {
+        // cached documents changed (closing a tab removes its own cache),
+        // or when a background autosave was in flight.
+        if keep != last.1 || self.autosave_writing.get() {
             for id in config::cached_ids() {
                 if keep.binary_search(&id).is_err() {
                     config::delete_cache(&id);

@@ -68,8 +68,9 @@ impl Editor {
     pub(super) fn hide_search(&self) {
         self.search.revealer.set_reveal_child(false);
         for d in self.docs.borrow().iter() {
-            let (a, b) = d.buffer.bounds();
-            d.buffer.remove_tag(&self.shared.tags.search, &a, &b);
+            if d.is_loaded() {
+                crate::doc::remove_tag_where_applied(&d.buffer, &self.shared.tags.search);
+            }
         }
         self.search.info.set_text("");
         if let Some(d) = self.active_doc() {
@@ -105,7 +106,7 @@ impl Editor {
     /// Paint every match and report how many there are.
     pub(super) fn highlight_matches(&self, d: &Rc<Doc>) -> usize {
         match self.query() {
-            Some(q) => self.paint_matches(d, Some(&q), &d.text()),
+            Some(q) => self.paint_matches(d, Some(&q), &d.buffer_text()),
             None => self.paint_matches(d, None, ""),
         }
     }
@@ -116,18 +117,32 @@ impl Editor {
         let tag = &self.shared.tags.search;
         crate::doc::remove_tag_where_applied(buf, tag);
         let Some(q) = q else { return 0 };
+        let ascii = text.is_ascii();
         let mut count = 0;
         let mut last = (0usize, 0usize);
+        let mut it = buf.start_iter();
+        let mut cur_char = 0usize;
         for m in q.re.find_iter(text) {
             if m.start() == m.end() {
                 continue;
             }
             count += 1;
             if count <= MAX_MATCH_HIGHLIGHT {
-                let s = crate::search::char_offset(text, last, m.start());
-                let e = s + text[m.start()..m.end()].chars().count();
-                last = (m.end(), e);
-                buf.apply_tag(tag, &buf.iter_at_offset(s as i32), &buf.iter_at_offset(e as i32));
+                let (s, e) = if ascii {
+                    (m.start(), m.end())
+                } else {
+                    let s = crate::search::char_offset(text, last, m.start());
+                    let e = s + text[m.start()..m.end()].chars().count();
+                    last = (m.end(), e);
+                    (s, e)
+                };
+                if s > cur_char {
+                    it.forward_chars((s - cur_char) as i32);
+                }
+                let start_it = it;
+                it.forward_chars((e - s) as i32);
+                cur_char = e;
+                buf.apply_tag(tag, &start_it, &it);
             }
         }
         self.search.info.set_tooltip_text(None);
@@ -146,7 +161,7 @@ impl Editor {
             self.paint_matches(&d, None, "");
             return;
         };
-        let text = d.text();
+        let text = d.buffer_text();
         if self.paint_matches(&d, Some(&q), &text) > 0 {
             // Restart from the beginning of the current selection.
             let buf = &d.buffer;
@@ -164,7 +179,7 @@ impl Editor {
             return;
         }
         let Some(q) = self.query() else { return };
-        self.select_match(&d, &q, &d.text(), forward);
+        self.select_match(&d, &q, &d.buffer_text(), forward);
     }
 
     /// `find_step` with the query and the text of `d` at hand.
@@ -175,7 +190,7 @@ impl Editor {
             (i, i)
         });
         let pivot_char = if forward { sel_b.offset() } else { sel_a.offset() } as usize;
-        let pivot = text.char_indices().nth(pivot_char).map_or(text.len(), |(b, _)| b);
+        let pivot = crate::search::byte_at_char(text, pivot_char);
         let nonempty = |m: &regex::Match| m.start() != m.end();
         let found = if forward {
             q.re.find_iter(&text[pivot..]).find(nonempty).map(|m| (m.start() + pivot, m.end() + pivot)).or_else(|| {
@@ -194,8 +209,12 @@ impl Editor {
         };
         match found {
             Some((s, e)) => {
-                let cs = text[..s].chars().count() as i32;
-                let ce = cs + text[s..e].chars().count() as i32;
+                let (cs, ce) = if text.is_ascii() {
+                    (s as i32, e as i32)
+                } else {
+                    let cs = text[..s].chars().count() as i32;
+                    (cs, cs + text[s..e].chars().count() as i32)
+                };
                 buf.select_range(&buf.iter_at_offset(cs), &buf.iter_at_offset(ce));
                 d.view.scroll_to_mark(&buf.get_insert(), 0.1, false, 0.0, 0.0);
             }
@@ -209,7 +228,7 @@ impl Editor {
         let buf = &d.buffer;
         let mut text = d.text();
         if let Some((mut a, mut b)) = buf.selection_bounds() {
-            let start_b = text.char_indices().nth(a.offset() as usize).map_or(text.len(), |(i, _)| i);
+            let start_b = crate::search::byte_at_char(&text, a.offset() as usize);
             let sel = buf.text(&a, &b, true);
             let end_b = start_b + sel.len();
             // The selection must be exactly a match.
@@ -230,14 +249,20 @@ impl Editor {
     pub(super) fn replace_all(&self) {
         let Some(d) = self.active_doc() else { return };
         let Some(q) = self.query() else { return };
-        let text = d.text();
+        let text = d.buffer_text();
+        let ascii = text.is_ascii();
         let repl = self.search.replace.text().to_string();
         let mut edits: Vec<(i32, i32, String)> = Vec::new();
         let mut last = (0usize, 0usize);
         for (start, end, rep) in crate::search::replacements(&q, &text, &repl) {
-            let s = crate::search::char_offset(&text, last, start);
-            let e = s + text[start..end].chars().count();
-            last = (end, e);
+            let (s, e) = if ascii {
+                (start, end)
+            } else {
+                let s = crate::search::char_offset(&text, last, start);
+                let e = s + text[start..end].chars().count();
+                last = (end, e);
+                (s, e)
+            };
             edits.push((s as i32, e as i32, rep));
         }
         let n = edits.len();
@@ -259,7 +284,7 @@ impl Editor {
             }
             buf.end_user_action();
         }
-        self.paint_matches(&d, Some(&q), &d.text());
+        self.paint_matches(&d, Some(&q), &d.buffer_text());
         self.message(&format!("{n} sostituzioni effettuate"));
     }
 }

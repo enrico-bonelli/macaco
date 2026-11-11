@@ -206,6 +206,13 @@ struct Highlighter {
     states: Vec<State>,
     lo: usize,
     hi: usize,
+    /// Lines from `fresh_from` onwards (outside `preview`) have received no
+    /// syntax tags since the buffer was loaded or cleared, so `remove_tag`
+    /// can be skipped on them.
+    fresh_from: usize,
+    /// Viewport slice highlighted ahead of `lo` so a newly opened or
+    /// jumped-to position in a large file has colours on the first frame.
+    preview: Option<(usize, usize)>,
     scheduled: bool,
     enabled: bool,
 }
@@ -228,6 +235,17 @@ impl Highlighter {
             if self.lo != NO_DIRTY && self.hi > line {
                 self.hi += added;
             }
+            if line < self.fresh_from {
+                self.fresh_from += added;
+            }
+            if let Some((p_lo, p_hi)) = &mut self.preview {
+                if line < *p_lo {
+                    *p_lo += added;
+                    *p_hi += added;
+                } else if line < *p_hi {
+                    *p_hi += added;
+                }
+            }
         }
         self.mark(line, line + added);
     }
@@ -239,6 +257,18 @@ impl Highlighter {
             self.states.drain(a..b);
             if self.lo != NO_DIRTY && self.hi > line {
                 self.hi = self.hi.saturating_sub(removed).max(line);
+            }
+            if self.fresh_from > line {
+                self.fresh_from = self.fresh_from.saturating_sub(removed).max(line + 1);
+            }
+            if let Some((p_lo, p_hi)) = &mut self.preview {
+                if *p_lo > line + removed {
+                    *p_lo -= removed;
+                    *p_hi -= removed;
+                } else if *p_hi > line {
+                    *p_lo = (*p_lo).min(line);
+                    *p_hi = p_hi.saturating_sub(removed).max(line + 1);
+                }
             }
         }
         self.mark(line, line);
@@ -401,7 +431,15 @@ impl Doc {
             title: RefCell::new(String::new()),
             label_budget: Cell::new(10),
             label_context: RefCell::new(String::new()),
-            hl: RefCell::new(Highlighter { states: vec![State::Normal], lo: NO_DIRTY, hi: 0, scheduled: false, enabled: true }),
+            hl: RefCell::new(Highlighter {
+                states: vec![State::Normal],
+                lo: NO_DIRTY,
+                hi: 0,
+                fresh_from: 0,
+                preview: None,
+                scheduled: false,
+                enabled: true,
+            }),
             bracket_on: Cell::new(false),
             folds: RefCell::new(Vec::new()),
             fold_cache: RefCell::new(None),
@@ -604,13 +642,17 @@ impl Doc {
         let cur_line = self.cursor_iter().line();
         let bottom = rect.y() + rect.height();
         let fw = self.fold_width();
-        // Collapsed blocks: (header line, first visible position after them).
-        let folded: Vec<(i32, gtk::TextIter)> = self
-            .folds
-            .borrow()
-            .iter()
-            .map(|f| (self.buffer.iter_at_mark(&f.head).line(), self.buffer.iter_at_mark(&f.end)))
-            .collect();
+        // Collapsed blocks: (header line, first visible position after them),
+        // sorted by (header, end offset) for binary search per visible row.
+        let mut folded: Vec<(i32, gtk::TextIter)> = {
+            let folds = self.folds.borrow();
+            if folds.is_empty() {
+                Vec::new()
+            } else {
+                folds.iter().map(|f| (self.buffer.iter_at_mark(&f.head).line(), self.buffer.iter_at_mark(&f.end))).collect()
+            }
+        };
+        folded.sort_unstable_by_key(|f| (f.0, f.1.offset()));
         let foldable = if fw > 0 && self.gutter_hover.get() {
             let r = self.cached_fold_ranges();
             if r.is_none() {
@@ -640,7 +682,12 @@ impl Doc {
                 cr.move_to((width - GUTTER_PAD - fw - tw) as f64, wy as f64);
                 pangocairo::functions::show_layout(cr, &layout);
             }
-            let fold_end = folded.iter().filter(|f| f.0 == line).map(|f| f.1).max_by_key(|e| e.offset());
+            let fold_end = if folded.is_empty() {
+                None
+            } else {
+                let hi = folded.partition_point(|f| f.0 <= line);
+                folded.get(hi.wrapping_sub(1)).filter(|f| f.0 == line).map(|f| f.1)
+            };
             if fw > 0 {
                 let (cx, cy) = ((width - fw / 2 - 2) as f64, wy as f64 + h as f64 / 2.0);
                 if fold_end.is_some() {
@@ -705,7 +752,8 @@ impl Doc {
         }
         let lang = self.lang.get();
         let r = if fold::supported(lang) && self.loaded.get() && self.buffer.char_count() < MAX_HIGHLIGHT_BYTES {
-            fold::ranges(lang, &self.text())
+            let text = self.buffer_text();
+            fold::ranges(lang, &text)
         } else {
             Vec::new()
         };
@@ -722,19 +770,43 @@ impl Doc {
         }
     }
 
-    /// Compute the foldable blocks shortly (after a pause in typing) and
-    /// redraw the handles.
+    /// Compute the foldable blocks shortly (after a pause in typing) on a
+    /// background thread and redraw the handles.
     fn schedule_fold_ranges(self: &Rc<Self>) {
         if self.fold_pending.replace(true) {
             return;
         }
         let w = Rc::downgrade(self);
-        glib::timeout_add_local_once(Duration::from_millis(150), move || {
-            if let Some(d) = w.upgrade() {
+        glib::timeout_add_local_once(Duration::from_millis(120), move || {
+            let Some(d) = w.upgrade() else { return };
+            if d.cached_fold_ranges().is_some() {
                 d.fold_pending.set(false);
-                d.fold_ranges();
                 d.gutter.queue_draw();
+                return;
             }
+            let lang = d.lang.get();
+            let edit_gen = d.edit_gen.get();
+            if !fold::supported(lang) || !d.loaded.get() || d.buffer.char_count() >= MAX_HIGHLIGHT_BYTES {
+                *d.fold_cache.borrow_mut() = Some((edit_gen, lang, Rc::new(Vec::new())));
+                d.fold_pending.set(false);
+                d.gutter.queue_draw();
+                return;
+            }
+            let text = d.text();
+            let w2 = Rc::downgrade(&d);
+            glib::spawn_future_local(async move {
+                let r = gio::spawn_blocking(move || fold::ranges(lang, &text)).await.unwrap_or_default();
+                let Some(d) = w2.upgrade() else { return };
+                d.fold_pending.set(false);
+                if d.edit_gen.get() == edit_gen && d.lang.get() == lang {
+                    *d.fold_cache.borrow_mut() = Some((edit_gen, lang, Rc::new(r)));
+                    if d.gutter_hover.get() {
+                        d.gutter.queue_draw();
+                    }
+                } else if d.gutter_hover.get() {
+                    d.schedule_fold_ranges();
+                }
+            });
         });
     }
 
@@ -750,16 +822,22 @@ impl Doc {
 
     /// Collapse a block (the cursor is moved out of it first).
     fn fold_range(&self, r: fold::Range) {
-        let buf = &self.buffer;
         if self.fold_index_at_line(r.header as i32).is_some() {
             return;
         }
+        if self.fold_range_unchecked(r) {
+            self.gutter.queue_draw();
+        }
+    }
+
+    fn fold_range_unchecked(&self, r: fold::Range) -> bool {
+        let buf = &self.buffer;
         let (Some(head), Some(start)) = (buf.iter_at_line(r.header as i32), buf.iter_at_line(r.header as i32 + 1)) else {
-            return;
+            return false;
         };
         let end = buf.iter_at_line(r.last as i32 + 1).unwrap_or_else(|| buf.end_iter());
         if start >= end {
-            return;
+            return false;
         }
         let ins = buf.iter_at_mark(&buf.get_insert());
         let sel = buf.iter_at_mark(&buf.selection_bound());
@@ -778,7 +856,7 @@ impl Doc {
             start: buf.create_mark(None, &start, true),
             end: buf.create_mark(None, &end, true),
         });
-        self.gutter.queue_draw();
+        true
     }
 
     /// Remove the tags and marks of a block that is no longer collapsed.
@@ -868,12 +946,26 @@ impl Doc {
     /// in languages without definitions, every outermost block. Returns
     /// the number of blocks collapsed.
     pub fn fold_all(&self) -> usize {
-        let ranges = self.fold_ranges();
         let lang = self.lang.get();
+        if !fold::supported(lang) || !self.loaded.get() || self.buffer.char_count() >= MAX_HIGHLIGHT_BYTES {
+            return 0;
+        }
+        let text = self.buffer_text();
+        let ranges = match self.cached_fold_ranges() {
+            Some(r) => r,
+            None => {
+                let r = Rc::new(fold::ranges(lang, &text));
+                *self.fold_cache.borrow_mut() = Some((self.edit_gen.get(), lang, r.clone()));
+                r
+            }
+        };
+        if ranges.is_empty() {
+            return 0;
+        }
         // A C# or C++ namespace wraps the whole file: its body stays open.
         let wraps_file = |s: &crate::symbols::Symbol| matches!(lang, Lang::CSharp | Lang::Cpp) && s.kind == crate::symbols::SymKind::Module;
         let mut lines: Vec<u32> =
-            crate::symbols::extract(lang, &self.text()).iter().filter(|s| !wraps_file(s)).map(|s| s.line).collect();
+            crate::symbols::extract(lang, &text).iter().filter(|s| !wraps_file(s)).map(|s| s.line).collect();
         lines.sort_unstable();
         lines.dedup();
         let mut targets: Vec<fold::Range> = Vec::new();
@@ -881,7 +973,8 @@ impl Doc {
             // The body opens on the definition line or a few lines below
             // (long signatures), never past the next definition.
             let limit = lines.get(k + 1).copied().unwrap_or(u32::MAX).min(d + 6);
-            if let Some(r) = ranges.iter().find(|r| r.block && r.header >= d && r.header < limit) {
+            let at = ranges.partition_point(|r| r.header < d);
+            if let Some(r) = ranges[at..].iter().take_while(|r| r.header < limit).find(|r| r.block) {
                 targets.push(*r);
             }
         }
@@ -894,11 +987,19 @@ impl Doc {
                 }
             }
         }
+        let mut existing: std::collections::HashSet<i32> =
+            self.folds.borrow().iter().map(|f| self.buffer.iter_at_mark(&f.head).line()).collect();
         let before = self.folds.borrow().len();
         for r in targets {
-            self.fold_range(r);
+            if existing.insert(r.header as i32) {
+                self.fold_range_unchecked(r);
+            }
         }
-        self.folds.borrow().len() - before
+        let added = self.folds.borrow().len() - before;
+        if added > 0 {
+            self.gutter.queue_draw();
+        }
+        added
     }
 
     pub fn unfold_all(&self) {
@@ -1049,6 +1150,10 @@ impl Doc {
         self.loaded.get()
     }
 
+    pub fn is_loading(&self) -> bool {
+        self.loading.get()
+    }
+
     pub fn is_modified(&self) -> bool {
         if self.loaded.get() { self.buffer.is_modified() } else { self.unloaded_modified.get() }
     }
@@ -1113,9 +1218,15 @@ impl Doc {
         self.edit_gen.get()
     }
 
-    pub fn text(&self) -> String {
+    /// Full buffer text as a GLib string (avoids copying into a second Rust
+    /// `String` when callers only need a `&str` slice).
+    pub fn buffer_text(&self) -> glib::GString {
         let (a, b) = self.buffer.bounds();
-        self.buffer.text(&a, &b, true).into()
+        self.buffer.text(&a, &b, true)
+    }
+
+    pub fn text(&self) -> String {
+        self.buffer_text().into()
     }
 
     pub fn cursor_offset(&self) -> i32 {
@@ -1141,7 +1252,7 @@ impl Doc {
         self.loaded.set(true);
         self.record_disk_stamp();
         self.edit_gen.set(self.edit_gen.get() + 1);
-        self.reset_highlight();
+        self.reset_highlight(false);
         self.update_gutter_width();
         self.update_cursor_decorations();
         self.refresh_title();
@@ -1210,6 +1321,8 @@ impl Doc {
         hl.states = vec![State::Normal];
         hl.states.shrink_to_fit();
         hl.lo = NO_DIRTY;
+        hl.fresh_from = 0;
+        hl.preview = None;
         true
     }
 
@@ -1255,13 +1368,18 @@ impl Doc {
         self.loaded.get() && self.is_unsaved() && self.cache_gen.get() != self.edit_gen.get()
     }
 
+    pub fn set_cache_gen(&self, edit_gen: u64) {
+        self.cache_gen.set(edit_gen);
+    }
+
     /// Write the current content to `~/.macaco/cache/`.
     pub fn write_cache(&self) -> std::io::Result<()> {
         if !self.loaded.get() {
             return Ok(());
         }
         let id = self.id.borrow().clone();
-        config::write_cache(&id, &self.text(), &self.cache_meta())?;
+        let text = self.buffer_text();
+        config::write_cache(&id, &text, &self.cache_meta())?;
         self.cache_gen.set(self.edit_gen.get());
         Ok(())
     }
@@ -1394,13 +1512,15 @@ impl Doc {
         }
         self.update_gutter_width();
         self.gutter.queue_draw();
-        self.reset_highlight();
+        self.reset_highlight(true);
     }
 
-    fn reset_highlight(self: &Rc<Self>) {
-        let (a, b) = self.buffer.bounds();
-        for t in &self.shared.tags.syntax {
-            self.buffer.remove_tag(t, &a, &b);
+    fn reset_highlight(self: &Rc<Self>, clear_tags: bool) {
+        if clear_tags {
+            let (a, b) = self.buffer.bounds();
+            for t in &self.shared.tags.syntax {
+                self.buffer.remove_tag(t, &a, &b);
+            }
         }
         let n = self.buffer.line_count().max(1) as usize;
         let enabled = self.lang.get() != Lang::Plain && self.buffer.char_count() < MAX_HIGHLIGHT_BYTES;
@@ -1409,6 +1529,8 @@ impl Doc {
             hl.states = vec![State::Normal; n];
             hl.enabled = enabled;
             hl.lo = NO_DIRTY;
+            hl.fresh_from = 0;
+            hl.preview = None;
             if enabled {
                 hl.mark(0, n - 1);
             }
@@ -1447,6 +1569,11 @@ impl Doc {
         if hl.states.len() != n {
             hl.states.resize(n, State::Normal);
         }
+        hl.fresh_from = hl.fresh_from.min(n);
+        if let Some((p_lo, p_hi)) = hl.preview {
+            let p_hi = p_hi.min(n);
+            hl.preview = (p_lo < p_hi).then_some((p_lo, p_hi));
+        }
         if hl.lo == NO_DIRTY || !hl.enabled || !self.loaded.get() {
             hl.lo = NO_DIRTY;
             return false;
@@ -1456,19 +1583,78 @@ impl Doc {
             return false;
         }
         let deadline = Instant::now() + HL_BUDGET;
+        let mut toks = Vec::with_capacity(32);
+        // When a large newly loaded file opens or restores away from the top,
+        // paint the visible slice first so frame 1 already has colours; the
+        // sequential pass below will re-lex it with the exact state.
+        if hl.preview.is_none() && hl.fresh_from + 256 < n {
+            let vis_line = if self.view.is_mapped() {
+                let rect = self.view.visible_rect();
+                if rect.height() > 0 { self.view.line_at_y(rect.y().max(0)).0.line().max(0) as usize } else { 0 }
+            } else {
+                0
+            };
+            let cur_line = self.cursor_iter().line().max(0) as usize;
+            let target = if vis_line >= hl.fresh_from + 256 {
+                Some(vis_line)
+            } else if cur_line >= hl.fresh_from + 256 {
+                Some(cur_line)
+            } else {
+                None
+            };
+            if let Some(t) = target {
+                let p_lo = t.saturating_sub(32).max(hl.fresh_from).max(hl.lo);
+                let p_hi = (t + 128).min(n);
+                if p_lo < p_hi {
+                    let start = buf.iter_at_line(p_lo as i32).unwrap_or_else(|| buf.end_iter());
+                    let end = if p_hi >= n { buf.end_iter() } else { buf.iter_at_line(p_hi as i32).unwrap_or_else(|| buf.end_iter()) };
+                    let text = buf.text(&start, &end, true);
+                    let mut base = start;
+                    let mut p_state = lexer::initial_state(lang);
+                    for l in text.split('\n').take(p_hi - p_lo) {
+                        p_state = lexer::lex_line(lang, p_state, l, &mut toks);
+                        for tok in &toks {
+                            let mut s = base;
+                            s.set_line_index(tok.start as i32);
+                            let mut e = base;
+                            e.set_line_index(tok.end as i32);
+                            buf.apply_tag(&tags.syntax[tok.kind as usize], &s, &e);
+                        }
+                        base.forward_line();
+                    }
+                    hl.preview = Some((p_lo, p_hi));
+                    hl.hi = hl.hi.max(p_hi - 1);
+                }
+            }
+        }
+        let clear_range = |r_lo: usize, r_hi: usize| {
+            if r_lo >= r_hi {
+                return;
+            }
+            let s = buf.iter_at_line(r_lo as i32).unwrap_or_else(|| buf.end_iter());
+            let e = if r_hi >= n { buf.end_iter() } else { buf.iter_at_line(r_hi as i32).unwrap_or_else(|| buf.end_iter()) };
+            for t in &tags.syntax {
+                buf.remove_tag(t, &s, &e);
+            }
+        };
         let mut line = hl.lo;
         let mut state = if line == 0 { lexer::initial_state(lang) } else { hl.states[line - 1] };
         // A key press usually changes one line, which converges at the
-        // next one: two lines, then twice as many each round.
-        let mut chunk = 2;
-        let mut toks = Vec::with_capacity(32);
+        // next one: two lines, then twice as many each round. When many lines
+        // are dirty (file load or large paste), start directly at 256.
+        let mut chunk = if hl.hi.saturating_sub(line) > 256 { 256 } else { 2 };
         loop {
             let end_line = (line + chunk).min(n);
+            clear_range(line, end_line.min(hl.fresh_from));
+            if let Some((p_lo, p_hi)) = hl.preview {
+                clear_range(line.max(p_lo).max(hl.fresh_from), end_line.min(p_hi));
+                if line <= p_lo {
+                    let next_lo = p_lo.max(end_line);
+                    hl.preview = (next_lo < p_hi).then_some((next_lo, p_hi));
+                }
+            }
             let start = buf.iter_at_line(line as i32).unwrap_or_else(|| buf.end_iter());
             let end = if end_line >= n { buf.end_iter() } else { buf.iter_at_line(end_line as i32).unwrap_or_else(|| buf.end_iter()) };
-            for t in &tags.syntax {
-                buf.remove_tag(t, &start, &end);
-            }
             let text = buf.text(&start, &end, true);
             let mut base = start;
             let mut converged = false;
@@ -1490,6 +1676,7 @@ impl Doc {
                 base.forward_line();
             }
             line = end_line;
+            hl.fresh_from = hl.fresh_from.max(line);
             if converged || line >= n {
                 hl.lo = NO_DIRTY;
                 return false;
@@ -1833,4 +2020,38 @@ pub fn read_file(path: &Path, enc: Option<Encoding>) -> std::io::Result<(String,
     let text = encoding::decode_owned(bytes, enc);
     let (text, eol) = encoding::normalize_eol(text);
     Ok((text, enc, eol))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn highlighter_ranges_track_edits() {
+        let mut hl = Highlighter {
+            states: vec![State::Normal; 200],
+            lo: 0,
+            hi: 199,
+            fresh_from: 10,
+            preview: Some((100, 140)),
+            scheduled: false,
+            enabled: true,
+        };
+        // Insert before both fresh_from and preview: both shift down.
+        hl.on_insert(4, 3);
+        assert_eq!(hl.fresh_from, 13);
+        assert_eq!(hl.preview, Some((103, 143)));
+        // Insert inside preview: only preview upper bound grows; fresh_from untouched.
+        hl.on_insert(110, 5);
+        assert_eq!(hl.fresh_from, 13);
+        assert_eq!(hl.preview, Some((103, 148)));
+        // Delete spanning into preview start (merges line 100..=103 into 100).
+        hl.on_delete(100, 3);
+        assert_eq!(hl.fresh_from, 13);
+        assert_eq!(hl.preview, Some((100, 145)));
+        // Delete spanning past fresh_from (merges 8..=20 into 8).
+        hl.on_delete(8, 12);
+        assert_eq!(hl.fresh_from, 9);
+        assert_eq!(hl.preview, Some((88, 133)));
+    }
 }

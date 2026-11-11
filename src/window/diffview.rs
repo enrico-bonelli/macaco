@@ -27,11 +27,15 @@ impl Editor {
     }
 
     pub(super) fn clear_diff(&self) {
+        self.diff_gen.set(self.diff_gen.get().wrapping_add(1));
+        self.clear_diff_tags();
+    }
+
+    fn clear_diff_tags(&self) {
         let tags = &self.shared.tags;
         for d in self.diff_pair.borrow_mut().drain(..).filter_map(|w| w.upgrade()) {
-            let (a, b) = d.buffer.bounds();
             for t in tags.diff_tags() {
-                d.buffer.remove_tag(t, &a, &b);
+                doc::remove_tag_where_applied(&d.buffer, t);
             }
         }
         *self.diff_result.borrow_mut() = None;
@@ -54,19 +58,48 @@ impl Editor {
     }
 
     pub(super) fn compute_diff(self: &Rc<Self>) {
-        self.clear_diff();
+        let seq = self.diff_gen.get().wrapping_add(1);
+        self.diff_gen.set(seq);
         self.status.diff.set_visible(true);
         let (Some(l), Some(r)) = (self.current_doc(0), self.current_doc(1)) else {
+            self.clear_diff_tags();
             self.status.diff.set_text("Diff: serve una scheda per pannello");
             return;
         };
         for d in [&l, &r] {
             if let Err(e) = d.ensure_loaded() {
+                self.clear_diff_tags();
                 self.message(&format!("Errore: {e}"));
                 return;
             }
         }
-        let res = diff::compute(&l.text(), &r.text());
+        if self.diff_docs().is_some_and(|(ol, or)| !Rc::ptr_eq(&ol, &l) || !Rc::ptr_eq(&or, &r)) {
+            self.clear_diff_tags();
+        }
+        let (l_gen, r_gen) = (l.edit_gen(), r.edit_gen());
+        let (l_text, r_text) = (l.text(), r.text());
+        let ed = Rc::downgrade(self);
+        let (wl, wr) = (l.weak(), r.weak());
+        glib::spawn_future_local(async move {
+            let Ok(res) = gio::spawn_blocking(move || diff::compute(&l_text, &r_text)).await else { return };
+            let Some(ed) = ed.upgrade() else { return };
+            if !ed.diff_on.get() || ed.diff_gen.get() != seq {
+                return;
+            }
+            let (Some(l), Some(r)) = (wl.upgrade(), wr.upgrade()) else { return };
+            if ed.current_doc(0).is_none_or(|c| !Rc::ptr_eq(&c, &l)) || ed.current_doc(1).is_none_or(|c| !Rc::ptr_eq(&c, &r)) {
+                return;
+            }
+            if l.edit_gen() != l_gen || r.edit_gen() != r_gen {
+                ed.schedule_diff();
+                return;
+            }
+            ed.apply_diff(&l, &r, res);
+        });
+    }
+
+    fn apply_diff(&self, l: &Rc<Doc>, r: &Rc<Doc>, res: DiffResult) {
+        self.clear_diff_tags();
         let tags = &self.shared.tags;
         let mark_lines = |d: &Doc, lines: &Range<usize>, tag: &gtk::TextTag| {
             if lines.is_empty() {
@@ -83,11 +116,11 @@ impl Editor {
         };
         for h in &res.hunks {
             match h.kind {
-                HunkKind::Added => mark_lines(&r, &h.new, &tags.diff_add),
-                HunkKind::Removed => mark_lines(&l, &h.old, &tags.diff_del),
+                HunkKind::Added => mark_lines(r, &h.new, &tags.diff_add),
+                HunkKind::Removed => mark_lines(l, &h.old, &tags.diff_del),
                 HunkKind::Changed => {
-                    mark_lines(&l, &h.old, &tags.diff_chg);
-                    mark_lines(&r, &h.new, &tags.diff_chg);
+                    mark_lines(l, &h.old, &tags.diff_chg);
+                    mark_lines(r, &h.new, &tags.diff_chg);
                 }
             }
         }
@@ -101,8 +134,8 @@ impl Editor {
                 }
             }
         };
-        mark_words(&l, &res.old_words, &tags.diff_word_del);
-        mark_words(&r, &res.new_words, &tags.diff_word_add);
+        mark_words(l, &res.old_words, &tags.diff_word_del);
+        mark_words(r, &res.new_words, &tags.diff_word_add);
 
         let (add, del, chg) = res.stats();
         let n = res.hunks.len();

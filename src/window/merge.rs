@@ -52,6 +52,8 @@ pub(super) struct Merge {
     pub(super) win: gtk::Window,
     /// Left, result, right.
     panes: [Rc<Doc>; 3],
+    /// Immutable left and right texts, shared with background diff workers.
+    sides: [std::sync::Arc<str>; 2],
     /// Between left and result, between result and right.
     links: [gtk::DrawingArea; 2],
     /// Differences of the left and of the right side from the result
@@ -65,6 +67,8 @@ pub(super) struct Merge {
     summary: gtk::Label,
     target: Target,
     pending: Cell<bool>,
+    recompute_seq: Cell<u64>,
+    computed_gen: Cell<Option<u64>>,
     syncing: Cell<bool>,
 }
 
@@ -188,15 +192,25 @@ impl Editor {
             let text = |o: &git::Output| String::from_utf8_lossy(&o.stdout).into_owned();
             // The common ancestor is missing when both sides added the file.
             let (b, o, t) = (if base.ok { text(&base) } else { String::new() }, text(&ours), text(&theirs));
-            let merged = diff::merge3(&b, &o, &t);
-            let left = Side { text: o, title: format!("La tua versione (HEAD) — {rel}"), path: Some(file.clone()) };
-            let right = Side { text: t, title: format!("Versione in arrivo — {rel}"), path: Some(file.clone()) };
-            ed.message(&match merged.conflicts {
-                0 => "Unione automatica senza conflitti: controlla il risultato e salva".to_string(),
-                1 => "1 conflitto da risolvere (in rosso)".to_string(),
-                n => format!("{n} conflitti da risolvere (in rosso)"),
+            let (ed, root, rel, file) = (ed.clone(), root.clone(), rel.clone(), file.clone());
+            glib::spawn_future_local(async move {
+                let Ok((o, t, merged)) = gio::spawn_blocking(move || {
+                    let merged = diff::merge3(&b, &o, &t);
+                    (o, t, merged)
+                })
+                .await
+                else {
+                    return;
+                };
+                let left = Side { text: o, title: format!("La tua versione (HEAD) — {rel}"), path: Some(file.clone()) };
+                let right = Side { text: t, title: format!("Versione in arrivo — {rel}"), path: Some(file.clone()) };
+                ed.message(&match merged.conflicts {
+                    0 => "Unione automatica senza conflitti: controlla il risultato e salva".to_string(),
+                    1 => "1 conflitto da risolvere (in rosso)".to_string(),
+                    n => format!("{n} conflitti da risolvere (in rosso)"),
+                });
+                ed.open_merge(left, merged.text, right, Target::Git { root, rel: rel.clone(), file }, &format!("Risolvi il conflitto — {rel}"));
             });
-            ed.open_merge(left, merged.text, right, Target::Git { root, rel: rel.clone(), file }, &format!("Risolvi il conflitto — {rel}"));
         });
     }
 
@@ -297,10 +311,12 @@ impl Merge {
         body.append(&columns);
         win.set_child(Some(&body));
 
+        let sides: [std::sync::Arc<str>; 2] = [left.text.into(), right.text.into()];
         let m = Rc::new(Merge {
             ed: Rc::downgrade(ed),
             win,
             panes,
+            sides,
             links,
             diffs: RefCell::new([DiffResult::default(), DiffResult::default()]),
             conflicting: RefCell::new([Vec::new(), Vec::new()]),
@@ -308,10 +324,12 @@ impl Merge {
             summary,
             target,
             pending: Cell::new(false),
+            recompute_seq: Cell::new(0),
+            computed_gen: Cell::new(None),
             syncing: Cell::new(false),
         });
         m.connect(&prev, &next, save_buttons);
-        m.recompute();
+        m.recompute_async();
         m
     }
 
@@ -461,20 +479,62 @@ impl Merge {
         glib::timeout_add_local_once(RECOMPUTE, move || {
             if let Some(m) = w.upgrade() {
                 m.pending.set(false);
-                m.recompute();
+                if m.computed_gen.get() != Some(m.panes[1].edit_gen()) {
+                    m.recompute_async();
+                }
             }
         });
     }
 
-    /// Compare both sides with the result and mark the blocks.
-    fn recompute(&self) {
+    fn compute_pair(left: &str, right: &str, center: &str) -> ([DiffResult; 2], [Vec<bool>; 2]) {
+        let diffs = [diff::compute(left, center), diff::compute(right, center)];
+        let conflicting = [conflict_flags(&diffs[0].hunks, &diffs[1].hunks), conflict_flags(&diffs[1].hunks, &diffs[0].hunks)];
+        (diffs, conflicting)
+    }
+
+    /// Compare both sides with the result on a worker thread and mark the
+    /// blocks once ready.
+    fn recompute_async(self: &Rc<Self>) {
+        let seq = self.recompute_seq.get().wrapping_add(1);
+        self.recompute_seq.set(seq);
+        let center_gen = self.panes[1].edit_gen();
         let center = self.panes[1].text();
-        let diffs = [diff::compute(&self.panes[0].text(), &center), diff::compute(&self.panes[2].text(), &center)];
+        let (left, right) = (self.sides[0].clone(), self.sides[1].clone());
+        let w = Rc::downgrade(self);
+        glib::spawn_future_local(async move {
+            let Ok((diffs, conflicting)) = gio::spawn_blocking(move || Self::compute_pair(&left, &right, &center)).await else {
+                return;
+            };
+            let Some(m) = w.upgrade() else { return };
+            if m.recompute_seq.get() != seq {
+                return;
+            }
+            if m.panes[1].edit_gen() != center_gen {
+                m.schedule_recompute();
+                return;
+            }
+            m.apply_computed(center_gen, diffs, conflicting);
+        });
+    }
+
+    /// Synchronous recomputation when an immediate up-to-date conflict count
+    /// is needed (`save` on a git conflict, or scripted debug steps).
+    fn ensure_recomputed(&self) {
+        let center_gen = self.panes[1].edit_gen();
+        if self.computed_gen.get() == Some(center_gen) {
+            return;
+        }
+        self.recompute_seq.set(self.recompute_seq.get().wrapping_add(1));
+        let center = self.panes[1].text();
+        let (diffs, conflicting) = Self::compute_pair(&self.sides[0], &self.sides[1], &center);
+        self.apply_computed(center_gen, diffs, conflicting);
+    }
+
+    fn apply_computed(&self, center_gen: u64, diffs: [DiffResult; 2], conflicting: [Vec<bool>; 2]) {
         let tags = &self.panes[1].shared.tags;
         for d in &self.panes {
-            let (a, b) = d.buffer.bounds();
             for t in tags.diff_tags() {
-                d.buffer.remove_tag(t, &a, &b);
+                crate::doc::remove_tag_where_applied(&d.buffer, t);
             }
         }
         let lines = |d: &Doc, r: &Range<usize>, tag: &gtk::TextTag| {
@@ -493,7 +553,6 @@ impl Merge {
                 }
             }
         };
-        let conflicting = [conflict_flags(&diffs[0].hunks, &diffs[1].hunks), conflict_flags(&diffs[1].hunks, &diffs[0].hunks)];
         let mut blocks = 0;
         for (k, side) in [(0, 0), (1, 2)] {
             for (h, &conflict) in diffs[k].hunks.iter().zip(&conflicting[k]) {
@@ -524,6 +583,7 @@ impl Merge {
         }
         *self.diffs.borrow_mut() = diffs;
         *self.conflicting.borrow_mut() = conflicting;
+        self.computed_gen.set(Some(center_gen));
         self.redraw();
     }
 
@@ -661,7 +721,7 @@ impl Merge {
         buf.insert(&mut start, &text);
         buf.end_user_action();
         buf.place_cursor(&buf.iter_at_offset(offset));
-        self.recompute();
+        self.recompute_async();
     }
 
     /// Keep the other columns aligned with pane `p` that scrolled.
@@ -736,7 +796,7 @@ impl Merge {
     fn save(self: &Rc<Self>, path: Option<PathBuf>) {
         // The count of conflicts must be up to date (only git asks it).
         if matches!(self.target, Target::Git { .. }) {
-            self.recompute();
+            self.ensure_recomputed();
         }
         let Some(ed) = self.ed.upgrade() else { return };
         let text = self.panes[1].text();
@@ -826,11 +886,13 @@ impl Editor {
 impl Merge {
     /// Click the arrow of block `i` of link `k`.
     pub(super) fn debug_take(self: &Rc<Self>, k: usize, i: usize, after: bool) {
+        self.ensure_recomputed();
         let Some(h) = self.diffs.borrow()[k].hunks.get(i).cloned() else { return };
         self.copy_block(if k == 0 { 0 } else { 2 }, &h.old, &h.new, if after { Apply::After } else { Apply::Replace });
     }
 
     pub(super) fn debug_dump(&self) {
+        self.ensure_recomputed();
         let d = self.diffs.borrow();
         eprintln!("MERGE summary={:?} left={} right={} conflicts={}", self.summary.text(), d[0].hunks.len(), d[1].hunks.len(), self.conflicts());
         eprintln!("RESULT {:?}", self.panes[1].text());

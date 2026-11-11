@@ -369,18 +369,100 @@ pub fn words<'a>(text: &'a str, min_len: usize, prefix: &str) -> Vec<&'a str> {
 
 /// Whether `s` starts with `lower` ignoring case (`lower` is lowercase).
 pub fn starts_with_lower(s: &str, lower: &str) -> bool {
+    if lower.is_ascii() && s.as_bytes().get(..lower.len()).is_some_and(|b| b.is_ascii()) {
+        return s.as_bytes()[..lower.len()].eq_ignore_ascii_case(lower.as_bytes());
+    }
     let mut s = s.chars().flat_map(char::to_lowercase);
     lower.chars().all(|c| s.next() == Some(c))
 }
 
 // --------------------------------------------------------------- project
 
-/// A symbol of the project.
-#[derive(Clone, Debug)]
-pub struct Entry {
-    pub sym: Symbol,
+/// Borrowed view of a symbol stored in [`ProjectSymbols`].
+#[derive(Clone, Copy, Debug)]
+pub struct EntryRef<'a> {
+    pub name: &'a str,
+    pub kind: SymKind,
+    pub line: u32,
+    pub col: u32,
     /// Index of the file in `ProjectSymbols::files`.
     pub file: u32,
+}
+
+impl EntryRef<'_> {
+    pub fn to_symbol(self) -> Symbol {
+        Symbol { name: self.name.to_string(), kind: self.kind, line: self.line, col: self.col }
+    }
+}
+
+/// Compact index entry pointing into a shared UTF-8 string arena (`blob`):
+/// `blob[off .. off + key_len]` is the lowercase key; when `name_len == 0`
+/// the symbol name equals its key, otherwise `blob[off + key_len .. off +
+/// key_len + name_len]` holds the original-case name.
+#[derive(Clone, Copy, Debug)]
+struct StoredEntry {
+    off: u32,
+    key_len: u32,
+    name_len: u32,
+    line: u32,
+    col: u32,
+    file: u32,
+    kind: SymKind,
+}
+
+impl StoredEntry {
+    fn key<'a>(&self, blob: &'a str) -> &'a str {
+        let s = self.off as usize;
+        &blob[s..s + self.key_len as usize]
+    }
+
+    fn name<'a>(&self, blob: &'a str) -> &'a str {
+        if self.name_len == 0 {
+            self.key(blob)
+        } else {
+            let s = (self.off + self.key_len) as usize;
+            &blob[s..s + self.name_len as usize]
+        }
+    }
+
+    fn raw_slice<'a>(&self, blob: &'a str) -> &'a str {
+        let s = self.off as usize;
+        let len = (self.key_len + self.name_len) as usize;
+        &blob[s..s + len]
+    }
+
+    fn as_ref<'a>(&self, blob: &'a str) -> EntryRef<'a> {
+        EntryRef { name: self.name(blob), kind: self.kind, line: self.line, col: self.col, file: self.file }
+    }
+}
+
+fn push_symbol(blob: &mut String, sym: Symbol, file: u32) -> StoredEntry {
+    let off = blob.len() as u32;
+    let is_lower = if sym.name.is_ascii() {
+        !sym.name.bytes().any(|b| b.is_ascii_uppercase())
+    } else {
+        !sym.name.chars().any(char::is_uppercase)
+    };
+    let (key_len, name_len) = if is_lower {
+        blob.push_str(&sym.name);
+        (sym.name.len() as u32, 0)
+    } else {
+        if sym.name.is_ascii() {
+            for b in sym.name.bytes() {
+                blob.push(b.to_ascii_lowercase() as char);
+            }
+        } else {
+            blob.extend(sym.name.chars().flat_map(char::to_lowercase));
+        }
+        let key_len = (blob.len() as u32) - off;
+        if blob[off as usize..] == sym.name {
+            (key_len, 0)
+        } else {
+            blob.push_str(&sym.name);
+            (key_len, sym.name.len() as u32)
+        }
+    };
+    StoredEntry { off, key_len, name_len, line: sym.line, col: sym.col, file, kind: sym.kind }
 }
 
 /// Modification time (ns) and size of a file: its symbols are read again
@@ -399,34 +481,51 @@ pub enum FileSymbols {
     New(Vec<Symbol>),
 }
 
-/// Symbols and lower case names, sorted by name.
-pub type Sorted = Vec<(String, Entry)>;
+/// Compact arena of newly scanned symbols sorted by lowercase name.
+#[derive(Default)]
+pub struct Sorted {
+    blob: String,
+    entries: Vec<StoredEntry>,
+}
 
 /// Sorts the new symbols (done in the background before `apply_scan`).
 pub fn sort_new(per_file: &mut [FileSymbols]) -> Sorted {
-    let mut out: Sorted = Vec::new();
-    for (f, fs) in per_file.iter_mut().enumerate() {
+    let (mut count, mut bytes) = (0usize, 0usize);
+    for fs in per_file.iter() {
         if let FileSymbols::New(syms) = fs {
-            out.extend(std::mem::take(syms).into_iter().map(|sym| (sym.name.to_lowercase(), Entry { sym, file: f as u32 })));
+            count += syms.len();
+            bytes += syms.iter().map(|s| s.name.len() * 2).sum::<usize>();
         }
     }
-    out.sort_by(|a, b| a.0.cmp(&b.0));
-    out
+    let mut blob = String::with_capacity(bytes);
+    let mut entries = Vec::with_capacity(count);
+    for (f, fs) in per_file.iter_mut().enumerate() {
+        if let FileSymbols::New(syms) = fs {
+            for sym in std::mem::take(syms) {
+                entries.push(push_symbol(&mut blob, sym, f as u32));
+            }
+        }
+    }
+    entries.sort_unstable_by(|a, b| a.key(&blob).cmp(b.key(&blob)).then(a.file.cmp(&b.file)).then(a.line.cmp(&b.line)));
+    blob.shrink_to_fit();
+    Sorted { blob, entries }
 }
 
-/// Definitions of the files of a folder, sorted by lower case name.
+/// Definitions of the files of a folder, stored in two contiguous arenas
+/// (`files` and `blob` + `entries`) sorted by lower case name.
 #[derive(Default)]
 pub struct ProjectSymbols {
-    pub files: Vec<String>,
+    pub files: crate::finder::Paths,
     stamps: Vec<Stamp>,
-    entries: Vec<Entry>,
-    keys: Vec<String>,
+    blob: String,
+    entries: Vec<StoredEntry>,
 }
 
 impl ProjectSymbols {
     #[cfg(test)]
     pub fn build(files: Vec<String>, per_file: Vec<Vec<Symbol>>) -> ProjectSymbols {
         let stamps = vec![(0, 0); files.len()];
+        let files = crate::finder::Paths::from_vec(&files);
         let mut per_file: Vec<FileSymbols> = per_file.into_iter().map(FileSymbols::New).collect();
         let sorted = sort_new(&mut per_file);
         let mut p = ProjectSymbols::default();
@@ -436,48 +535,77 @@ impl ProjectSymbols {
 
     /// Files and stamps of the last scan: file → (stamp, index).
     pub fn stamps(&self) -> HashMap<String, (Stamp, u32)> {
-        self.files.iter().zip(&self.stamps).enumerate().map(|(i, (f, s))| (f.clone(), (*s, i as u32))).collect()
+        let mut out = HashMap::with_capacity(self.files.len());
+        for (i, &s) in self.stamps.iter().enumerate() {
+            out.insert(self.files.get(i).to_string(), (s, i as u32));
+        }
+        out
     }
 
     /// Whether a scan found the same files, all unchanged.
-    pub fn unchanged(&self, files: &[String], per_file: &[FileSymbols]) -> bool {
+    pub fn unchanged(&self, files: &crate::finder::Paths, per_file: &[FileSymbols]) -> bool {
         files.len() == self.files.len() && per_file.iter().enumerate().all(|(i, f)| matches!(f, FileSymbols::Same(o) if *o as usize == i))
     }
 
     /// Takes the result of a new scan: symbols of unchanged files are kept,
     /// `sorted` (from `sort_new`) replaces the others.
-    pub fn apply_scan(&mut self, files: Vec<String>, stamps: Vec<Stamp>, per_file: &[FileSymbols], sorted: Sorted) {
+    pub fn apply_scan(&mut self, files: crate::finder::Paths, stamps: Vec<Stamp>, per_file: &[FileSymbols], sorted: Sorted) {
         let mut remap = vec![None; self.files.len()];
+        let mut any_kept = false;
         for (new, f) in per_file.iter().enumerate() {
             if let FileSymbols::Same(old) = f {
                 remap[*old as usize] = Some(new as u32);
+                any_kept = true;
             }
         }
-        self.merge(|f| remap.get(f as usize).copied().flatten(), sorted);
+        if !any_kept || self.entries.is_empty() {
+            self.blob = sorted.blob;
+            self.entries = sorted.entries;
+        } else {
+            self.merge(|f| remap.get(f as usize).copied().flatten(), sorted);
+        }
         self.files = files;
         self.stamps = stamps;
     }
 
     /// Keeps the entries whose file `keep` maps to a (new) index, and adds
-    /// `new`, both sorted: a linear merge instead of a new sort.
+    /// `new`, both sorted: a linear merge into a fresh compact arena.
     fn merge(&mut self, keep: impl Fn(u32) -> Option<u32>, new: Sorted) {
-        let old = std::mem::take(&mut self.entries).into_iter().zip(std::mem::take(&mut self.keys)).filter_map(|(mut e, k)| {
-            e.file = keep(e.file)?;
-            Some((k, e))
-        });
-        let mut old = old.peekable();
-        let mut new = new.into_iter().peekable();
+        let old_blob = std::mem::take(&mut self.blob);
+        let old_entries = std::mem::take(&mut self.entries);
+        let mut merged_blob = String::with_capacity(old_blob.len() + new.blob.len());
+        let mut merged_entries = Vec::with_capacity(old_entries.len() + new.entries.len());
+
+        let mut old = old_entries
+            .into_iter()
+            .filter_map(|mut e| {
+                e.file = keep(e.file)?;
+                Some(e)
+            })
+            .peekable();
+        let mut added = new.entries.into_iter().peekable();
         loop {
-            let take_old = match (old.peek(), new.peek()) {
-                (Some(a), Some(b)) => a.0 <= b.0,
+            let take_old = match (old.peek(), added.peek()) {
+                (Some(a), Some(b)) => a.key(&old_blob) <= b.key(&new.blob),
                 (Some(_), None) => true,
                 (None, Some(_)) => false,
                 (None, None) => break,
             };
-            let (k, e) = if take_old { old.next() } else { new.next() }.expect("peeked");
-            self.keys.push(k);
-            self.entries.push(e);
+            let (mut e, src_blob) = if take_old {
+                (old.next().expect("peeked"), old_blob.as_str())
+            } else {
+                (added.next().expect("peeked"), new.blob.as_str())
+            };
+            let raw = e.raw_slice(src_blob);
+            e.off = merged_blob.len() as u32;
+            merged_blob.push_str(raw);
+            merged_entries.push(e);
         }
+        if merged_blob.capacity() > merged_blob.len() + (64 << 10) {
+            merged_blob.shrink_to_fit();
+        }
+        self.blob = merged_blob;
+        self.entries = merged_entries;
     }
 
     pub fn len(&self) -> usize {
@@ -485,47 +613,63 @@ impl ProjectSymbols {
     }
 
     /// Definitions named exactly `name`.
-    pub fn find(&self, name: &str) -> Vec<&Entry> {
-        let key = name.to_lowercase();
-        let start = self.keys.partition_point(|k| k.as_str() < key.as_str());
+    pub fn find<'a>(&'a self, name: &str) -> Vec<EntryRef<'a>> {
+        let key: Cow<'_, str> = if name.is_ascii() {
+            if name.bytes().any(|b| b.is_ascii_uppercase()) {
+                Cow::Owned(name.to_ascii_lowercase())
+            } else {
+                Cow::Borrowed(name)
+            }
+        } else {
+            Cow::Owned(name.to_lowercase())
+        };
+        let start = self.entries.partition_point(|e| e.key(&self.blob) < key.as_ref());
         self.entries[start..]
             .iter()
-            .zip(&self.keys[start..])
-            .take_while(|(_, k)| **k == key)
-            .filter(|(e, _)| e.sym.name == name)
-            .map(|(e, _)| e)
+            .take_while(|e| e.key(&self.blob) == key.as_ref())
+            .filter(|e| e.name(&self.blob) == name)
+            .map(|e| e.as_ref(&self.blob))
             .collect()
     }
 
     /// Symbols whose name starts with `prefix` (ignoring case).
-    pub fn with_prefix(&self, prefix: &str, limit: usize) -> Vec<&Entry> {
-        let key = prefix.to_lowercase();
-        let start = self.keys.partition_point(|k| k.as_str() < key.as_str());
+    pub fn with_prefix<'a>(&'a self, prefix: &str, limit: usize) -> Vec<EntryRef<'a>> {
+        let key: Cow<'_, str> = if prefix.is_ascii() {
+            if prefix.bytes().any(|b| b.is_ascii_uppercase()) {
+                Cow::Owned(prefix.to_ascii_lowercase())
+            } else {
+                Cow::Borrowed(prefix)
+            }
+        } else {
+            Cow::Owned(prefix.to_lowercase())
+        };
+        let start = self.entries.partition_point(|e| e.key(&self.blob) < key.as_ref());
         self.entries[start..]
             .iter()
-            .zip(&self.keys[start..])
-            .take_while(|(_, k)| k.starts_with(key.as_str()))
-            .map(|(e, _)| e)
+            .take_while(|e| e.key(&self.blob).starts_with(key.as_ref()))
+            .map(|e| e.as_ref(&self.blob))
             .take(limit)
             .collect()
     }
 
     /// Replaces the symbols of `file` (after it was saved).
     pub fn update_file(&mut self, rel: &str, stamp: Stamp, syms: Vec<Symbol>) {
-        let idx = match self.files.iter().position(|f| f == rel) {
+        let idx = match self.files.position(rel) {
             Some(i) => {
                 self.stamps[i] = stamp;
                 i as u32
             }
             None => {
-                self.files.push(rel.to_string());
+                let i = self.files.push(rel);
                 self.stamps.push(stamp);
-                (self.files.len() - 1) as u32
+                i as u32
             }
         };
-        let mut new: Sorted = syms.into_iter().map(|sym| (sym.name.to_lowercase(), Entry { sym, file: idx })).collect();
-        new.sort_by(|a, b| a.0.cmp(&b.0));
-        self.merge(|f| (f != idx).then_some(f), new);
+        let bytes: usize = syms.iter().map(|s| s.name.len() * 2).sum();
+        let mut blob = String::with_capacity(bytes);
+        let mut entries: Vec<StoredEntry> = syms.into_iter().map(|sym| push_symbol(&mut blob, sym, idx)).collect();
+        entries.sort_unstable_by(|a, b| a.key(&blob).cmp(b.key(&blob)).then(a.line.cmp(&b.line)));
+        self.merge(|f| (f != idx).then_some(f), Sorted { blob, entries });
     }
 }
 
@@ -598,14 +742,25 @@ mod tests {
         // A new scan: a.rs unchanged (moved to index 1), c.rs new, b.rs gone.
         let mut per_file = vec![FileSymbols::New(extract(Lang::Rust, "fn apri() {}\n")), FileSymbols::Same(0)];
         let sorted = sort_new(&mut per_file);
-        p.apply_scan(vec!["c.rs".into(), "a.rs".into()], vec![(1, 1), (0, 0)], &per_file, sorted);
-        let files: Vec<&str> = p.find("apri").iter().map(|e| p.files[e.file as usize].as_str()).collect();
+        p.apply_scan(crate::finder::Paths::from_vec(&["c.rs".into(), "a.rs".into()]), vec![(1, 1), (0, 0)], &per_file, sorted);
+        let found = p.find("apri");
+        let files: Vec<&str> = found.iter().map(|e| p.files.get(e.file as usize)).collect();
         assert_eq!(files.len(), 2);
         assert!(files.contains(&"a.rs") && files.contains(&"c.rs"));
         assert_eq!(p.with_prefix("a", 10).len(), 3);
-        assert!(p.keys.windows(2).all(|w| w[0] <= w[1]));
+        assert!(p.entries.windows(2).all(|w| w[0].key(&p.blob) <= w[1].key(&p.blob)));
+        assert!(p.files.get(0) == "c.rs");
+        // Adding a brand-new file with mixed-case and Unicode symbols via update_file.
+        p.update_file("nuovo.py", (2, 2), extract(Lang::Python, "class CittàNuova:\n    def saluta():\n        pass\n"));
+        let cn = p.find("CittàNuova");
+        assert_eq!(cn.len(), 1);
+        assert_eq!(p.files.get(cn[0].file as usize), "nuovo.py");
+        assert_eq!(p.with_prefix("CITTÀ", 10).len(), 1);
         assert_eq!(words("a bb cc_d bb 9x é_é", 2, ""), vec!["bb", "cc_d", "é_é"]);
         assert_eq!(words("Foo fob bar FOOD", 2, "fo"), vec!["Foo", "fob", "FOOD"]);
+        assert!(starts_with_lower("CittàVecchia", "città"));
+        assert!(starts_with_lower("İstanbul", "i"));
+        assert!(!starts_with_lower("f", "fo"));
     }
 }
 

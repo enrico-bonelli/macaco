@@ -138,9 +138,63 @@ pub fn uri_to_path(uri: &str) -> Option<PathBuf> {
     glib::filename_from_uri(uri).ok().map(|(p, _)| p)
 }
 
+/// Length of `s` in UTF-16 code units.
+pub fn utf16_len(s: &str) -> u32 {
+    if s.is_ascii() {
+        return s.len() as u32;
+    }
+    s.chars().map(|c| c.len_utf16() as u32).sum()
+}
+
 /// Column in UTF-16 code units (as LSP counts) of character `col` of `line`.
 pub fn utf16_col(line: &str, col: usize) -> u32 {
+    if line.is_ascii() {
+        return col.min(line.len()) as u32;
+    }
     line.chars().take(col).map(|c| c.len_utf16() as u32).sum()
+}
+
+/// An incremental edit in LSP UTF-16 coordinates (`start == end` for insertions).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Change {
+    pub line: u32,
+    pub u16col: u32,
+    pub end_line: u32,
+    pub end_u16col: u32,
+    pub text: String,
+}
+
+/// Appends `c` to `changes`, merging consecutive single-line insertions or
+/// backward deletions into one event.
+pub fn push_change(changes: &mut Vec<Change>, c: Change) {
+    if let Some(last) = changes.last_mut() {
+        let last_ins = last.line == last.end_line && last.u16col == last.end_u16col;
+        let new_ins = c.line == c.end_line && c.u16col == c.end_u16col;
+        if last_ins
+            && new_ins
+            && c.line == last.line
+            && !last.text.contains(['\n', '\r'])
+            && !c.text.contains(['\n', '\r'])
+            && c.u16col == last.u16col + utf16_len(&last.text)
+        {
+            last.text.push_str(&c.text);
+            return;
+        }
+        if last.text.is_empty() && c.text.is_empty() && c.end_line == last.line && c.end_u16col == last.u16col {
+            last.line = c.line;
+            last.u16col = c.u16col;
+            return;
+        }
+    }
+    changes.push(c);
+}
+
+/// `TextDocumentSyncKind` from an `initialize` result (`0`: None, `1`: Full, `2`: Incremental).
+pub fn parse_sync_kind(init_result: &Value) -> u8 {
+    let sync = init_result.pointer("/capabilities/textDocumentSync");
+    sync.and_then(|s| s.as_u64().or_else(|| s.get("change").and_then(Value::as_u64)))
+        .filter(|&k| k <= 2)
+        .map_or(1, |k| k as u8)
 }
 
 /// Character column of UTF-16 column `u16col` of `line`.
@@ -381,6 +435,8 @@ pub struct Client {
     pub stopping: Cell<bool>,
     /// Characters that open the completion list (`.`, `::`…).
     pub trigger_chars: RefCell<Vec<String>>,
+    /// `TextDocumentSyncKind` negotiated in `initialize` (default `1` = Full, `2` = Incremental).
+    sync_kind: Cell<u8>,
     /// Open documents (URI) and their version.
     pub docs: RefCell<HashMap<String, i32>>,
     /// Last lines of the error output (to explain a failure).
@@ -428,6 +484,7 @@ impl Client {
             ready: Cell::new(false),
             stopping: Cell::new(false),
             trigger_chars: RefCell::new(Vec::new()),
+            sync_kind: Cell::new(1),
             docs: RefCell::new(HashMap::new()),
             stderr: RefCell::new(String::new()),
             progress: RefCell::new(HashMap::new()),
@@ -629,6 +686,7 @@ impl Client {
                 if let Some(chars) = v.pointer("/capabilities/completionProvider/triggerCharacters").and_then(Value::as_array) {
                     *c.trigger_chars.borrow_mut() = chars.iter().filter_map(|x| x.as_str().map(str::to_string)).collect();
                 }
+                c.sync_kind.set(parse_sync_kind(&v));
                 c.write(&json!({"jsonrpc": "2.0", "method": "initialized", "params": {}}));
                 c.ready.set(true);
                 let queued: Vec<Value> = c.queued.borrow_mut().drain(..).collect();
@@ -710,18 +768,24 @@ impl Client {
 
     // ----------------------------------------------------------- documents
 
-    pub fn did_open(self: &Rc<Self>, uri: &str, language_id: &str, text: &str) {
+    /// Whether the server accepts incremental `didChange` ranges (`TextDocumentSyncKind::Incremental`).
+    pub fn is_incremental(&self) -> bool {
+        self.sync_kind.get() == 2
+    }
+
+    pub fn did_open(self: &Rc<Self>, uri: &str, language_id: &str, text: impl Into<String>) {
         if self.docs.borrow().contains_key(uri) {
             self.did_change(uri, text);
             return;
         }
+        let text: String = text.into();
         self.docs.borrow_mut().insert(uri.to_string(), 1);
         self.notify("textDocument/didOpen", json!({"textDocument": {"uri": uri, "languageId": language_id, "version": 1, "text": text}}));
     }
 
     /// Sends the current text of a document: a change if the server has it,
     /// else (when the server is ready) an open.
-    pub fn sync_text(self: &Rc<Self>, uri: &str, language_id: &str, text: &str) {
+    pub fn sync_text(self: &Rc<Self>, uri: &str, language_id: &str, text: impl Into<String>) {
         if self.docs.borrow().contains_key(uri) {
             self.did_change(uri, text);
         } else if self.ready.get() {
@@ -730,14 +794,44 @@ impl Client {
     }
 
     /// Sends the whole text (accepted whatever sync kind the server asks).
-    pub fn did_change(self: &Rc<Self>, uri: &str, text: &str) {
+    pub fn did_change(self: &Rc<Self>, uri: &str, text: impl Into<String>) {
+        if self.sync_kind.get() == 0 {
+            return;
+        }
         let version = {
             let mut docs = self.docs.borrow_mut();
             let Some(v) = docs.get_mut(uri) else { return };
             *v += 1;
             *v
         };
+        let text: String = text.into();
         self.notify("textDocument/didChange", json!({"textDocument": {"uri": uri, "version": version}, "contentChanges": [{"text": text}]}));
+    }
+
+    /// Sends incremental ranged changes (`TextDocumentSyncKind::Incremental`).
+    pub fn did_change_incremental(self: &Rc<Self>, uri: &str, changes: &[Change]) {
+        if changes.is_empty() || self.sync_kind.get() == 0 {
+            return;
+        }
+        let version = {
+            let mut docs = self.docs.borrow_mut();
+            let Some(v) = docs.get_mut(uri) else { return };
+            *v += 1;
+            *v
+        };
+        let events: Vec<Value> = changes
+            .iter()
+            .map(|c| {
+                json!({
+                    "range": {
+                        "start": {"line": c.line, "character": c.u16col},
+                        "end": {"line": c.end_line, "character": c.end_u16col},
+                    },
+                    "text": c.text.as_str(),
+                })
+            })
+            .collect();
+        self.notify("textDocument/didChange", json!({"textDocument": {"uri": uri, "version": version}, "contentChanges": events}));
     }
 
     pub fn did_save(self: &Rc<Self>, uri: &str) {
@@ -831,5 +925,62 @@ mod tests {
         assert_eq!((d[0].severity, d[0].source.as_str(), d[0].message.as_str(), d[0].end_u16col), (Severity::Error, "clang expected_semi", "expected ';'", 9));
         assert_eq!((d[1].severity, d[1].source.as_str()), (Severity::Warning, "6133"));
         assert_eq!((d[2].severity, d[2].end_line, d[2].message.as_str()), (Severity::Error, 1, "no severity\ndeclared here"));
+    }
+
+    /// Reference UTF-16 incremental applier matching LSP 3.17 `contentChanges`.
+    fn apply_lsp_changes(doc: &mut String, changes: &[Change]) {
+        fn offset_of(s: &str, line: u32, u16col: u32) -> usize {
+            let mut cur_line = 0;
+            let mut line_start = 0;
+            for (i, b) in s.bytes().enumerate() {
+                if cur_line == line {
+                    break;
+                }
+                if b == b'\n' {
+                    cur_line += 1;
+                    line_start = i + 1;
+                }
+            }
+            let rest = &s[line_start..];
+            let line_end = rest.find('\n').unwrap_or(rest.len());
+            let slice = &rest[..line_end];
+            let ch_col = char_col(slice, u16col) as usize;
+            let byte_in_line = slice.char_indices().nth(ch_col).map_or(slice.len(), |(b, _)| b);
+            line_start + byte_in_line
+        }
+        for c in changes {
+            let a = offset_of(doc, c.line, c.u16col);
+            let b = offset_of(doc, c.end_line, c.end_u16col);
+            doc.replace_range(a..b, &c.text);
+        }
+    }
+
+    #[test]
+    fn incremental_sync_and_coalescing() {
+        assert_eq!(parse_sync_kind(&json!({"capabilities": {"textDocumentSync": 2}})), 2);
+        assert_eq!(parse_sync_kind(&json!({"capabilities": {"textDocumentSync": {"change": 2, "openClose": true}}})), 2);
+        assert_eq!(parse_sync_kind(&json!({"capabilities": {"textDocumentSync": {"openClose": true}}})), 1);
+        assert_eq!(parse_sync_kind(&json!({"capabilities": {"textDocumentSync": 0}})), 0);
+        assert_eq!(parse_sync_kind(&json!({})), 1);
+
+        let mut doc = "let x = \"a😀b\";\nfn main() {}\n".to_string();
+        let mut edits = Vec::new();
+        // Type "12" + "😀" + "!" consecutively after "a😀" (col 11 in UTF-16: `let x = "a` = 10 + `😀` = 2 -> 12).
+        push_change(&mut edits, Change { line: 0, u16col: 12, end_line: 0, end_u16col: 12, text: "1".into() });
+        push_change(&mut edits, Change { line: 0, u16col: 13, end_line: 0, end_u16col: 13, text: "2".into() });
+        push_change(&mut edits, Change { line: 0, u16col: 14, end_line: 0, end_u16col: 14, text: "😀".into() });
+        push_change(&mut edits, Change { line: 0, u16col: 16, end_line: 0, end_u16col: 16, text: "!".into() });
+        // All four single-line insertions coalesce into one event.
+        assert_eq!(edits.len(), 1);
+        assert_eq!(edits[0].text, "12😀!");
+
+        // Backspace across newline: delete `f` on line 1, then `\n` at end of line 0.
+        push_change(&mut edits, Change { line: 1, u16col: 0, end_line: 1, end_u16col: 1, text: String::new() });
+        push_change(&mut edits, Change { line: 0, u16col: 20, end_line: 1, end_u16col: 0, text: String::new() });
+        assert_eq!(edits.len(), 2);
+        assert_eq!((edits[1].line, edits[1].u16col, edits[1].end_line, edits[1].end_u16col), (0, 20, 1, 1));
+
+        apply_lsp_changes(&mut doc, &edits);
+        assert_eq!(doc, "let x = \"a😀12😀!b\";n main() {}\n");
     }
 }

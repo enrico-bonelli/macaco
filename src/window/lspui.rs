@@ -8,7 +8,6 @@ use super::Editor;
 use super::inspect::Item;
 use crate::config;
 use crate::doc::Doc;
-use crate::format;
 use crate::lang::Lang;
 use crate::finder::{self, TextMatch, TextResults};
 use crate::lsp::{self, Client, Location};
@@ -25,22 +24,40 @@ use std::time::Duration;
 const CHANGE_DELAY: Duration = Duration::from_millis(300);
 /// Completion rows from the server.
 const MAX_ITEMS: usize = 80;
+/// Above this many buffered edits (or bytes in one insertion), send the whole text.
+const MAX_INCREMENTAL_EDITS: usize = 256;
+const MAX_INCREMENTAL_TEXT: usize = 65_536;
+
+/// Unsent edits of a document.
+pub(super) enum PendingChanges {
+    Incremental(Vec<lsp::Change>),
+    Full,
+}
+
+/// LSP position `(line, UTF-16 column)` of `it` in `buf`.
+fn iter_position(buf: &gtk::TextBuffer, it: &gtk::TextIter) -> (u32, u32) {
+    let col = it.line_offset() as usize;
+    if col == 0 {
+        return (it.line() as u32, 0);
+    }
+    // Pure ASCII up to `it`: 1 byte == 1 char == 1 UTF-16 code unit.
+    if it.line_index() as usize == col {
+        return (it.line() as u32, col as u32);
+    }
+    let mut start = *it;
+    start.set_line_offset(0);
+    let line = buf.text(&start, it, true);
+    (it.line() as u32, lsp::utf16_col(&line, col))
+}
 
 /// LSP position of the cursor of `d`: (line, UTF-16 column).
 fn cursor_position(d: &Doc) -> (u32, u32) {
-    let buf = &d.buffer;
-    let it = buf.iter_at_mark(&buf.get_insert());
-    let mut start = it;
-    start.set_line_offset(0);
-    let line = buf.text(&start, &it, true);
-    (it.line() as u32, lsp::utf16_col(&line, it.line_offset() as usize))
+    iter_position(&d.buffer, &d.cursor_iter())
 }
 
 /// Whether the cursor of the Vue document `d` is in its `<script>` block.
 fn in_vue_script(d: &Doc) -> bool {
-    let buf = &d.buffer;
-    let before = buf.text(&buf.start_iter(), &buf.iter_at_mark(&buf.get_insert()), true);
-    matches!(format::embedded_lang(Lang::Vue, &before), Lang::JavaScript | Lang::TypeScript)
+    matches!(super::Editor::lang_at(d, &d.cursor_iter()), Lang::JavaScript | Lang::TypeScript)
 }
 
 /// Folder of the installed Vue language server: the Vue TypeScript plugin
@@ -333,28 +350,31 @@ impl Editor {
 
     /// Tells the servers of `d` (started if needed) that the document is
     /// open. Servers that already have it get its changes from
-    /// `lsp_changed`, not here.
+    /// `lsp_changed` / `lsp_edit_*`, not here.
     pub(super) fn lsp_open(self: &Rc<Self>, d: &Rc<Doc>) {
         if !d.is_loaded() {
             return;
         }
         let Some(path) = d.path.borrow().clone() else { return };
         let uri = lsp::path_to_uri(&path);
-        let mut text = None;
-        for c in self.lsp_clients_for(d) {
-            if c.ready.get() && !c.docs.borrow().contains_key(&uri) {
-                let text = text.get_or_insert_with(|| d.text());
-                c.did_open(&uri, lsp::language_id(d.lang.get(), &path), text);
+        let lang_id = lsp::language_id(d.lang.get(), &path);
+        let need: Vec<Rc<Client>> =
+            self.lsp_clients_for(d).into_iter().filter(|c| c.ready.get() && !c.docs.borrow().contains_key(&uri)).collect();
+        if need.is_empty() {
+            return;
+        }
+        let text = d.text();
+        let last = need.len() - 1;
+        for (i, c) in need.into_iter().enumerate() {
+            if i == last {
+                c.did_open(&uri, lang_id, text);
+                break;
             }
+            c.did_open(&uri, lang_id, text.as_str());
         }
     }
 
-    /// The text of `d` changed: sent to the server shortly.
-    pub(super) fn lsp_changed(self: &Rc<Self>, d: &Rc<Doc>) {
-        if self.lsp_clients.borrow().is_empty() || !d.is_loaded() {
-            return;
-        }
-        self.lsp_dirty.borrow_mut().insert(d.id.borrow().clone());
+    fn schedule_lsp_flush(self: &Rc<Self>) {
         if self.lsp_flush_scheduled.replace(true) {
             return;
         }
@@ -367,20 +387,122 @@ impl Editor {
         });
     }
 
+    /// Whole content of `d` was replaced (reload, reopen): sent to the server shortly.
+    pub(super) fn lsp_changed(self: &Rc<Self>, d: &Rc<Doc>) {
+        if self.lsp_clients.borrow().is_empty() {
+            return;
+        }
+        self.lsp_dirty.borrow_mut().insert(d.id.borrow().clone(), PendingChanges::Full);
+        self.schedule_lsp_flush();
+    }
+
+    /// Incremental insertion in `d` (recorded before the buffer mutates).
+    pub(super) fn lsp_edit_insert(self: &Rc<Self>, d: &Rc<Doc>, at: &gtk::TextIter, text: &str) {
+        if text.is_empty() || self.lsp_clients.borrow().is_empty() || !d.is_loaded() {
+            return;
+        }
+        if d.is_loading() || text.len() > MAX_INCREMENTAL_TEXT {
+            self.lsp_changed(d);
+            return;
+        }
+        let id = d.id.borrow().clone();
+        {
+            let mut dirty = self.lsp_dirty.borrow_mut();
+            let entry = dirty.entry(id).or_insert_with(|| PendingChanges::Incremental(Vec::with_capacity(4)));
+            match entry {
+                PendingChanges::Full => {}
+                PendingChanges::Incremental(changes) if changes.len() >= MAX_INCREMENTAL_EDITS => {
+                    *entry = PendingChanges::Full;
+                }
+                PendingChanges::Incremental(changes) => {
+                    let (line, u16col) = iter_position(&d.buffer, at);
+                    lsp::push_change(changes, lsp::Change { line, u16col, end_line: line, end_u16col: u16col, text: text.to_string() });
+                }
+            }
+        }
+        self.schedule_lsp_flush();
+    }
+
+    /// Incremental deletion in `d` (recorded before the buffer mutates).
+    pub(super) fn lsp_edit_delete(self: &Rc<Self>, d: &Rc<Doc>, start: &gtk::TextIter, end: &gtk::TextIter) {
+        if start == end || self.lsp_clients.borrow().is_empty() || !d.is_loaded() {
+            return;
+        }
+        if d.is_loading() {
+            self.lsp_changed(d);
+            return;
+        }
+        let id = d.id.borrow().clone();
+        {
+            let mut dirty = self.lsp_dirty.borrow_mut();
+            let entry = dirty.entry(id).or_insert_with(|| PendingChanges::Incremental(Vec::with_capacity(4)));
+            match entry {
+                PendingChanges::Full => {}
+                PendingChanges::Incremental(changes) if changes.len() >= MAX_INCREMENTAL_EDITS => {
+                    *entry = PendingChanges::Full;
+                }
+                PendingChanges::Incremental(changes) => {
+                    let (line, u16col) = iter_position(&d.buffer, start);
+                    let (end_line, end_u16col) = iter_position(&d.buffer, end);
+                    lsp::push_change(changes, lsp::Change { line, u16col, end_line, end_u16col, text: String::new() });
+                }
+            }
+        }
+        self.schedule_lsp_flush();
+    }
+
     /// Sends the pending changes.
     fn lsp_flush(self: &Rc<Self>) {
-        let dirty: Vec<String> = self.lsp_dirty.borrow_mut().drain().collect();
-        for id in dirty {
+        let dirty: Vec<(String, PendingChanges)> = self.lsp_dirty.borrow_mut().drain().collect();
+        for (id, pending) in dirty {
             let Some(d) = self.docs.borrow().iter().find(|d| *d.id.borrow() == id).cloned() else { continue };
             // Unloaded meanwhile: sent again when it is loaded.
             if !d.is_loaded() {
                 continue;
             }
             let Some(path) = d.path.borrow().clone() else { continue };
+            let clients = self.lsp_clients_for(&d);
+            if clients.is_empty() {
+                continue;
+            }
             let uri = lsp::path_to_uri(&path);
-            let text = d.text();
-            for c in self.lsp_clients_for(&d) {
-                c.sync_text(&uri, lsp::language_id(d.lang.get(), &path), &text);
+            let lang_id = lsp::language_id(d.lang.get(), &path);
+            let needs_full = clients
+                .iter()
+                .filter(|c| {
+                    if c.docs.borrow().contains_key(&uri) {
+                        !matches!(pending, PendingChanges::Incremental(_)) || !c.is_incremental()
+                    } else {
+                        c.ready.get()
+                    }
+                })
+                .count();
+            let mut full_text = (needs_full > 0).then(|| d.text());
+            let mut rem_full = needs_full;
+            for c in clients {
+                if c.docs.borrow().contains_key(&uri) {
+                    if let PendingChanges::Incremental(ref changes) = pending
+                        && c.is_incremental()
+                    {
+                        c.did_change_incremental(&uri, changes);
+                    } else if let Some(ref t) = full_text {
+                        rem_full -= 1;
+                        if rem_full == 0 {
+                            c.did_change(&uri, full_text.take().unwrap());
+                        } else {
+                            c.did_change(&uri, t.as_str());
+                        }
+                    }
+                } else if c.ready.get()
+                    && let Some(ref t) = full_text
+                {
+                    rem_full -= 1;
+                    if rem_full == 0 {
+                        c.did_open(&uri, lang_id, full_text.take().unwrap());
+                    } else {
+                        c.did_open(&uri, lang_id, t.as_str());
+                    }
+                }
             }
         }
     }
@@ -403,6 +525,7 @@ impl Editor {
     }
 
     pub(super) fn lsp_closed(&self, d: &Doc) {
+        self.lsp_dirty.borrow_mut().remove(&*d.id.borrow());
         let Some(path) = d.path.borrow().clone() else { return };
         let uri = lsp::path_to_uri(&path);
         for c in self.lsp_clients.borrow().iter() {
@@ -474,7 +597,7 @@ impl Editor {
         let path = d.path.borrow().clone()?;
         // The server must see the current text (every change marks the
         // document as dirty).
-        if self.lsp_dirty.borrow().contains(&*d.id.borrow()) {
+        if self.lsp_dirty.borrow().contains_key(&*d.id.borrow()) {
             self.lsp_flush();
         }
         if !c.docs.borrow().contains_key(&lsp::path_to_uri(&path)) {

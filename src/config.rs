@@ -350,12 +350,16 @@ impl Session {
     pub fn save_if_changed(&self, last: &mut String) {
         let text = self.to_text();
         if text != *last {
-            let _ = write_atomic(&session_path(), text.as_bytes());
+            let _ = Self::write_text(&text);
             *last = text;
         }
     }
 
-    fn to_text(&self) -> String {
+    pub fn write_text(text: &str) -> io::Result<()> {
+        write_atomic(&session_path(), text.as_bytes())
+    }
+
+    pub fn to_text(&self) -> String {
         use std::fmt::Write as _;
         let mut text = format!("split\t{}\nactive\t{}\t{}\n", self.split, self.active[0], self.active[1]);
         if let Some(w) = &self.workdir {

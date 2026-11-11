@@ -75,6 +75,17 @@ pub fn char_offset(s: &str, from: (usize, usize), byte: usize) -> usize {
     from.1 + s[from.0..byte].chars().count()
 }
 
+/// Byte offset of character `ch` in `s` (`s.len()` if past the end).
+pub fn byte_at_char(s: &str, ch: usize) -> usize {
+    if ch == 0 {
+        return 0;
+    }
+    if s.is_ascii() {
+        return ch.min(s.len());
+    }
+    s.char_indices().nth(ch).map_or(s.len(), |(b, _)| b)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -96,5 +107,14 @@ mod tests {
         let plain = Query::new("$1", Options::default()).unwrap();
         assert_eq!(replacements(&plain, "x$1", "$0"), vec![(1, 3, "$0".to_string())]);
         assert!(Query::new("(", Options { regex: true, ..Default::default() }).is_err());
+        assert_eq!(byte_at_char("abcdef", 0), 0);
+        assert_eq!(byte_at_char("abcdef", 3), 3);
+        assert_eq!(byte_at_char("abcdef", 99), 6);
+        let utf = "aè🦀z";
+        assert_eq!(byte_at_char(utf, 0), 0);
+        assert_eq!(byte_at_char(utf, 1), 1);
+        assert_eq!(byte_at_char(utf, 2), 3);
+        assert_eq!(byte_at_char(utf, 3), 7);
+        assert_eq!(byte_at_char(utf, 9), utf.len());
     }
 }

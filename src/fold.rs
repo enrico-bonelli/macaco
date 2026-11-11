@@ -61,7 +61,7 @@ pub fn ranges(lang: Lang, text: &str) -> Vec<Range> {
         Some(Style::Indent) => indent(lang, lines),
         None => Vec::new(),
     };
-    out.sort_by(|a, b| a.header.cmp(&b.header).then(b.last.cmp(&a.last)));
+    out.sort_unstable_by(|a, b| a.header.cmp(&b.header).then(b.last.cmp(&a.last)));
     out.dedup_by_key(|r| r.header);
     out
 }

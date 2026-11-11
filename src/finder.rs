@@ -45,7 +45,7 @@ impl Paths {
         Paths { data, spans }
     }
 
-    fn from_vec(v: &[String]) -> Paths {
+    pub(crate) fn from_vec(v: &[String]) -> Paths {
         let mut data = String::with_capacity(v.iter().map(|p| p.len() + 1).sum());
         for p in v {
             data.push_str(p);
@@ -65,6 +65,19 @@ impl Paths {
     pub fn get(&self, i: usize) -> &str {
         let (start, end) = self.spans[i];
         &self.data[start as usize..end as usize]
+    }
+
+    pub fn position(&self, rel: &str) -> Option<usize> {
+        (0..self.len()).find(|&i| self.get(i) == rel)
+    }
+
+    pub fn push(&mut self, rel: &str) -> usize {
+        let start = self.data.len() as u32;
+        self.data.push_str(rel);
+        let end = self.data.len() as u32;
+        self.data.push('\0');
+        self.spans.push((start, end));
+        self.spans.len() - 1
     }
 }
 
@@ -179,19 +192,16 @@ fn greedy(q: &[u8], s: &[u8], from: usize, out: &mut Vec<usize>) -> bool {
 }
 
 /// Score of `s` for the normalized query `q`; the byte positions of the
-/// matched characters are left in `pos`.
-fn score_bytes(q: &[u8], s: &[u8], pos: &mut Vec<usize>) -> Option<i32> {
+/// matched characters are left in `pos` (`alt` is reusable scratch space).
+fn score_bytes(q: &[u8], s: &[u8], pos: &mut Vec<usize>, alt: &mut Vec<usize>) -> Option<i32> {
     // Most paths fail here, at the cost of one pass over their bytes.
     if !greedy(q, s, 0, pos) {
         return None;
     }
     let name_start = s.iter().rposition(|&c| c == b'/').map_or(0, |i| i + 1);
     // Prefer a match inside the file name.
-    if pos[0] < name_start {
-        let mut in_name = Vec::with_capacity(q.len());
-        if greedy(q, s, name_start, &mut in_name) {
-            *pos = in_name;
-        }
+    if pos[0] < name_start && greedy(q, s, name_start, alt) {
+        std::mem::swap(pos, alt);
     }
     let mut score = 0;
     let mut prev = usize::MAX;
@@ -229,7 +239,8 @@ fn score_bytes(q: &[u8], s: &[u8], pos: &mut Vec<usize>) -> Option<i32> {
 fn score(query: &str, rel: &str) -> Option<(i32, Vec<usize>)> {
     let q = normalize(query);
     let mut pos = Vec::new();
-    let s = score_bytes(q.as_bytes(), rel.as_bytes(), &mut pos)?;
+    let mut alt = Vec::new();
+    let s = score_bytes(q.as_bytes(), rel.as_bytes(), &mut pos, &mut alt)?;
     Some((s, char_positions(rel, &pos)))
 }
 
@@ -258,9 +269,10 @@ pub fn search(paths: &Paths, query: &str, limit: usize, within: Option<&[u32]>) 
     }
     let q = q.as_bytes();
     let mut pos = Vec::with_capacity(q.len());
+    let mut alt = Vec::with_capacity(q.len());
     let mut scored: Vec<(i32, u32)> = Vec::new();
     let mut check = |i: u32| {
-        if let Some(s) = score_bytes(q, paths.get(i as usize).as_bytes(), &mut pos) {
+        if let Some(s) = score_bytes(q, paths.get(i as usize).as_bytes(), &mut pos, &mut alt) {
             scored.push((s, i));
         }
     };
@@ -281,9 +293,8 @@ pub fn search(paths: &Paths, query: &str, limit: usize, within: Option<&[u32]>) 
         .into_iter()
         .map(|(_, i)| {
             let rel = paths.get(i as usize);
-            let mut bytes = Vec::new();
-            score_bytes(q, rel.as_bytes(), &mut bytes);
-            Hit { index: i as usize, positions: char_positions(rel, &bytes) }
+            score_bytes(q, rel.as_bytes(), &mut pos, &mut alt);
+            Hit { index: i as usize, positions: char_positions(rel, &pos) }
         })
         .collect();
     Found { hits, all }
@@ -295,9 +306,41 @@ pub fn search(paths: &Paths, query: &str, limit: usize, within: Option<&[u32]>) 
 const MAX_SEARCH_FILE: u64 = 8 << 20;
 /// Stop after this many matching lines.
 pub const MAX_TEXT_MATCHES: usize = 10_000;
+/// Files claimed at once by each worker thread during folder scans.
+pub const WORKER_CHUNK: usize = 16;
+/// Reusable per-worker buffers above this size are shrunk after a huge file.
+const MAX_RETAINED_BUF: usize = 1 << 20;
 /// Characters of a matching line shown before and after the match.
 const SNIPPET_BEFORE: usize = 60;
 const SNIPPET_AFTER: usize = 120;
+
+/// Number of worker threads to use for `items` files (`1` on small folders).
+pub fn worker_count(items: usize) -> usize {
+    if items < 32 {
+        1
+    } else {
+        std::thread::available_parallelism().map_or(4, |n| n.get().clamp(1, 8)).min(items.div_ceil(WORKER_CHUNK))
+    }
+}
+
+/// Base byte buffer `root/` for joining relative paths without allocating.
+pub fn root_prefix(root: &Path) -> Vec<u8> {
+    use std::os::unix::ffi::OsStrExt;
+    let b = root.as_os_str().as_bytes();
+    let mut out = Vec::with_capacity(b.len() + 64);
+    out.extend_from_slice(b);
+    if !out.is_empty() && !out.ends_with(b"/") {
+        out.push(b'/');
+    }
+    out
+}
+
+pub fn join_rel<'a>(pbuf: &'a mut Vec<u8>, base_len: usize, rel: &str) -> &'a Path {
+    use std::os::unix::ffi::OsStrExt;
+    pbuf.truncate(base_len);
+    pbuf.extend_from_slice(rel.as_bytes());
+    Path::new(std::ffi::OsStr::from_bytes(pbuf))
+}
 
 /// A line containing the text searched.
 pub struct TextMatch {
@@ -364,15 +407,60 @@ pub fn read_text(path: &Path) -> Option<String> {
     if !meta.is_file() || meta.len() > MAX_SEARCH_FILE {
         return None;
     }
-    // Binary files are recognized from their beginning.
-    let mut bytes = vec![0; 8000.min(meta.len() as usize)];
-    f.read_exact(&mut bytes).ok()?;
+    let len = meta.len() as usize;
+    if len == 0 {
+        return Some(String::new());
+    }
+    // Binary files are recognized from their beginning before reserving the
+    // full file size.
+    let mut bytes = Vec::with_capacity(len.min(8000) + 32);
+    (&mut f).take(8000).read_to_end(&mut bytes).ok()?;
     if is_binary(&bytes) {
         return None;
     }
-    f.read_to_end(&mut bytes).ok()?;
-    let enc = encoding::detect(&bytes);
-    Some(encoding::normalize_eol(encoding::decode_owned(bytes, enc)).0)
+    if bytes.len() == 8000 {
+        bytes.reserve(len.saturating_sub(8000) + 32);
+        f.read_to_end(&mut bytes).ok()?;
+    }
+    Some(encoding::decode_auto_owned(bytes))
+}
+
+/// Like `read_text`, reusing `buf` and `scratch` across files so multi-thread
+/// scans do not contend on the allocator.
+pub fn read_text_buf<'a>(path: &Path, buf: &'a mut Vec<u8>, scratch: &'a mut String) -> Option<&'a str> {
+    use std::io::Read;
+    if buf.capacity() > MAX_RETAINED_BUF {
+        *buf = Vec::with_capacity(64 << 10);
+    }
+    if scratch.capacity() > MAX_RETAINED_BUF {
+        *scratch = String::new();
+    }
+    buf.clear();
+    let mut f = fs::File::open(path).ok()?;
+    let meta = f.metadata().ok()?;
+    if !meta.is_file() || meta.len() > MAX_SEARCH_FILE {
+        return None;
+    }
+    let len = meta.len() as usize;
+    if len == 0 {
+        return Some("");
+    }
+    let head_cap = len.min(8000) + 32;
+    if buf.capacity() < head_cap {
+        buf.reserve(head_cap - buf.capacity());
+    }
+    (&mut f).take(8000).read_to_end(buf).ok()?;
+    if is_binary(buf) {
+        return None;
+    }
+    if buf.len() == 8000 {
+        let full_cap = len.max(8000) + 32;
+        if buf.capacity() < full_cap {
+            buf.reserve(full_cap - buf.capacity());
+        }
+        f.read_to_end(buf).ok()?;
+    }
+    Some(encoding::decode_auto_slice(buf, scratch))
 }
 
 /// Largest char boundary of `s` that is `<= i`.
@@ -391,38 +479,111 @@ fn floor_boundary(s: &str, i: usize) -> usize {
 pub fn snippet(line: &str, start: usize, end: usize) -> (String, (u32, u32), u32) {
     let start = floor_boundary(line, start);
     let end = floor_boundary(line, end).max(start);
-    let before: Vec<char> = line[..start].chars().collect();
-    let found: Vec<char> = line[start..end].chars().collect();
+    let before = &line[..start];
+    let found = &line[start..end];
     let after = &line[end..];
+    let col = before.chars().count() as u32;
+    let found_chars = found.chars().count() as u32;
     // Some text around the match, without leading blanks.
-    let skip = before.iter().take_while(|c| c.is_whitespace()).count().max(before.len().saturating_sub(SNIPPET_BEFORE));
-    let mut snippet = String::new();
-    if skip > 0 && before[..skip].iter().any(|c| !c.is_whitespace()) {
-        snippet.push('…');
+    let trimmed = before.trim_start();
+    let mut rev = trimmed.char_indices().rev();
+    let (ellipsis_before, prefix, hl_start) = match rev.nth(SNIPPET_BEFORE - 1) {
+        Some((cut, _)) if rev.next().is_some() => (true, &trimmed[cut..], 1 + SNIPPET_BEFORE as u32),
+        _ => (false, trimmed, trimmed.chars().count() as u32),
+    };
+    let mut tail = after.char_indices();
+    let (suffix, ellipsis_after) = match tail.nth(SNIPPET_AFTER) {
+        Some((cut, _)) => (&after[..cut], true),
+        None => (after, false),
+    };
+    let cap = prefix.len() + found.len() + suffix.len() + if ellipsis_before { 3 } else { 0 } + if ellipsis_after { 3 } else { 0 };
+    let mut out = String::with_capacity(cap);
+    if ellipsis_before {
+        out.push('…');
     }
-    snippet.extend(&before[skip..]);
-    let hl_start = snippet.chars().count() as u32;
-    snippet.extend(&found);
-    let mut tail = after.chars();
-    snippet.extend(tail.by_ref().take(SNIPPET_AFTER));
-    if tail.next().is_some() {
-        snippet.push('…');
+    out.push_str(prefix);
+    out.push_str(found);
+    out.push_str(suffix);
+    if ellipsis_after {
+        out.push('…');
     }
-    (snippet, (hl_start, found.len() as u32), before.len() as u32)
+    (out, (hl_start, found_chars), col)
 }
 
-/// Byte ranges of comments and strings in `text` (sorted).
-fn comments_and_strings(lang: crate::lang::Lang, text: &str) -> Vec<(usize, usize)> {
-    let mut out = Vec::new();
+/// Byte ranges of comments and strings in `text` (sorted), reusing `toks` and
+/// `out`.
+fn comments_and_strings_into(
+    lang: crate::lang::Lang,
+    text: &str,
+    toks: &mut Vec<crate::lexer::Token>,
+    out: &mut Vec<(usize, usize)>,
+) {
+    out.clear();
     let mut state = crate::lexer::initial_state(lang);
-    let mut toks = Vec::new();
     let mut offset = 0;
     for line in text.split('\n') {
-        state = crate::lexer::lex_line(lang, state, line, &mut toks);
+        state = crate::lexer::lex_line(lang, state, line, toks);
         for t in toks.iter().filter(|t| matches!(t.kind, crate::lexer::Kind::Comment | crate::lexer::Kind::Str)) {
             out.push((offset + t.start as usize, offset + t.end as usize));
         }
         offset += line.len() + 1;
+    }
+}
+
+struct RawMatch {
+    line: u32,
+    col: u32,
+    snippet: String,
+    hl: (u32, u32),
+}
+
+fn grep_file(
+    rel: &str,
+    text: &str,
+    re: &regex::Regex,
+    code_only: bool,
+    toks: &mut Vec<crate::lexer::Token>,
+    skip_ranges: &mut Vec<(usize, usize)>,
+) -> Vec<RawMatch> {
+    let mut out = Vec::new();
+    let mut skip_ready = false;
+    // Line of the last match, to report each line once.
+    let (mut line, mut line_start, mut counted_to) = (0u32, 0usize, 0usize);
+    let mut last_line = u32::MAX;
+    for m in re.find_iter(text) {
+        if m.start() == m.end() {
+            continue;
+        }
+        if code_only {
+            if !skip_ready {
+                skip_ready = true;
+                skip_ranges.clear();
+                let lang = crate::lang::detect(Some(Path::new(rel)), text);
+                if lang != crate::lang::Lang::Plain {
+                    comments_and_strings_into(lang, text, toks, skip_ranges);
+                }
+            }
+            let k = skip_ranges.partition_point(|r| r.1 <= m.start());
+            if skip_ranges.get(k).is_some_and(|r| r.0 <= m.start()) {
+                continue;
+            }
+        }
+        let between = &text.as_bytes()[counted_to..m.start()];
+        if let Some(last_nl) = between.iter().rposition(|&b| b == b'\n') {
+            line += between[..=last_nl].iter().filter(|&&b| b == b'\n').count() as u32;
+            line_start = counted_to + last_nl + 1;
+        }
+        counted_to = m.start();
+        if line == last_line {
+            continue;
+        }
+        last_line = line;
+        let line_end = text[line_start..].find('\n').map_or(text.len(), |e| line_start + e);
+        let (snippet, hl, col) = snippet(&text[line_start..line_end], m.start() - line_start, m.end().min(line_end) - line_start);
+        out.push(RawMatch { line, col, snippet, hl });
+        if out.len() >= MAX_TEXT_MATCHES {
+            break;
+        }
     }
     out
 }
@@ -433,63 +594,83 @@ fn comments_and_strings(lang: crate::lang::Lang, text: &str) -> Vec<(usize, usiz
 /// Slow: to be run in a thread; `progress.cancel` stops it.
 pub fn grep(root: &Path, paths: Option<Paths>, q: &Query, code_only: bool, progress: &Progress) -> TextResults {
     let paths = paths.unwrap_or_else(|| scan(root));
-    progress.total.store(paths.len(), Ordering::Relaxed);
-    let mut res = TextResults::default();
-    for i in 0..paths.len() {
-        if progress.cancel.load(Ordering::Relaxed) {
-            res.cancelled = true;
-            break;
-        }
-        progress.done.store(i + 1, Ordering::Relaxed);
-        res.searched = i + 1;
-        let rel = paths.get(i);
-        let Some(text) = read_text(&root.join(rel)) else { continue };
-        let mut file: Option<u32> = None;
-        // Comments and strings, computed for files that match.
-        let mut skip_ranges: Option<Vec<(usize, usize)>> = None;
-        // Line of the last match, to report each line once.
-        let (mut line, mut line_start, mut counted_to) = (0u32, 0usize, 0usize);
-        let mut last_line = u32::MAX;
-        for m in q.re.find_iter(&text) {
-            if m.start() == m.end() {
-                continue;
+    let total = paths.len();
+    progress.total.store(total, Ordering::Relaxed);
+    if total == 0 {
+        return TextResults::default();
+    }
+    let workers = worker_count(total);
+    let next_idx = AtomicUsize::new(0);
+    let found_total = AtomicUsize::new(0);
+    let run_worker = || -> Vec<(usize, Vec<RawMatch>)> {
+        let re = q.re.clone();
+        let mut pbuf = root_prefix(root);
+        let base_len = pbuf.len();
+        let mut buf = Vec::new();
+        let mut scratch = String::new();
+        let mut toks = Vec::new();
+        let mut skip_ranges = Vec::new();
+        let mut hits = Vec::new();
+        loop {
+            if progress.cancel.load(Ordering::Relaxed) || found_total.load(Ordering::Relaxed) >= MAX_TEXT_MATCHES {
+                break;
             }
-            if code_only {
-                let ranges = skip_ranges.get_or_insert_with(|| {
-                    match crate::lang::detect(Some(Path::new(rel)), &text) {
-                        crate::lang::Lang::Plain => Vec::new(),
-                        lang => comments_and_strings(lang, &text),
+            let start = next_idx.fetch_add(WORKER_CHUNK, Ordering::Relaxed);
+            if start >= total {
+                break;
+            }
+            let end = (start + WORKER_CHUNK).min(total);
+            for i in start..end {
+                if progress.cancel.load(Ordering::Relaxed) {
+                    return hits;
+                }
+                let rel = paths.get(i);
+                let path = join_rel(&mut pbuf, base_len, rel);
+                if let Some(text) = read_text_buf(path, &mut buf, &mut scratch) {
+                    let m = grep_file(rel, text, &re, code_only, &mut toks, &mut skip_ranges);
+                    if !m.is_empty() {
+                        found_total.fetch_add(m.len(), Ordering::Relaxed);
+                        hits.push((i, m));
                     }
-                });
-                let i = ranges.partition_point(|r| r.1 <= m.start());
-                if ranges.get(i).is_some_and(|r| r.0 <= m.start()) {
-                    continue;
+                }
+                progress.done.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        hits
+    };
+    let mut all_hits: Vec<(usize, Vec<RawMatch>)> = if workers <= 1 {
+        run_worker()
+    } else {
+        std::thread::scope(|s| {
+            let handles: Vec<_> = (1..workers).map(|_| s.spawn(run_worker)).collect();
+            let mut merged = run_worker();
+            for h in handles {
+                if let Ok(part) = h.join() {
+                    merged.extend(part);
                 }
             }
-            for (j, b) in text.as_bytes()[counted_to..m.start()].iter().enumerate() {
-                if *b == b'\n' {
-                    line += 1;
-                    line_start = counted_to + j + 1;
-                }
-            }
-            counted_to = m.start();
-            if line == last_line {
-                continue;
-            }
-            last_line = line;
-            let line_end = text[line_start..].find('\n').map_or(text.len(), |e| line_start + e);
-            let (snippet, hl, col) = snippet(&text[line_start..line_end], m.start() - line_start, m.end().min(line_end) - line_start);
-            let idx = *file.get_or_insert_with(|| {
-                res.files.push(rel.to_string());
-                (res.files.len() - 1) as u32
-            });
-            res.matches.push(TextMatch { file: idx, line, col, snippet, hl });
+            merged
+        })
+    };
+    all_hits.sort_unstable_by_key(|(i, _)| *i);
+
+    let mut res = TextResults::default();
+    let cancelled = progress.cancel.load(Ordering::Relaxed);
+    for (file_idx, matches) in all_hits {
+        let rel = paths.get(file_idx);
+        res.files.push(rel.to_string());
+        let idx = (res.files.len() - 1) as u32;
+        for m in matches {
+            res.matches.push(TextMatch { file: idx, line: m.line, col: m.col, snippet: m.snippet, hl: m.hl });
             if res.matches.len() >= MAX_TEXT_MATCHES {
                 res.truncated = true;
+                res.searched = file_idx + 1;
                 return res;
             }
         }
     }
+    res.cancelled = cancelled;
+    res.searched = if cancelled { progress.done.load(Ordering::Relaxed).min(total) } else { total };
     res
 }
 
@@ -531,6 +712,19 @@ mod tests {
         assert_eq!(snippet("ab", 1, 9), ("ab".to_string(), (1, 1), 1));
         // A position inside a multi-byte character.
         assert_eq!(snippet("àb", 1, 2).0, "àb");
+        // Exact boundary around SNIPPET_BEFORE (60) after leading spaces, plus
+        // multi-byte UTF-8 and SNIPPET_AFTER (120) truncation.
+        let p60 = format!("    {}", "à".repeat(SNIPPET_BEFORE));
+        let line60 = format!("{p60}TARGET{}", "è".repeat(SNIPPET_AFTER));
+        let (s, hl, col) = snippet(&line60, p60.len(), p60.len() + 6);
+        assert!(!s.starts_with('…') && !s.ends_with('…'));
+        assert_eq!((hl, col), ((SNIPPET_BEFORE as u32, 6), 4 + SNIPPET_BEFORE as u32));
+
+        let p61 = format!("    {}", "à".repeat(SNIPPET_BEFORE + 1));
+        let line61 = format!("{p61}TARGET{}", "è".repeat(SNIPPET_AFTER + 1));
+        let (s, hl, col) = snippet(&line61, p61.len(), p61.len() + 6);
+        assert!(s.starts_with('…') && s.ends_with('…'));
+        assert_eq!((hl, col), ((1 + SNIPPET_BEFORE as u32, 6), 5 + SNIPPET_BEFORE as u32));
     }
 
     #[test]
@@ -590,6 +784,34 @@ mod tests {
         assert_eq!(in_b, vec![0, 2]);
         let m = res.matches.iter().find(|m| res.files[m.file as usize] == "b.rs" && m.line == 2).unwrap();
         assert_eq!(m.col, 16);
+
+        // Multi-thread path (>= 32 files, > 8 KB text file, deterministic order, cancel).
+        fs::create_dir_all(dir.join("many")).unwrap();
+        for k in 0..48 {
+            let body = if k == 7 {
+                format!("{}\nfn ago_unico() {{}}\n// ago_unico\n", "let x = 1;\n".repeat(900))
+            } else if k % 5 == 0 {
+                format!("pub fn f{k}() {{ ago_unico(); }}\r\n")
+            } else {
+                format!("pub fn f{k}() {{}}\n")
+            };
+            fs::write(dir.join(format!("many/f{k:02}.rs")), body).unwrap();
+        }
+        let q_many = Query::new("ago_unico", Options::default()).unwrap();
+        let res_many = grep(&dir, None, &q_many, true, &Progress::default());
+        let expected_files: Vec<String> = (0..48)
+            .filter(|k| *k == 7 || k % 5 == 0)
+            .map(|k| format!("many/f{k:02}.rs"))
+            .collect();
+        assert_eq!(res_many.files, expected_files);
+        assert_eq!(res_many.matches.len(), expected_files.len());
+        assert!(!res_many.cancelled && !res_many.truncated);
+
+        let cancelled = Progress::default();
+        cancelled.cancel.store(true, Ordering::Relaxed);
+        let res_cancel = grep(&dir, None, &q_many, false, &cancelled);
+        assert!(res_cancel.cancelled);
+        assert!(res_cancel.matches.is_empty());
         let _ = fs::remove_dir_all(&dir);
     }
 

@@ -172,8 +172,14 @@ impl Editor {
         // again); servers still starting get it when they are ready.
         self.lsp_dirty.borrow_mut().remove(&*d.id.borrow());
         let text = d.text();
-        for c in &clients {
-            c.sync_text(&uri, lsp::language_id(d.lang.get(), &path), &text);
+        let lang_id = lsp::language_id(d.lang.get(), &path);
+        let last = clients.len().saturating_sub(1);
+        for (i, c) in clients.iter().enumerate() {
+            if i == last {
+                c.sync_text(&uri, lang_id, text);
+                break;
+            }
+            c.sync_text(&uri, lang_id, text.as_str());
         }
         let servers: Vec<&'static str> = clients.iter().map(|c| c.spec.name).collect();
         let started = Instant::now();

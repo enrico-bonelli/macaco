@@ -38,7 +38,14 @@ impl Editor {
     /// block around it.
     pub(super) fn lang_at(d: &Doc, at: &gtk::TextIter) -> Lang {
         match d.lang.get() {
-            l @ (Lang::Html | Lang::Vue) => format::embedded_lang(l, &d.buffer.text(&d.buffer.start_iter(), at, true)),
+            l @ (Lang::Html | Lang::Vue) => match d.state_at_line_start(at.line() as usize) {
+                Some(state) => {
+                    let mut start = *at;
+                    start.set_line_offset(0);
+                    crate::lexer::embedded_lang_at(l, state, &d.buffer.text(&start, at, true))
+                }
+                None => format::embedded_lang(l, &d.buffer.text(&d.buffer.start_iter(), at, true)),
+            },
             l => l,
         }
     }

@@ -191,6 +191,17 @@ fn sniff_utf16(bytes: &[u8]) -> Option<Encoding> {
     }
 }
 
+fn detect_latin(bytes: &[u8]) -> Encoding {
+    if bytes.iter().any(|&b| (0x80..0xA0).contains(&b)) {
+        Encoding::Windows1252
+    } else if bytes.contains(&0xA4) {
+        // In Western texts '€' is far more likely than '¤'.
+        Encoding::Iso8859_15
+    } else {
+        Encoding::Iso8859_1
+    }
+}
+
 /// Guess the encoding of raw file contents.
 pub fn detect(bytes: &[u8]) -> Encoding {
     if bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {
@@ -210,13 +221,98 @@ pub fn detect(bytes: &[u8]) -> Encoding {
         // non-ASCII characters later does not lose data on save.
         return Encoding::Utf8;
     }
-    if bytes.iter().any(|&b| (0x80..0xA0).contains(&b)) {
-        Encoding::Windows1252
-    } else if bytes.contains(&0xA4) {
-        // In Western texts '€' is far more likely than '¤'.
-        Encoding::Iso8859_15
-    } else {
-        Encoding::Iso8859_1
+    detect_latin(bytes)
+}
+
+/// Normalize `\r\n` and lone `\r` to `\n` into `out`, reusing its capacity.
+fn normalize_eol_into(src: &str, out: &mut String) {
+    out.clear();
+    out.reserve(src.len());
+    let bytes = src.as_bytes();
+    let mut at = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\r' {
+            out.push_str(&src[at..i]);
+            out.push('\n');
+            i += 1;
+            if bytes.get(i) == Some(&b'\n') {
+                i += 1;
+            }
+            at = i;
+        } else {
+            i += 1;
+        }
+    }
+    out.push_str(&src[at..]);
+}
+
+/// Detect encoding, decode `bytes` and normalize line endings to `\n` in a
+/// single UTF-8 pass.
+pub fn decode_auto_owned(mut bytes: Vec<u8>) -> String {
+    if bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {
+        bytes.drain(..3);
+        let s = String::from_utf8(bytes).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned());
+        return normalize_eol(s).0;
+    }
+    if bytes.starts_with(&[0xFF, 0xFE]) {
+        return normalize_eol(decode_utf16(&bytes[2..], true)).0;
+    }
+    if bytes.starts_with(&[0xFE, 0xFF]) {
+        return normalize_eol(decode_utf16(&bytes[2..], false)).0;
+    }
+    if let Some(enc) = sniff_utf16(&bytes) {
+        return normalize_eol(decode_utf16(&bytes, enc == Encoding::Utf16Le)).0;
+    }
+    match String::from_utf8(bytes) {
+        Ok(s) => normalize_eol(s).0,
+        Err(e) => {
+            let bytes = e.into_bytes();
+            let enc = detect_latin(&bytes);
+            normalize_eol(decode(&bytes, enc)).0
+        }
+    }
+}
+
+/// Like `decode_auto_owned`, but borrows directly from `bytes` when it is
+/// valid `\n`-only UTF-8 and writes into `scratch` otherwise.
+pub fn decode_auto_slice<'a>(bytes: &'a [u8], scratch: &'a mut String) -> &'a str {
+    if let Some(b) = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]) {
+        match std::str::from_utf8(b) {
+            Ok(s) if !s.contains('\r') => return s,
+            Ok(s) => {
+                normalize_eol_into(s, scratch);
+                return scratch;
+            }
+            Err(_) => {
+                *scratch = normalize_eol(String::from_utf8_lossy(b).into_owned()).0;
+                return scratch;
+            }
+        }
+    }
+    if bytes.starts_with(&[0xFF, 0xFE]) {
+        *scratch = normalize_eol(decode_utf16(&bytes[2..], true)).0;
+        return scratch;
+    }
+    if bytes.starts_with(&[0xFE, 0xFF]) {
+        *scratch = normalize_eol(decode_utf16(&bytes[2..], false)).0;
+        return scratch;
+    }
+    if let Some(enc) = sniff_utf16(bytes) {
+        *scratch = normalize_eol(decode_utf16(bytes, enc == Encoding::Utf16Le)).0;
+        return scratch;
+    }
+    match std::str::from_utf8(bytes) {
+        Ok(s) if !s.contains('\r') => s,
+        Ok(s) => {
+            normalize_eol_into(s, scratch);
+            scratch
+        }
+        Err(_) => {
+            let enc = detect_latin(bytes);
+            *scratch = normalize_eol(decode(bytes, enc)).0;
+            scratch
+        }
     }
 }
 
@@ -377,5 +473,23 @@ mod tests {
         assert_eq!(normalize_eol("è\r\nà".into()), ("è\nà".to_string(), Eol::CrLf));
         assert_eq!(decode_owned(vec![0xEF, 0xBB, 0xBF, b'a'], Encoding::Utf8Bom), "a");
         assert_eq!(decode_owned(vec![b'a', 0xFF], Encoding::Utf8), "a\u{FFFD}");
+
+        let mut scratch = String::new();
+        let samples: Vec<Vec<u8>> = vec![
+            b"ciao\nmondo\n".to_vec(),
+            b"ciao\r\nmondo\rfin".to_vec(),
+            vec![0xEF, 0xBB, 0xBF, b'a', b'\r', b'\n', b'b'],
+            vec![0xEF, 0xBB, 0xBF, b'a', 0xFF, b'\r', b'\n'],
+            vec![b'a', 0xE8, b'\r', b'\n', b'b'],
+            vec![b'a', 0xA4, b'\n'],
+            vec![0x93, b'a', 0x94],
+            encode("riga 1\r\nriga 2 €", Encoding::Utf16Le).0,
+            encode("riga 1\r\nriga 2 €", Encoding::Utf16Be).0,
+        ];
+        for raw in samples {
+            let expected = normalize_eol(decode_owned(raw.clone(), detect(&raw))).0;
+            assert_eq!(decode_auto_owned(raw.clone()), expected);
+            assert_eq!(decode_auto_slice(&raw, &mut scratch), expected);
+        }
     }
 }

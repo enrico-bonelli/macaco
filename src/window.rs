@@ -96,10 +96,13 @@ pub struct Editor {
     eol_action: gio::SimpleAction,
     layout_pending: Cell<bool>,
     autosave_pending: Cell<bool>,
+    autosave_writing: Cell<bool>,
+    autosave_again: Cell<bool>,
     message_gen: Rc<Cell<u32>>,
     shut_down: Cell<bool>,
     diff_on: Cell<bool>,
     diff_pending: Cell<bool>,
+    diff_gen: Cell<u64>,
     /// Documents currently compared (left, right) and their diff.
     diff_pair: RefCell<Vec<Weak<Doc>>>,
     diff_result: RefCell<Option<DiffResult>>,
@@ -142,8 +145,11 @@ pub struct Editor {
     /// Definitions found in the indexed working folder.
     symbols: RefCell<Option<Rc<inspect::Symbols>>>,
     symbols_building: Cell<bool>,
-    /// Completion popup.
+    /// Cached symbols of the active document (for fast local completion).
+    doc_symbols: RefCell<Option<inspect::DocSymbols>>,
+    /// Completion popup and its pending debounce timer.
     completion: RefCell<Option<Rc<inspect::Completion>>>,
+    completion_timer: Cell<Option<glib::SourceId>>,
     /// Running language servers.
     lsp_clients: RefCell<Vec<Rc<crate::lsp::Client>>>,
     /// Servers that could not start in this folder (not tried again).
@@ -151,7 +157,7 @@ pub struct Editor {
     /// Progress text of each server.
     lsp_status: RefCell<std::collections::HashMap<&'static str, String>>,
     /// Documents with changes not yet sent to their server.
-    lsp_dirty: RefCell<std::collections::HashSet<String>>,
+    lsp_dirty: RefCell<std::collections::HashMap<String, lspui::PendingChanges>>,
     lsp_flush_scheduled: Cell<bool>,
     /// Latest diagnostics of the servers, the running "Verifica il file"
     /// and the problems listed in its panel.
@@ -332,10 +338,13 @@ impl Editor {
             eol_action,
             layout_pending: Cell::new(false),
             autosave_pending: Cell::new(false),
+            autosave_writing: Cell::new(false),
+            autosave_again: Cell::new(false),
             message_gen: Rc::new(Cell::new(0)),
             shut_down: Cell::new(false),
             diff_on: Cell::new(false),
             diff_pending: Cell::new(false),
+            diff_gen: Cell::new(0),
             diff_pair: RefCell::new(Vec::new()),
             diff_result: RefCell::new(None),
             syncing: Cell::new(false),
@@ -361,7 +370,9 @@ impl Editor {
             text_search: RefCell::new(None),
             symbols: RefCell::new(None),
             symbols_building: Cell::new(false),
+            doc_symbols: RefCell::new(None),
             completion: RefCell::new(None),
+            completion_timer: Cell::new(None),
             lsp_clients: RefCell::new(Vec::new()),
             lsp_failed: RefCell::new(Default::default()),
             lsp_status: RefCell::new(Default::default()),

@@ -174,6 +174,26 @@ pub fn is_jsx_text(state: State) -> bool {
     matches!(state, State::Jsx(v) if Jsx::unpack(v).mode() == JsxMode::Text)
 }
 
+/// Embedded language at the end of `line_prefix` (the line up to the cursor),
+/// given the state at the start of that line in an HTML or Vue document.
+pub fn embedded_lang_at(outer: Lang, state: State, line_prefix: &str) -> Lang {
+    if !matches!(outer, Lang::Html | Lang::Vue) {
+        return outer;
+    }
+    let st = if line_prefix.is_empty() {
+        state
+    } else {
+        let mut toks = Vec::new();
+        lex_line(outer, state, line_prefix, &mut toks)
+    };
+    match st {
+        State::HtmlScript(js) if js >= 3 => Lang::TypeScript,
+        State::HtmlScript(_) => Lang::JavaScript,
+        State::HtmlStyle(_) => Lang::Css,
+        _ => outer,
+    }
+}
+
 /// Perl quote-like operators and the number of delimited parts they take.
 fn perl_quote_op(w: &[u8]) -> Option<usize> {
     match w {
@@ -2097,6 +2117,11 @@ mod tests {
         assert!(t.contains(&("number".into(), Kind::Type)));
         let (_, s) = kinds(Lang::Vue, s, "</script>");
         assert_eq!(s, State::Normal);
+        assert_eq!(embedded_lang_at(Lang::Vue, State::HtmlScript(3), "const x = 1"), Lang::TypeScript);
+        assert_eq!(embedded_lang_at(Lang::Vue, State::HtmlScript(0), "let x = 1"), Lang::JavaScript);
+        assert_eq!(embedded_lang_at(Lang::Vue, State::HtmlStyle(0), "p { color: red }"), Lang::Css);
+        assert_eq!(embedded_lang_at(Lang::Vue, State::Normal, r#"<script setup lang="ts">const x"#), Lang::TypeScript);
+        assert_eq!(embedded_lang_at(Lang::Vue, State::HtmlScript(3), "</script><p>"), Lang::Vue);
         // Plain HTML: no directives.
         let (t, _) = kinds(Lang::Html, State::Normal, r#"<p :x="a">{{ b }}</p>"#);
         assert!(!t.iter().any(|x| x.1 == Kind::Keyword));

@@ -14,6 +14,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::rc::{Rc, Weak};
+use std::time::{Duration, Instant};
 
 /// Files bigger than this are not scanned for symbols.
 const MAX_SYMBOL_FILE: u64 = 1 << 20;
@@ -21,11 +22,26 @@ const MAX_SYMBOL_FILE: u64 = 1 << 20;
 const MIN_PREFIX: usize = 2;
 /// Completion: rows shown.
 const MAX_ITEMS: usize = 60;
+/// Characters around the cursor scanned for local words (~64 KB window).
+const NEAR_CHARS: i32 = 32_768;
+/// Coalesces completion updates during rapid typing bursts.
+const COMPLETION_DELAY: Duration = Duration::from_millis(30);
+/// Reuse window for active-document symbol definitions while typing.
+const SYMBOL_CACHE_TTL: Duration = Duration::from_secs(3);
 
 /// Symbols of the indexed working folder.
 pub(super) struct Symbols {
     pub(super) root: PathBuf,
     pub(super) project: RefCell<ProjectSymbols>,
+}
+
+/// Cached definitions extracted from the active document.
+pub(super) struct DocSymbols {
+    doc_id: String,
+    lang: Lang,
+    edit_gen: u64,
+    computed_at: Instant,
+    symbols: Rc<[Symbol]>,
 }
 
 /// A completion proposal.
@@ -150,14 +166,14 @@ fn completion_row() -> gtk::Box {
     row
 }
 
-/// Text of the document around the cursor (at most about 1 MB), for the
-/// words proposed by the completion.
-fn text_near_cursor(d: &Doc) -> String {
+/// Text of the document around the cursor (~64 KB), for the local words
+/// proposed by the completion without copying the whole buffer.
+fn text_near_cursor(d: &Doc) -> glib::GString {
     let buf = &d.buffer;
     let cur = buf.iter_at_mark(&buf.get_insert()).offset();
-    let a = buf.iter_at_offset((cur - 500_000).max(0));
-    let b = buf.iter_at_offset(cur + 500_000);
-    buf.text(&a, &b, true).to_string()
+    let a = buf.iter_at_offset((cur - NEAR_CHARS).max(0));
+    let b = buf.iter_at_offset(cur + NEAR_CHARS);
+    buf.text(&a, &b, true)
 }
 
 impl Editor {
@@ -167,6 +183,7 @@ impl Editor {
         add("find-usages", &["<Shift>F4"], |ed| ed.find_usages());
         add("complete", &["<Control>space"], |ed| {
             if let Some(d) = ed.active_doc() {
+                ed.cancel_completion_timer();
                 ed.update_completion(&d, true);
             }
         });
@@ -221,40 +238,43 @@ impl Editor {
         });
         d.view.add_controller(g);
 
-        // Changes for the language server.
+        // Programmatic full-buffer replacements for the language server.
         let ed = Rc::downgrade(self);
         let wd = d.weak();
         d.buffer.connect_changed(move |_| {
-            if let (Some(ed), Some(d)) = (ed.upgrade(), wd.upgrade()) {
+            if let (Some(ed), Some(d)) = (ed.upgrade(), wd.upgrade())
+                && d.is_loading()
+            {
                 ed.lsp_changed(&d);
             }
         });
 
-        // Completion while typing.
+        // Incremental LSP sync and completion while typing.
         let ed = Rc::downgrade(self);
         let wd = d.weak();
-        d.buffer.connect_insert_text(move |_, _, text| {
+        d.buffer.connect_insert_text(move |_, iter, text| {
             let (Some(ed), Some(d)) = (ed.upgrade(), wd.upgrade()) else { return };
-            if !d.is_loaded() || !ed.is_active(&d) {
+            ed.lsp_edit_insert(&d, iter, text);
+            if d.is_loading() || !d.is_loaded() || !ed.is_active(&d) {
                 return;
             }
-            let one = text.chars().count() == 1;
-            let ident = one && text.chars().all(symbols::is_ident_char);
-            let trigger = one && ed.lsp_trigger_char(&d, text);
+            let mut chars = text.chars();
+            let one = chars.next().filter(|_| chars.next().is_none());
+            let ident = one.is_some_and(symbols::is_ident_char);
+            let trigger = one.is_some() && ed.lsp_trigger_char(&d, text);
             if ident || trigger {
-                let (ed, d) = (ed.clone(), d.clone());
-                glib::idle_add_local_once(move || ed.update_completion(&d, trigger));
+                ed.schedule_completion(&d, trigger);
             } else {
                 ed.hide_completion();
             }
         });
         let ed = Rc::downgrade(self);
         let wd = d.weak();
-        d.buffer.connect_delete_range(move |_, _, _| {
+        d.buffer.connect_delete_range(move |_, start, end| {
             let (Some(ed), Some(d)) = (ed.upgrade(), wd.upgrade()) else { return };
-            if ed.completion_visible() {
-                let (ed, d) = (ed.clone(), d.clone());
-                glib::idle_add_local_once(move || ed.update_completion(&d, false));
+            ed.lsp_edit_delete(&d, start, end);
+            if !d.is_loading() && ed.completion_visible() {
+                ed.schedule_completion(&d, false);
             }
         });
         let ed = Rc::downgrade(self);
@@ -283,30 +303,70 @@ impl Editor {
         glib::spawn_future_local(async move {
             let r = root.clone();
             let scan = gio::spawn_blocking(move || {
-                let files: Vec<String> = (0..paths.len()).map(|i| paths.get(i).to_string()).collect();
-                drop(paths);
-                let mut stamps = Vec::with_capacity(files.len());
-                let mut per_file: Vec<FileSymbols> = files
-                    .iter()
-                    .map(|rel| {
-                        let path = r.join(rel);
-                        let meta = std::fs::metadata(&path).ok();
-                        let stamp = meta.as_ref().map_or((0, 0), symbols::stamp_of);
-                        stamps.push(stamp);
-                        if let Some(&(s, i)) = old.get(rel)
-                            && s == stamp
-                        {
-                            return FileSymbols::Same(i);
+                let total = paths.len();
+                let workers = finder::worker_count(total);
+                let next_idx = std::sync::atomic::AtomicUsize::new(0);
+                let run_worker = || -> Vec<(usize, symbols::Stamp, FileSymbols)> {
+                    let mut pbuf = finder::root_prefix(&r);
+                    let base_len = pbuf.len();
+                    let mut buf = Vec::new();
+                    let mut scratch = String::new();
+                    let mut out = Vec::new();
+                    loop {
+                        let start = next_idx.fetch_add(finder::WORKER_CHUNK, std::sync::atomic::Ordering::Relaxed);
+                        if start >= total {
+                            break;
                         }
-                        let l = lang::detect(Some(&path), "");
-                        if l == Lang::Plain || meta.is_none_or(|m| m.len() > MAX_SYMBOL_FILE) {
-                            return FileSymbols::New(Vec::new());
+                        let end = (start + finder::WORKER_CHUNK).min(total);
+                        for idx in start..end {
+                            let rel = paths.get(idx);
+                            let path = finder::join_rel(&mut pbuf, base_len, rel);
+                            let meta = std::fs::metadata(path).ok();
+                            let stamp = meta.as_ref().map_or((0, 0), symbols::stamp_of);
+                            if let Some(&(s, prev)) = old.get(rel)
+                                && s == stamp
+                            {
+                                out.push((idx, stamp, FileSymbols::Same(prev)));
+                                continue;
+                            }
+                            let l = lang::detect(Some(path), "");
+                            if l == Lang::Plain || meta.is_none_or(|m| m.len() > MAX_SYMBOL_FILE) {
+                                out.push((idx, stamp, FileSymbols::New(Vec::new())));
+                                continue;
+                            }
+                            let syms = finder::read_text_buf(path, &mut buf, &mut scratch)
+                                .map(|t| symbols::extract_file(l, path, t))
+                                .unwrap_or_default();
+                            out.push((idx, stamp, FileSymbols::New(syms)));
                         }
-                        FileSymbols::New(finder::read_text(&path).map(|t| symbols::extract_file(l, &path, &t)).unwrap_or_default())
+                    }
+                    out
+                };
+                let parts = if workers <= 1 {
+                    vec![run_worker()]
+                } else {
+                    std::thread::scope(|s| {
+                        let handles: Vec<_> = (1..workers).map(|_| s.spawn(run_worker)).collect();
+                        let mut res = Vec::with_capacity(workers);
+                        res.push(run_worker());
+                        for h in handles {
+                            if let Ok(part) = h.join() {
+                                res.push(part);
+                            }
+                        }
+                        res
                     })
-                    .collect();
+                };
+                let mut stamps = vec![(0, 0); total];
+                let mut per_file: Vec<FileSymbols> = (0..total).map(|_| FileSymbols::New(Vec::new())).collect();
+                for part in parts {
+                    for (idx, stamp, fs) in part {
+                        stamps[idx] = stamp;
+                        per_file[idx] = fs;
+                    }
+                }
                 let sorted = symbols::sort_new(&mut per_file);
-                (files, stamps, per_file, sorted)
+                (paths, stamps, per_file, sorted)
             })
             .await;
             let Some(ed) = ed.upgrade() else { return };
@@ -385,23 +445,53 @@ impl Editor {
         self.local_definition(&d, &word);
     }
 
+    /// Definitions of `d`: reused across keystrokes (`!exact`) within
+    /// `SYMBOL_CACHE_TTL`, or refreshed immediately when `exact` is requested
+    /// and the buffer changed.
+    fn doc_symbols_for(&self, d: &Doc, exact: bool) -> Rc<[Symbol]> {
+        if !exact && d.buffer.char_count() > MAX_SYMBOL_FILE as i32 {
+            return Rc::from([]);
+        }
+        let id = d.id.borrow();
+        let lang = d.lang.get();
+        let edit_gen = d.edit_gen();
+        if let Some(c) = self.doc_symbols.borrow().as_ref()
+            && c.doc_id == *id
+            && c.lang == lang
+            && (c.edit_gen == edit_gen || (!exact && c.computed_at.elapsed() < SYMBOL_CACHE_TTL))
+        {
+            return c.symbols.clone();
+        }
+        drop(id);
+        let doc_file = d.path.borrow().clone().unwrap_or_default();
+        let syms: Rc<[Symbol]> = symbols::extract_file(lang, &doc_file, &d.text()).into();
+        *self.doc_symbols.borrow_mut() = Some(DocSymbols {
+            doc_id: d.id.borrow().clone(),
+            lang,
+            edit_gen,
+            computed_at: Instant::now(),
+            symbols: syms.clone(),
+        });
+        syms
+    }
+
     /// Definitions by name: in the document, then in the project.
     pub(super) fn local_definition(self: &Rc<Self>, d: &Rc<Doc>, word: &str) {
         let doc_path = d.path.borrow().clone();
-        // (path, symbol, line text)
-        let doc_file = doc_path.clone().unwrap_or_default();
-        let mut found: Vec<(Option<PathBuf>, Symbol)> = symbols::extract_file(d.lang.get(), &doc_file, &d.text())
-            .into_iter()
+        let mut found: Vec<(Option<PathBuf>, Symbol)> = self
+            .doc_symbols_for(d, true)
+            .iter()
             .filter(|s| s.name == word)
-            .map(|s| (doc_path.clone(), s))
+            .map(|s| (doc_path.clone(), s.clone()))
             .collect();
         let project = self.symbols.borrow().clone();
         if let Some(p) = &project {
-            for e in p.project.borrow().find(word) {
-                let path = p.root.join(&p.project.borrow().files[e.file as usize]);
+            let proj = p.project.borrow();
+            for e in proj.find(word) {
+                let path = p.root.join(proj.files.get(e.file as usize));
                 // The open document is more recent than the index.
                 if Some(&path) != doc_path.as_ref() {
-                    found.push((Some(path), e.sym.clone()));
+                    found.push((Some(path), e.to_symbol()));
                 }
             }
         }
@@ -492,11 +582,35 @@ impl Editor {
         c
     }
 
+    fn cancel_completion_timer(&self) {
+        if let Some(id) = self.completion_timer.take() {
+            id.remove();
+        }
+    }
+
+    fn schedule_completion(self: &Rc<Self>, d: &Rc<Doc>, forced: bool) {
+        self.cancel_completion_timer();
+        let (ed, d) = (self.clone(), d.clone());
+        let id = if forced {
+            glib::idle_add_local_once(move || {
+                ed.completion_timer.set(None);
+                ed.update_completion(&d, true);
+            })
+        } else {
+            glib::timeout_add_local_once(COMPLETION_DELAY, move || {
+                ed.completion_timer.set(None);
+                ed.update_completion(&d, false);
+            })
+        };
+        self.completion_timer.set(Some(id));
+    }
+
     pub(super) fn completion_visible(&self) -> bool {
         self.completion.borrow().as_ref().is_some_and(|c| c.popover.is_visible())
     }
 
     pub(super) fn hide_completion(&self) {
+        self.cancel_completion_timer();
         if let Some(c) = self.completion.borrow().as_ref() {
             c.generation.set(c.generation.get() + 1);
             c.popover.popdown();
@@ -564,38 +678,43 @@ impl Editor {
         let lower = prefix.to_lowercase();
         // name -> (rank, detail)
         let mut best: HashMap<String, (u8, String)> = HashMap::new();
-        let mut add = |name: &str, rank: u8, detail: &str| {
+        let mut add = |name: &str, rank: u8, detail: &dyn Fn() -> String| {
             if name == prefix || !symbols::starts_with_lower(name, &lower) {
                 return;
             }
             let rank = rank + if name.starts_with(prefix) { 0 } else { 4 };
-            let e = best.entry(name.to_string()).or_insert((u8::MAX, String::new()));
-            if rank < e.0 {
-                *e = (rank, detail.to_string());
+            if let Some(e) = best.get_mut(name) {
+                if rank < e.0 {
+                    *e = (rank, detail());
+                }
+            } else {
+                best.insert(name.to_string(), (rank, detail()));
             }
         };
-        let text = text_near_cursor(d);
-        for s in symbols::extract(d.lang.get(), &text) {
-            add(&s.name, 0, s.kind.label());
+        for s in self.doc_symbols_for(d, false).iter() {
+            add(&s.name, 0, &|| s.kind.label().to_string());
         }
         if let Some(p) = self.symbols.borrow().as_ref() {
             let project = p.project.borrow();
             for e in project.with_prefix(prefix, 300) {
-                let file = project.files[e.file as usize].rsplit('/').next().unwrap_or("");
-                add(&e.sym.name, 2, &format!("{} · {file}", e.sym.kind.label()));
+                add(e.name, 2, &|| {
+                    let file = project.files.get(e.file as usize).rsplit('/').next().unwrap_or("");
+                    format!("{} · {file}", e.kind.label())
+                });
             }
         }
-        for w in symbols::words(&text, MIN_PREFIX, &lower) {
-            add(w, 1, "");
+        let near = text_near_cursor(d);
+        for w in symbols::words(&near, MIN_PREFIX, &lower) {
+            add(w, 1, &String::new);
         }
         let spec = d.lang.get().spec();
         for (list, label) in [(spec.keywords, "parola chiave"), (spec.types, "tipo"), (spec.constants, "costante"), (spec.builtins, "funzione")] {
             for k in list {
-                add(k, 3, label);
+                add(k, 3, &|| label.to_string());
             }
         }
         let mut items: Vec<(u8, String, String)> = best.into_iter().map(|(n, (r, det))| (r, n, det)).collect();
-        items.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.len().cmp(&b.1.len())).then(a.1.cmp(&b.1)));
+        items.sort_unstable_by(|a, b| a.0.cmp(&b.0).then(a.1.len().cmp(&b.1.len())).then(a.1.cmp(&b.1)));
         items
             .into_iter()
             .take(MAX_ITEMS)
@@ -676,6 +795,10 @@ impl Editor {
 
     /// Releases the completion popup (e.g. when its document closes).
     pub(super) fn forget_completion(&self, d: &Doc) {
+        self.cancel_completion_timer();
+        if self.doc_symbols.borrow().as_ref().is_some_and(|s| s.doc_id == *d.id.borrow()) {
+            *self.doc_symbols.borrow_mut() = None;
+        }
         let c = self.completion.borrow().clone();
         if let Some(c) = c
             && c.popover.parent().as_ref() == Some(d.view.upcast_ref())
