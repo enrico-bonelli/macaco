@@ -37,6 +37,7 @@ impl Editor {
                 }
                 "key" => {
                     if let (Some(d), Some(k)) = (ed.active_doc(), gdk::Key::from_name(arg.unwrap_or("")))
+                        && !(d.has_multi() && d.multi_key(k, gdk::ModifierType::empty()))
                         && !d.key_hook.borrow().as_ref().is_some_and(|h| h(k, gdk::ModifierType::empty()))
                         && !d.handle_key(k, gdk::ModifierType::empty())
                         && let Some(c) = k.to_unicode()
@@ -153,6 +154,26 @@ impl Editor {
                 "history-page" => {
                     if let Some(h) = ed.history.borrow().as_ref() {
                         h.debug_page(arg.unwrap_or("patch"));
+                    }
+                }
+                // seq:action+k=Key+…: actions and keys at once (the desktop
+                // may take the selection away between steps).
+                "seq" => {
+                    for item in arg.unwrap_or("").split('+') {
+                        match item.strip_prefix("k=") {
+                            Some(k) => {
+                                if let (Some(d), Some(k)) = (ed.active_doc(), gdk::Key::from_name(k))
+                                    && !(d.has_multi() && d.multi_key(k, gdk::ModifierType::empty()))
+                                    && !d.handle_key(k, gdk::ModifierType::empty())
+                                    && let Some(c) = k.to_unicode()
+                                {
+                                    d.buffer.insert_at_cursor(&c.to_string());
+                                }
+                            }
+                            None => {
+                                let _ = WidgetExt::activate_action(&ed.win, &format!("win.{item}"), None);
+                            }
+                        }
                     }
                 }
                 "problem" => ed.jump_to_problem(arg.and_then(|a| a.parse().ok()).unwrap_or(0)),

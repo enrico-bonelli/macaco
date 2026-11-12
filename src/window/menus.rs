@@ -139,6 +139,11 @@ impl Editor {
         e2.append(Some("Incolla"), Some("win.paste"));
         e2.append(Some("Seleziona tutto"), Some("win.select-all"));
         edit.append_section(None, &e2);
+        let em = gio::Menu::new();
+        em.append(Some("Seleziona occorrenza successiva"), Some("win.select-next-occurrence"));
+        em.append(Some("Seleziona tutte le occorrenze"), Some("win.select-all-occurrences"));
+        em.append(Some("Torna a un solo cursore (Esc)"), Some("win.clear-cursors"));
+        edit.append_section(None, &em);
         let e3 = gio::Menu::new();
         e3.append(Some("Commenta/decommenta"), Some("win.toggle-comment"));
         e3.append(Some("Aumenta rientro"), Some("win.indent"));

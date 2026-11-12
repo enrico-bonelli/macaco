@@ -548,9 +548,13 @@ impl Editor {
         ] {
             let accels: Vec<&str> = accels.into_iter().filter(|a| !a.is_empty()).collect();
             let a = gio::SimpleAction::new(name, None);
-            let w = self.win.downgrade();
+            let ed = Rc::downgrade(self);
             a.connect_activate(move |_, _| {
-                if let Some(focus) = w.upgrade().and_then(|w| gtk::prelude::GtkWindowExt::focus(&w)) {
+                let Some(ed) = ed.upgrade() else { return };
+                if ed.multi_clipboard(name) {
+                    return;
+                }
+                if let Some(focus) = gtk::prelude::GtkWindowExt::focus(&ed.win) {
                     let _ = focus.activate_action(target, None);
                 }
             });
@@ -558,6 +562,26 @@ impl Editor {
             self.app.set_accels_for_action(&format!("win.{name}"), &accels);
         }
 
+        act!("select-next-occurrence", ["<Alt>j"], |ed: &Rc<Editor>| {
+            if let Some(d) = ed.active_doc() {
+                match d.select_next_occurrence() {
+                    Ok(m) | Err(m) => ed.message(&m),
+                }
+            }
+        });
+        act!("select-all-occurrences", ["<Shift><Alt>j"], |ed: &Rc<Editor>| {
+            if let Some(d) = ed.active_doc() {
+                match d.select_all_occurrences() {
+                    Ok(m) | Err(m) => ed.message(&m),
+                }
+            }
+        });
+        act!("clear-cursors", [], |ed: &Rc<Editor>| {
+            if let Some(d) = ed.active_doc() {
+                d.clear_multi();
+                d.focus();
+            }
+        });
         act!("toggle-comment", ["<Control>slash", "<Control>KP_Divide"], |ed: &Rc<Editor>| ed.toggle_comment());
         act!("indent", ["<Control>bracketright"], |ed: &Rc<Editor>| {
             if let Some(d) = ed.active_doc() {
@@ -1023,6 +1047,29 @@ impl Editor {
     /// Splits the active tab in two views of the same file, one above the
     /// other (`Vertical`) or side by side; again with the same orientation,
     /// back to one view.
+    /// Undo, cut, copy, paste and select all while the active document has
+    /// several cursors: the clipboard acts at every cursor, the others go
+    /// back to one cursor first. True if handled here.
+    fn multi_clipboard(&self, name: &str) -> bool {
+        let Some(d) = self.active_doc().filter(|d| d.has_multi()) else { return false };
+        let focused = gtk::prelude::GtkWindowExt::focus(&self.win);
+        if !d.views().iter().any(|v| focused.as_ref() == Some(v.upcast_ref())) {
+            return false;
+        }
+        match name {
+            "copy" => d.multi_copy(),
+            "cut" => d.multi_cut(),
+            "paste" => {
+                d.multi_paste();
+                true
+            }
+            _ => {
+                d.clear_multi();
+                false
+            }
+        }
+    }
+
     fn split_view(self: &Rc<Self>, orientation: gtk::Orientation) {
         let Some(d) = self.active_doc() else { return };
         if d.split_orientation() == Some(orientation) {

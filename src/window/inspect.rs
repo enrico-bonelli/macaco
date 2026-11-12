@@ -219,7 +219,7 @@ impl Editor {
         d.buffer.connect_insert_text(move |_, iter, text| {
             let (Some(ed), Some(d)) = (ed.upgrade(), wd.upgrade()) else { return };
             ed.lsp_edit_insert(&d, iter, text);
-            if d.is_loading() || !d.is_loaded() || !ed.is_active(&d) {
+            if d.is_loading() || !d.is_loaded() || d.has_multi() || !ed.is_active(&d) {
                 return;
             }
             let mut chars = text.chars();

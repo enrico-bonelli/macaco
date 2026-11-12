@@ -1,6 +1,8 @@
 //! A document: one tab with its buffer, view, line number gutter,
 //! incremental syntax highlighter and memory/cache management.
 
+mod multi;
+
 use crate::config::{self, CacheMeta, Settings};
 use crate::encoding::{self, Encoding, Eol};
 use crate::fold;
@@ -41,6 +43,8 @@ pub struct Tags {
     /// Diff view: changed words in the left / right document.
     pub diff_word_del: gtk::TextTag,
     pub diff_word_add: gtk::TextTag,
+    /// Selections of the extra cursors (multiple cursors).
+    pub multi_sel: gtk::TextTag,
 }
 
 impl Tags {
@@ -77,7 +81,25 @@ impl Tags {
         table.add(&diag_warning);
         let diag_error = gtk::TextTag::builder().name("diag-error").underline(pango::Underline::Error).build();
         table.add(&diag_error);
-        let tags = Tags { table, syntax, curline, bracket, search, fold, fold_head, diag_error, diag_warning, diff_add, diff_del, diff_chg, diff_conflict, diff_word_del, diff_word_add };
+        let multi_sel = mk("multi-sel");
+        let tags = Tags {
+            table,
+            syntax,
+            curline,
+            bracket,
+            search,
+            fold,
+            fold_head,
+            diag_error,
+            diag_warning,
+            diff_add,
+            diff_del,
+            diff_chg,
+            diff_conflict,
+            diff_word_del,
+            diff_word_add,
+            multi_sel,
+        };
         tags.set_palette(dark);
         tags
     }
@@ -131,6 +153,7 @@ impl Tags {
         self.diff_conflict.set_paragraph_background(Some(if dark { "#4a2a1c" } else { "#ffe1cc" }));
         self.diff_word_del.set_background(Some(wdel));
         self.diff_word_add.set_background(Some(wadd));
+        self.multi_sel.set_background(Some(if dark { "#264f78" } else { "#add6ff" }));
     }
 }
 
@@ -280,10 +303,12 @@ pub struct SplitView {
     pub view: gtk::TextView,
     pub gutter: gtk::DrawingArea,
     pub scroller: gtk::ScrolledWindow,
+    overlay: gtk::Overlay,
 }
 
-/// A text view with its line-number gutter, in a scrolled window.
-fn build_view(buffer: &gtk::TextBuffer) -> (gtk::TextView, gtk::DrawingArea, gtk::ScrolledWindow) {
+/// A text view with its line-number gutter, in a scrolled window, in an
+/// overlay (for the carets of multiple cursors).
+fn build_view(buffer: &gtk::TextBuffer) -> (gtk::TextView, gtk::DrawingArea, gtk::ScrolledWindow, gtk::Overlay) {
     let view = gtk::TextView::with_buffer(buffer);
     view.add_css_class("macaco");
     view.set_monospace(true);
@@ -295,7 +320,8 @@ fn build_view(buffer: &gtk::TextBuffer) -> (gtk::TextView, gtk::DrawingArea, gtk
     let gutter = gtk::DrawingArea::new();
     view.set_gutter(gtk::TextWindowType::Left, Some(&gutter));
     let scroller = gtk::ScrolledWindow::builder().child(&view).hexpand(true).vexpand(true).build();
-    (view, gutter, scroller)
+    let overlay = gtk::Overlay::builder().child(&scroller).build();
+    (view, gutter, scroller, overlay)
 }
 
 pub struct Doc {
@@ -312,6 +338,13 @@ pub struct Doc {
     /// Top widget of the document (the page of its tab): `scroller`, and
     /// the second view when the tab is split.
     pub page: gtk::Paned,
+    overlay: gtk::Overlay,
+    /// Extra cursors (Alt+J), and set while they are being edited/moved.
+    multi: RefCell<Option<multi::Multi>>,
+    multi_busy: Cell<bool>,
+    /// The word selected by Alt+J at the cursor: its occurrences are
+    /// whole words only.
+    word_pick: Cell<Option<(i32, i32)>>,
     split: RefCell<Option<SplitView>>,
     /// The second view is the one used last: the buffer cursor is its.
     split_active: Cell<bool>,
@@ -422,10 +455,10 @@ impl Doc {
             live::DOCS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             live::BUFFERS.with(|b| b.borrow_mut().push(buffer.downgrade()));
         }
-        let (view, gutter, scroller) = build_view(&buffer);
+        let (view, gutter, scroller, overlay) = build_view(&buffer);
         // With one child the handle is hidden.
         let page = gtk::Paned::new(gtk::Orientation::Vertical);
-        page.set_start_child(Some(&scroller));
+        page.set_start_child(Some(&overlay));
         page.set_shrink_start_child(false);
         page.set_shrink_end_child(false);
         page.set_wide_handle(true);
@@ -451,6 +484,10 @@ impl Doc {
             gutter,
             scroller,
             page,
+            overlay,
+            multi: RefCell::new(None),
+            multi_busy: Cell::new(false),
+            word_pick: Cell::new(None),
             split: RefCell::new(None),
             split_active: Cell::new(false),
             other_sel: RefCell::new(None),
@@ -544,6 +581,7 @@ impl Doc {
         self.buffer.connect_cursor_position_notify(move |_| {
             if let Some(d) = w.upgrade()
                 && !d.loading.get() {
+                    d.multi_cursor_moved();
                     d.reveal_cursor();
                     d.update_cursor_decorations();
                     d.queue_gutters();
@@ -626,10 +664,25 @@ impl Doc {
         let w = Rc::downgrade(self);
         keys.connect_key_pressed(move |_, key, _, state| {
             let Some(d) = w.upgrade() else { return glib::Propagation::Proceed };
+            if d.has_multi() {
+                return if d.multi_key(key, state) { glib::Propagation::Stop } else { glib::Propagation::Proceed };
+            }
             let hooked = d.key_hook.borrow().as_ref().is_some_and(|h| h(key, state));
             if hooked || d.handle_key(key, state) { glib::Propagation::Stop } else { glib::Propagation::Proceed }
         });
         view.add_controller(keys);
+
+        // A click goes back to one cursor.
+        let click = gtk::GestureClick::new();
+        click.set_button(0);
+        click.set_propagation_phase(gtk::PropagationPhase::Capture);
+        let w = Rc::downgrade(self);
+        click.connect_pressed(move |_, _, _, _| {
+            if let Some(d) = w.upgrade() {
+                d.clear_multi();
+            }
+        });
+        view.add_controller(click);
 
         // The two views of a split tab share the cursor: each keeps its own.
         let focus = gtk::EventControllerFocus::new();
@@ -660,21 +713,22 @@ impl Doc {
     /// and its scrolled window, or `None` if the tab was already split
     /// (only the orientation changes).
     pub fn split(self: &Rc<Self>, orientation: gtk::Orientation) -> Option<(gtk::TextView, gtk::ScrolledWindow)> {
+        self.clear_multi();
         self.page.set_orientation(orientation);
         if self.is_split() {
             self.center_split();
             return None;
         }
-        let (view, gutter, scroller) = build_view(&self.buffer);
+        let (view, gutter, scroller, overlay) = build_view(&self.buffer);
         let buf = &self.buffer;
         let ins = buf.iter_at_mark(&buf.get_insert());
         let bound = buf.iter_at_mark(&buf.selection_bound());
         *self.other_sel.borrow_mut() = Some((buf.create_mark(None, &ins, false), buf.create_mark(None, &bound, false)));
         self.split_active.set(false);
-        *self.split.borrow_mut() = Some(SplitView { view: view.clone(), gutter: gutter.clone(), scroller: scroller.clone() });
+        *self.split.borrow_mut() = Some(SplitView { view: view.clone(), gutter: gutter.clone(), scroller: scroller.clone(), overlay: overlay.clone() });
         self.connect_view(1);
         self.update_gutter_width();
-        self.page.set_end_child(Some(&scroller));
+        self.page.set_end_child(Some(&overlay));
         self.center_split();
         // The new view starts where the first one is.
         let (from, to) = (self.scroller.vadjustment(), scroller.vadjustment());
@@ -695,6 +749,7 @@ impl Doc {
 
     /// Back to a single view, keeping the cursor of the view in use.
     pub fn unsplit(&self) {
+        self.clear_multi();
         let Some(v) = self.split.borrow_mut().take() else { return };
         let had_focus = v.view.has_focus();
         self.page.set_end_child(None::<&gtk::Widget>);
@@ -717,6 +772,7 @@ impl Doc {
         if self.split_active.get() == second || !self.loaded.get() {
             return;
         }
+        self.clear_multi();
         let marks = self.other_sel.borrow();
         let Some((a, b)) = marks.as_ref() else { return };
         let buf = &self.buffer;
@@ -737,6 +793,15 @@ impl Doc {
             return v.view.clone();
         }
         self.view.clone()
+    }
+
+    /// Views with their overlay and scrolled window.
+    fn views_with_overlay(&self) -> Vec<(gtk::TextView, gtk::Overlay, gtk::ScrolledWindow)> {
+        let mut v = vec![(self.view.clone(), self.overlay.clone(), self.scroller.clone())];
+        if let Some(s) = self.split.borrow().as_ref() {
+            v.push((s.view.clone(), s.overlay.clone(), s.scroller.clone()));
+        }
+        v
     }
 
     /// Both views of a split tab, or the only one.
@@ -1464,6 +1529,7 @@ impl Doc {
     pub fn set_content(self: &Rc<Self>, text: &str, modified: bool, cursor: i32) {
         // Selection of the other view of a split tab, kept across the reload.
         let other = if self.loaded.get() { self.other_sel_offsets() } else { self.other_sel_saved.take() };
+        self.clear_multi();
         self.unfold_all();
         self.loads.set(self.loads.get().wrapping_add(1));
         self.loading.set(true);
@@ -1533,6 +1599,7 @@ impl Doc {
         if self.is_unsaved() && self.write_cache().is_err() {
             return false;
         }
+        self.clear_multi();
         self.saved_cursor.set(self.cursor_offset());
         self.other_sel_saved.set(self.other_sel_offsets());
         self.unloaded_modified.set(self.buffer.is_modified());
