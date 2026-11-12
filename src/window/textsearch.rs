@@ -137,7 +137,7 @@ impl Editor {
         }
         let buf = &d.buffer;
         buf.place_cursor(&d.iter_at_line_col(line as i32, col as i32));
-        let view = d.view.clone();
+        let view = d.active_view();
         // Scroll once the view has its size.
         glib::idle_add_local_once(move || {
             view.scroll_to_mark(&view.buffer().get_insert(), 0.1, true, 0.0, 0.4);
@@ -231,7 +231,7 @@ impl TextSearch {
         preview_head.append(&preview_title);
         preview_head.append(&preview_open);
         let preview_frame = gtk::Frame::new(None);
-        preview_frame.set_child(Some(&preview.scroller));
+        preview_frame.set_child(Some(&preview.page));
         let right = gtk::Box::new(gtk::Orientation::Vertical, 6);
         right.append(&preview_head);
         right.append(&preview_frame);

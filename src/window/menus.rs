@@ -1,4 +1,4 @@
-//! Menu bar, status bar and the recent files.
+//! Menu bar, status bar, the recent files and working folders.
 
 use super::*;
 
@@ -100,7 +100,7 @@ impl Editor {
         (bar, StatusUi { message, pos, goto, lang, enc, eol, diff, branch, lsp, mem, agents })
     }
 
-    pub(super) fn build_menu(recent: &gio::Menu, bookmarks: &gio::Menu, menus: &SharedMenus) -> gio::Menu {
+    pub(super) fn build_menu(recent: &gio::Menu, recent_folders: &gio::Menu, bookmarks: &gio::Menu, menus: &SharedMenus) -> gio::Menu {
         let bar = gio::Menu::new();
 
         let file = gio::Menu::new();
@@ -111,6 +111,7 @@ impl Editor {
         file.append_section(None, &s1);
         let sw = gio::Menu::new();
         sw.append(Some("Apri cartella di lavoro…"), Some("win.open-folder"));
+        sw.append_submenu(Some("Cartelle di lavoro recenti"), recent_folders);
         sw.append(Some("Cerca file nella cartella di lavoro…"), Some("win.quick-open"));
         sw.append(Some("Indicizza la cartella di lavoro"), Some("win.index-folder"));
         sw.append(Some("Analisi del codice con language server"), Some("win.lsp-folder"));
@@ -171,6 +172,13 @@ impl Editor {
         let view = gio::Menu::new();
         let v1 = gio::Menu::new();
         v1.append(Some("Affianca schede"), Some("win.split"));
+        view.append_section(None, &v1);
+        let vs = gio::Menu::new();
+        vs.append(Some("Dividi la scheda (sopra e sotto)"), Some("win.split-view-below"));
+        vs.append(Some("Dividi la scheda (affiancata)"), Some("win.split-view-side"));
+        vs.append(Some("Passa all'altra vista della scheda"), Some("win.other-view"));
+        view.append_section(None, &vs);
+        let v1 = gio::Menu::new();
         v1.append(Some("Sposta scheda nell'altro pannello"), Some("win.move-tab"));
         v1.append(Some("Scheda successiva"), Some("win.next-tab"));
         v1.append(Some("Scheda precedente"), Some("win.prev-tab"));
@@ -241,5 +249,48 @@ impl Editor {
         let clear = gio::Menu::new();
         clear.append(Some("Svuota elenco"), Some("win.clear-recent"));
         m.append_section(None, &clear);
+    }
+
+    /// Move `dir` to the front of the recent working folders.
+    pub(super) fn add_recent_folder(&self, dir: &Path) {
+        if self.recent_folders.borrow().first().is_some_and(|p| p == dir) {
+            return;
+        }
+        config::push_recent(&mut self.recent_folders.borrow_mut(), dir);
+        config::save_recent_folders(&self.recent_folders.borrow());
+        self.rebuild_recent_folders_menu();
+    }
+
+    pub(super) fn rebuild_recent_folders_menu(&self) {
+        let m = &self.recent_folders_menu;
+        m.remove_all();
+        m.append_section(None, &crate::ui::path_menu(&self.recent_folders.borrow(), "win.open-recent-folder", "(nessuna cartella recente)"));
+        let clear = gio::Menu::new();
+        clear.append(Some("Svuota elenco"), Some("win.clear-recent-folders"));
+        m.append_section(None, &clear);
+    }
+
+    /// Open a recent working folder; one that no longer exists is dropped
+    /// from the list.
+    pub(super) fn open_recent_folder(self: &Rc<Self>, dir: &Path) {
+        if dir.is_dir() {
+            self.set_workdir(Some(dir.to_path_buf()));
+            return;
+        }
+        self.recent_folders.borrow_mut().retain(|p| p != dir);
+        config::save_recent_folders(&self.recent_folders.borrow());
+        self.rebuild_recent_folders_menu();
+        self.message(&format!("{} non esiste più: tolta dalle cartelle recenti", config::tilde(dir)));
+    }
+
+    /// A folder was renamed or moved in the file panel.
+    pub(super) fn recent_folders_renamed(&self, old: &Path, new: &Path) {
+        let dirs: Vec<PathBuf> =
+            self.recent_folders.borrow().iter().map(|p| p.strip_prefix(old).map_or_else(|_| p.clone(), |rest| new.join(rest))).collect();
+        if dirs != *self.recent_folders.borrow() {
+            config::save_recent_folders(&dirs);
+            *self.recent_folders.borrow_mut() = dirs;
+            self.rebuild_recent_folders_menu();
+        }
     }
 }

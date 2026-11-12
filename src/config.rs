@@ -2,6 +2,7 @@
 //!
 //! * `config/settings.conf`  user preferences (font, size, ...)
 //! * `recent`                recently opened files, most recent first
+//! * `recent-folders`        recently opened working folders, most recent first
 //! * `session`               tabs open at exit, working folder
 //! * `cache/<id>.txt|.meta`  content of unsaved tabs
 //! * `git-excluded`          files hidden from the list of git changes
@@ -229,6 +230,16 @@ pub fn load_recent() -> Vec<PathBuf> {
 
 pub fn save_recent(list: &[PathBuf]) {
     write_path_list("recent", list);
+}
+
+pub fn load_recent_folders() -> Vec<PathBuf> {
+    let mut list = read_path_list("recent-folders");
+    list.truncate(MAX_RECENT);
+    list
+}
+
+pub fn save_recent_folders(list: &[PathBuf]) {
+    write_path_list("recent-folders", list);
 }
 
 /// Move `path` to the front of the list.

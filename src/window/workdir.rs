@@ -54,7 +54,7 @@ impl Editor {
         } else if s.widget.focus_child().is_some()
             && let Some(d) = self.active_doc()
         {
-            d.view.grab_focus();
+            d.focus();
         }
         self.shared.settings.borrow_mut().sidebar = on;
         self.set_action_state("sidebar", on);
@@ -98,6 +98,7 @@ impl Editor {
         match &dir {
             Some(d) => {
                 self.message(&format!("Cartella di lavoro: {}", d.display()));
+                self.add_recent_folder(d);
                 self.set_sidebar(true);
             }
             None => {
@@ -118,6 +119,7 @@ impl Editor {
                 self.release_memory();
             }
         }
+        self.update_bookmark_state();
         self.sync_index();
         self.sync_lsp();
         self.sync_sidebar();
@@ -143,6 +145,7 @@ impl Editor {
     /// Updates open documents after a file or folder was renamed.
     pub(super) fn renamed(self: &Rc<Self>, old: &Path, new: &Path) {
         self.bookmarks_renamed(old, new);
+        self.recent_folders_renamed(old, new);
         for d in self.docs.borrow().iter() {
             let moved = d.path.borrow().as_ref().and_then(|p| p.strip_prefix(old).ok().map(|rest| new.join(rest)));
             if let Some(p) = moved {
@@ -157,6 +160,7 @@ impl Editor {
         if self.workdir.borrow().as_ref().is_some_and(|w| w.starts_with(old)) {
             let w = self.workdir.borrow().as_ref().and_then(|w| w.strip_prefix(old).ok().map(|r| new.join(r)));
             *self.workdir.borrow_mut() = w;
+            self.update_bookmark_state();
         }
         self.schedule_layout();
         self.git_refresh();

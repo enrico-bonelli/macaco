@@ -394,8 +394,8 @@ impl Editor {
             d.iter_at_line_col(line as i32, col as i32)
         };
         buf.place_cursor(&it);
-        d.view.scroll_to_mark(&buf.get_insert(), 0.1, true, 0.0, 0.4);
-        d.view.grab_focus();
+        d.active_view().scroll_to_mark(&buf.get_insert(), 0.1, true, 0.0, 0.4);
+        d.focus();
     }
 }
 

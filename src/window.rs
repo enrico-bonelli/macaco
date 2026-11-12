@@ -87,6 +87,9 @@ pub struct Editor {
     active_pane: Cell<usize>,
     recent: RefCell<Vec<PathBuf>>,
     recent_menu: gio::Menu,
+    /// Working folders opened recently and the menu listing them.
+    recent_folders: RefCell<Vec<PathBuf>>,
+    recent_folders_menu: gio::Menu,
     /// Favourite files and folders, and the "Preferiti" menu listing them.
     bookmarks: RefCell<Vec<PathBuf>>,
     bookmarks_menu: gio::Menu,
@@ -288,8 +291,9 @@ impl Editor {
         let disk_bar = external::build_bar();
 
         let recent_menu = gio::Menu::new();
+        let recent_folders_menu = gio::Menu::new();
         let bookmarks_menu = gio::Menu::new();
-        let menubar = gtk::PopoverMenuBar::from_model(Some(&Self::build_menu(&recent_menu, &bookmarks_menu, &shared_menus)));
+        let menubar = gtk::PopoverMenuBar::from_model(Some(&Self::build_menu(&recent_menu, &recent_folders_menu, &bookmarks_menu, &shared_menus)));
 
         let vbox = gtk::Box::new(gtk::Orientation::Vertical, 0);
         vbox.append(&menubar);
@@ -330,6 +334,8 @@ impl Editor {
             active_pane: Cell::new(0),
             recent: RefCell::new(config::load_recent()),
             recent_menu,
+            recent_folders: RefCell::new(config::load_recent_folders()),
+            recent_folders_menu,
             bookmarks: RefCell::new(config::load_bookmarks()),
             bookmarks_menu,
             search,
@@ -399,6 +405,7 @@ impl Editor {
         ed.setup_actions();
         ed.connect_ui();
         ed.rebuild_recent_menu();
+        ed.rebuild_recent_folders_menu();
         ed.restore_session();
         if ed.shared.settings.borrow().sidebar || ed.workdir.borrow().is_some() {
             ed.set_sidebar(true);
@@ -522,6 +529,12 @@ impl Editor {
             ed.rebuild_recent_menu();
         });
         act_str!("open-recent", |ed: &Rc<Editor>, p: String| ed.open_path(Path::new(&p)));
+        act!("clear-recent-folders", [], |ed: &Rc<Editor>| {
+            ed.recent_folders.borrow_mut().clear();
+            config::save_recent_folders(&[]);
+            ed.rebuild_recent_folders_menu();
+        });
+        act_str!("open-recent-folder", |ed: &Rc<Editor>, p: String| ed.open_recent_folder(Path::new(&p)));
 
         // Clipboard and undo act on whatever widget has the focus (the
         // editor or one of the search entries).
@@ -615,6 +628,15 @@ impl Editor {
         });
 
         act!("split", ["<Control>backslash", "F8"], |ed: &Rc<Editor>| ed.toggle_split());
+        act!("split-view-below", ["<Control><Alt>s"], |ed: &Rc<Editor>| ed.split_view(gtk::Orientation::Vertical));
+        act!("split-view-side", ["<Control><Alt>a"], |ed: &Rc<Editor>| ed.split_view(gtk::Orientation::Horizontal));
+        act!("other-view", ["<Control><Alt>o"], |ed: &Rc<Editor>| {
+            if let Some(d) = ed.active_doc()
+                && !d.focus_other_view()
+            {
+                ed.message("La scheda non è divisa: Visualizza → Dividi la scheda");
+            }
+        });
         // Panels with a check mark (set by the functions they call).
         self.add_toggle("diff", &["F9"], |ed| ed.set_diff(!ed.diff_on.get()));
         self.add_toggle("terminal", &["F12", "<Control>grave"], |ed| ed.set_terminal(!ed.terminal_visible()));
@@ -831,9 +853,9 @@ impl Editor {
                 if line > 0 {
                     let buf = &d.buffer;
                     buf.place_cursor(&d.iter_at_line_col(line - 1, col - 1));
-                    d.view.scroll_to_mark(&buf.get_insert(), 0.1, true, 0.0, 0.4);
+                    d.active_view().scroll_to_mark(&buf.get_insert(), 0.1, true, 0.0, 0.4);
                 }
-                d.view.grab_focus();
+                d.focus();
             }
         });
 
@@ -925,16 +947,6 @@ impl Editor {
         middle.connect_released(move |_, _, _, _| close());
         d.tab.add_controller(middle);
 
-        let focus = gtk::EventControllerFocus::new();
-        let entered = self.doc_handler(d, |ed, d| {
-            if let Some(p) = ed.pane_of(d) {
-                ed.active_pane.set(p);
-            }
-            ed.update_status_for(d);
-        });
-        focus.connect_enter(move |_| entered());
-        d.view.add_controller(focus);
-
         let changed = self.doc_handler(d, |ed, d| {
             if d.is_loaded() {
                 ed.schedule_autosave();
@@ -960,11 +972,28 @@ impl Editor {
         // Diff mode: the other view follows the scrolling.
         let scrolled = self.doc_handler(d, |ed, d| ed.sync_scroll(d));
         d.scroller.vadjustment().connect_value_changed(move |_| scrolled());
+        self.wire_view(d, &d.view, &d.scroller);
+    }
+
+    /// Handlers of a view of `d` (the first one, or the second one of a
+    /// split tab).
+    fn wire_view(self: &Rc<Self>, d: &Rc<Doc>, view: &gtk::TextView, scroller: &gtk::ScrolledWindow) {
+        self.wire_inspect_view(d, view);
+        let focus = gtk::EventControllerFocus::new();
+        let entered = self.doc_handler(d, |ed, d| {
+            if let Some(p) = ed.pane_of(d) {
+                ed.active_pane.set(p);
+            }
+            ed.update_status_for(d);
+        });
+        focus.connect_enter(move |_| entered());
+        view.add_controller(focus);
+
         // Search matches are painted around the visible lines.
         let repaint = Rc::new(self.doc_handler(d, |ed, d| ed.schedule_search_paint(d)));
         let r = repaint.clone();
-        d.scroller.vadjustment().connect_value_changed(move |_| r());
-        d.scroller.vadjustment().connect_page_size_notify(move |_| repaint());
+        scroller.vadjustment().connect_value_changed(move |_| r());
+        scroller.vadjustment().connect_page_size_notify(move |_| repaint());
 
         // Ctrl + mouse wheel zooms.
         let scroll = gtk::EventControllerScroll::new(gtk::EventControllerScrollFlags::VERTICAL);
@@ -988,25 +1017,47 @@ impl Editor {
             acc.set(0.0);
             glib::Propagation::Proceed
         });
-        d.view.add_controller(scroll);
+        view.add_controller(scroll);
+    }
+
+    /// Splits the active tab in two views of the same file, one above the
+    /// other (`Vertical`) or side by side; again with the same orientation,
+    /// back to one view.
+    fn split_view(self: &Rc<Self>, orientation: gtk::Orientation) {
+        let Some(d) = self.active_doc() else { return };
+        if d.split_orientation() == Some(orientation) {
+            self.unsplit_view(&d);
+            return;
+        }
+        if let Some((view, scroller)) = d.split(orientation) {
+            self.wire_view(&d, &view, &scroller);
+            self.schedule_search_paint(&d);
+            self.message("Scheda divisa: Ctrl+Alt+O passa all'altra vista, ripeti il comando per tornare a una vista");
+        }
+    }
+
+    fn unsplit_view(self: &Rc<Self>, d: &Rc<Doc>) {
+        self.forget_completion(d);
+        d.unsplit();
+        self.schedule_search_paint(d);
     }
 
     fn add_doc(self: &Rc<Self>, d: &Rc<Doc>, pane: usize) {
         let pane = if self.notebooks[1].is_visible() { pane } else { 0 };
         let nb = &self.notebooks[pane];
-        let idx = nb.append_page(&d.scroller, Some(&d.tab));
+        let idx = nb.append_page(&d.page, Some(&d.tab));
         nb.set_current_page(Some(idx));
         if !self.restoring.get() {
-            d.view.grab_focus();
+            d.focus();
         }
     }
 
     fn doc_for_widget(&self, w: &gtk::Widget) -> Option<Rc<Doc>> {
-        self.docs.borrow().iter().find(|d| d.scroller.upcast_ref::<gtk::Widget>() == w).cloned()
+        self.docs.borrow().iter().find(|d| d.page.upcast_ref::<gtk::Widget>() == w).cloned()
     }
 
     fn pane_of(&self, d: &Doc) -> Option<usize> {
-        self.notebooks.iter().position(|nb| nb.page_num(&d.scroller).is_some())
+        self.notebooks.iter().position(|nb| nb.page_num(&d.page).is_some())
     }
 
     fn current_doc(&self, pane: usize) -> Option<Rc<Doc>> {
@@ -1027,7 +1078,7 @@ impl Editor {
             nb.current_page().and_then(|i| nb.nth_page(Some(i)))
         };
         let p = self.active_pane.get();
-        page(p).or_else(|| page(1 - p)).is_some_and(|w| w == *d.scroller.upcast_ref::<gtk::Widget>())
+        page(p).or_else(|| page(1 - p)).is_some_and(|w| w == *d.page.upcast_ref::<gtk::Widget>())
     }
 
     fn visible_docs(&self) -> Vec<Rc<Doc>> {
@@ -1040,11 +1091,11 @@ impl Editor {
     fn focus_doc(&self, d: &Rc<Doc>) {
         if let Some(p) = self.pane_of(d) {
             let nb = &self.notebooks[p];
-            if let Some(i) = nb.page_num(&d.scroller) {
+            if let Some(i) = nb.page_num(&d.page) {
                 nb.set_current_page(Some(i));
             }
             self.active_pane.set(p);
-            d.view.grab_focus();
+            d.focus();
         }
     }
 
@@ -1084,7 +1135,7 @@ impl Editor {
         if reuse.is_none() {
             self.add_doc(&d, self.active_pane.get());
         } else {
-            d.view.grab_focus();
+            d.focus();
         }
         self.add_recent(&path);
         self.update_status_for(&d);
@@ -1288,7 +1339,7 @@ impl Editor {
         self.lsp_closed(d);
         if let Some(p) = self.pane_of(d) {
             let nb = &self.notebooks[p];
-            if let Some(i) = nb.page_num(&d.scroller) {
+            if let Some(i) = nb.page_num(&d.page) {
                 nb.remove_page(Some(i));
             }
         }
@@ -1300,7 +1351,7 @@ impl Editor {
         }
         self.check_panes();
         if let Some(a) = self.active_doc() {
-            a.view.grab_focus();
+            a.focus();
             self.update_status_for(&a);
         }
         self.schedule_autosave();
@@ -1412,9 +1463,9 @@ impl Editor {
         if from == to {
             return;
         }
-        self.notebooks[from].detach_tab(&d.scroller);
+        self.notebooks[from].detach_tab(&d.page);
         let nb = &self.notebooks[to];
-        let i = nb.append_page(&d.scroller, Some(&d.tab));
+        let i = nb.append_page(&d.page, Some(&d.tab));
         nb.set_current_page(Some(i));
     }
 
@@ -1450,7 +1501,7 @@ impl Editor {
         let cur = nb.current_page().unwrap_or(0) as i32;
         nb.set_current_page(Some(((cur + delta).rem_euclid(n)) as u32));
         if let Some(d) = self.active_doc() {
-            d.view.grab_focus();
+            d.focus();
         }
     }
 
@@ -1629,7 +1680,7 @@ impl Editor {
     pub fn present(&self) {
         self.win.present();
         if let Some(d) = self.active_doc() {
-            d.view.grab_focus();
+            d.focus();
         }
     }
 }

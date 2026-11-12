@@ -97,7 +97,7 @@ impl Editor {
             widget.set_visible(false);
             self.suspend_accels(false);
             if let Some(d) = self.active_doc() {
-                d.view.grab_focus();
+                d.focus();
             }
         }
         self.set_terminal_state(on);
@@ -141,7 +141,7 @@ impl Editor {
         self.set_terminal_state(false);
         self.release_memory();
         if had_focus && let Some(d) = self.active_doc() {
-            d.view.grab_focus();
+            d.focus();
         }
     }
 

@@ -202,42 +202,6 @@ impl Editor {
 
     /// Context menu, Ctrl+click and completion for a document.
     pub(super) fn wire_inspect(self: &Rc<Self>, d: &Rc<Doc>) {
-        // Setting the menu marks the buffer as modified (GTK): keep its state.
-        let modified = d.buffer.is_modified();
-        d.view.set_extra_menu(Some(&Self::code_menu()));
-        d.buffer.set_modified(modified);
-        // Right click outside the selection moves the cursor, so that the
-        // menu entries act on the word clicked.
-        let g = gtk::GestureClick::builder().button(gdk::BUTTON_SECONDARY).build();
-        g.set_propagation_phase(gtk::PropagationPhase::Capture);
-        let wd = d.weak();
-        g.connect_pressed(move |_, _, x, y| {
-            let Some(d) = wd.upgrade() else { return };
-            let (bx, by) = d.view.window_to_buffer_coords(gtk::TextWindowType::Widget, x as i32, y as i32);
-            let Some(it) = d.view.iter_at_location(bx, by) else { return };
-            let inside = d.buffer.selection_bounds().is_some_and(|(a, b)| it.in_range(&a, &b) || it == b);
-            if !inside {
-                d.buffer.place_cursor(&it);
-            }
-        });
-        d.view.add_controller(g);
-        // Ctrl+click: go to the definition.
-        let g = gtk::GestureClick::builder().button(gdk::BUTTON_PRIMARY).build();
-        let ed = Rc::downgrade(self);
-        let wd = d.weak();
-        g.connect_released(move |g, _, x, y| {
-            if !g.current_event_state().contains(gdk::ModifierType::CONTROL_MASK) {
-                return;
-            }
-            let (Some(ed), Some(d)) = (ed.upgrade(), wd.upgrade()) else { return };
-            let (bx, by) = d.view.window_to_buffer_coords(gtk::TextWindowType::Widget, x as i32, y as i32);
-            if let Some(it) = d.view.iter_at_location(bx, by) {
-                d.buffer.place_cursor(&it);
-                ed.goto_definition();
-            }
-        });
-        d.view.add_controller(g);
-
         // Programmatic full-buffer replacements for the language server.
         let ed = Rc::downgrade(self);
         let wd = d.weak();
@@ -279,6 +243,50 @@ impl Editor {
         });
         let ed = Rc::downgrade(self);
         *d.key_hook.borrow_mut() = Some(Box::new(move |key, state| ed.upgrade().is_some_and(|ed| ed.completion_key(key, state))));
+    }
+
+    /// Context menu, Ctrl+click and the completion popup of a view of `d`.
+    pub(super) fn wire_inspect_view(self: &Rc<Self>, d: &Rc<Doc>, view: &gtk::TextView) {
+        // Setting the menu marks the buffer as modified (GTK): keep its state.
+        let modified = d.buffer.is_modified();
+        view.set_extra_menu(Some(&Self::code_menu()));
+        d.buffer.set_modified(modified);
+        // Right click outside the selection moves the cursor, so that the
+        // menu entries act on the word clicked.
+        let g = gtk::GestureClick::builder().button(gdk::BUTTON_SECONDARY).build();
+        g.set_propagation_phase(gtk::PropagationPhase::Capture);
+        let wd = d.weak();
+        let wv = view.downgrade();
+        g.connect_pressed(move |_, _, x, y| {
+            let (Some(d), Some(view)) = (wd.upgrade(), wv.upgrade()) else { return };
+            // First: in a split tab, the focus gives the view its cursor.
+            view.grab_focus();
+            let (bx, by) = view.window_to_buffer_coords(gtk::TextWindowType::Widget, x as i32, y as i32);
+            let Some(it) = view.iter_at_location(bx, by) else { return };
+            let inside = d.buffer.selection_bounds().is_some_and(|(a, b)| it.in_range(&a, &b) || it == b);
+            if !inside {
+                d.buffer.place_cursor(&it);
+            }
+        });
+        view.add_controller(g);
+        // Ctrl+click: go to the definition.
+        let g = gtk::GestureClick::builder().button(gdk::BUTTON_PRIMARY).build();
+        let ed = Rc::downgrade(self);
+        let wd = d.weak();
+        let wv = view.downgrade();
+        g.connect_released(move |g, _, x, y| {
+            if !g.current_event_state().contains(gdk::ModifierType::CONTROL_MASK) {
+                return;
+            }
+            let (Some(ed), Some(d), Some(view)) = (ed.upgrade(), wd.upgrade(), wv.upgrade()) else { return };
+            let (bx, by) = view.window_to_buffer_coords(gtk::TextWindowType::Widget, x as i32, y as i32);
+            if let Some(it) = view.iter_at_location(bx, by) {
+                d.buffer.place_cursor(&it);
+                ed.goto_definition();
+            }
+        });
+        view.add_controller(g);
+
         let ed = Rc::downgrade(self);
         let focus = gtk::EventControllerFocus::new();
         focus.connect_leave(move |_| {
@@ -286,7 +294,7 @@ impl Editor {
                 ed.hide_completion();
             }
         });
-        d.view.add_controller(focus);
+        view.add_controller(focus);
     }
 
     // ------------------------------------------------------------ symbols
@@ -521,8 +529,8 @@ impl Editor {
             _ => {
                 let buf = &d.buffer;
                 buf.place_cursor(&d.iter_at_line_col(line as i32, col as i32));
-                d.view.scroll_to_mark(&buf.get_insert(), 0.1, true, 0.0, 0.4);
-                d.view.grab_focus();
+                d.active_view().scroll_to_mark(&buf.get_insert(), 0.1, true, 0.0, 0.4);
+                d.focus();
             }
         }
     }
@@ -760,19 +768,20 @@ impl Editor {
         // Under the cursor.
         let buf = &d.buffer;
         let it = buf.iter_at_mark(&buf.get_insert());
-        let loc = d.view.iter_location(&it);
-        let (x, y) = d.view.buffer_to_window_coords(gtk::TextWindowType::Widget, loc.x(), loc.y());
-        if c.popover.parent().as_ref() != Some(d.view.upcast_ref()) {
+        let view = d.active_view();
+        let loc = view.iter_location(&it);
+        let (x, y) = view.buffer_to_window_coords(gtk::TextWindowType::Widget, loc.x(), loc.y());
+        if c.popover.parent().as_ref() != Some(view.upcast_ref()) {
             if c.popover.parent().is_some() {
                 c.popover.unparent();
             }
-            c.popover.set_parent(&d.view);
+            c.popover.set_parent(&view);
         }
         c.popover.set_pointing_to(Some(&gdk::Rectangle::new(x, y, 1, loc.height())));
         if !c.popover.is_visible() {
             c.popover.popup();
         }
-        d.view.grab_focus();
+        view.grab_focus();
     }
 
     fn accept_completion(self: &Rc<Self>, i: usize) {
@@ -801,7 +810,7 @@ impl Editor {
         }
         let c = self.completion.borrow().clone();
         if let Some(c) = c
-            && c.popover.parent().as_ref() == Some(d.view.upcast_ref())
+            && c.popover.parent().is_some_and(|p| d.views().iter().any(|v| p == *v.upcast_ref::<gtk::Widget>()))
         {
             c.popover.popdown();
             c.popover.unparent();

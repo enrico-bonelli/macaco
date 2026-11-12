@@ -104,7 +104,7 @@ fn pane_box(title: &str, doc: &Rc<Doc>) -> gtk::Box {
     b.set_hexpand(true);
     b.append(&head);
     let frame = gtk::Frame::new(None);
-    frame.set_child(Some(&doc.scroller));
+    frame.set_child(Some(&doc.page));
     frame.set_vexpand(true);
     b.append(&frame);
     b

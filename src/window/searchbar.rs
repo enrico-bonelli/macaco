@@ -86,7 +86,7 @@ impl Editor {
         }
         self.search.info.set_text("");
         if let Some(d) = self.active_doc() {
-            d.view.grab_focus();
+            d.focus();
         }
     }
 
@@ -158,28 +158,42 @@ impl Editor {
     /// with tag toggles: the rest is painted when scrolled into view.
     fn paint_visible(&self, d: &Doc, h: &Hits) {
         let buf = &d.buffer;
-        let view = &d.view;
-        let rect = view.visible_rect();
-        let (top, bottom) = if rect.height() > 0 {
-            (view.line_at_y(rect.y()).0.line(), view.line_at_y(rect.y() + rect.height()).0.line())
-        } else {
-            let l = d.cursor_iter().line();
-            (l, l)
-        };
+        // Visible lines of each view (two when the tab is split).
+        let ranges: Vec<(i32, i32)> = d
+            .views()
+            .iter()
+            .map(|view| {
+                let rect = view.visible_rect();
+                if rect.height() > 0 {
+                    (view.line_at_y(rect.y()).0.line(), view.line_at_y(rect.y() + rect.height()).0.line())
+                } else {
+                    let l = d.cursor_iter().line();
+                    (l, l)
+                }
+            })
+            .collect();
         let chars_of = |line: i32| buf.iter_at_line(line).map_or_else(|| buf.char_count(), |it| it.offset()) as u32;
-        let (a, b) = (chars_of(top), chars_of(bottom + 1));
         let (pa, pb) = h.painted.get();
-        if pa < pb && pa <= a && b <= pb {
-            return;
+        if ranges.len() == 1 {
+            let (top, bottom) = ranges[0];
+            let (a, b) = (chars_of(top), chars_of(bottom + 1));
+            if pa < pb && pa <= a && b <= pb {
+                return;
+            }
         }
-        let margin = (bottom - top).max(PAINT_MARGIN_LINES);
-        let (a, b) = (chars_of((top - margin).max(0)), chars_of(bottom + 1 + margin));
         let tag = &self.shared.tags.search;
         crate::doc::remove_tag_where_applied(buf, tag);
-        for &(s, e) in h.within(a, b).iter().take(MAX_MATCH_HIGHLIGHT) {
-            buf.apply_tag(tag, &buf.iter_at_offset(s as i32), &buf.iter_at_offset(e as i32));
+        let mut painted = (0, 0);
+        for &(top, bottom) in &ranges {
+            let margin = (bottom - top).max(PAINT_MARGIN_LINES);
+            let (a, b) = (chars_of((top - margin).max(0)), chars_of(bottom + 1 + margin));
+            for &(s, e) in h.within(a, b).iter().take(MAX_MATCH_HIGHLIGHT) {
+                buf.apply_tag(tag, &buf.iter_at_offset(s as i32), &buf.iter_at_offset(e as i32));
+            }
+            painted = (a, b);
         }
-        h.painted.set((a, b));
+        // Split tab: the two ranges are painted again at every scroll.
+        h.painted.set(if ranges.len() == 1 { painted } else { (0, 0) });
     }
 
     /// Repaint the matches of `d` after it scrolled (once per idle).
@@ -261,7 +275,7 @@ impl Editor {
         match found {
             Some((s, e)) => {
                 buf.select_range(&buf.iter_at_offset(s as i32), &buf.iter_at_offset(e as i32));
-                d.view.scroll_to_mark(&buf.get_insert(), 0.1, false, 0.0, 0.0);
+                d.active_view().scroll_to_mark(&buf.get_insert(), 0.1, false, 0.0, 0.0);
             }
             None => self.search.info.set_text("nessun risultato"),
         }

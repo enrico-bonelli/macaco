@@ -26,6 +26,10 @@ impl Editor {
         a.connect_activate(move |_, _| ed.toggle_bookmark());
         self.win.add_action(&a);
         self.app.set_accels_for_action("win.bookmark", &["<Control><Alt>b"]);
+        let a = gio::SimpleAction::new_stateful("bookmark-folder", None, &false.to_variant());
+        let ed = self.clone();
+        a.connect_activate(move |_, _| ed.toggle_folder_bookmark());
+        self.win.add_action(&a);
         self.add_action("bookmarks", &["<Control><Shift>b"], |ed| ed.bookmarks_window());
         self.add_str_action("open-bookmark", |ed, p| {
             ed.open_bookmark(Path::new(&p));
@@ -33,24 +37,46 @@ impl Editor {
         self.rebuild_bookmarks_menu();
     }
 
-    /// The "Preferiti" menu: one entry per bookmark.
+    /// The "Preferiti" menu: one entry per bookmark, working folders
+    /// first, then files.
     pub(super) fn rebuild_bookmarks_menu(&self) {
         let m = &self.bookmarks_menu;
         m.remove_all();
         let head = gio::Menu::new();
         head.append(Some("File corrente nei preferiti"), Some("win.bookmark"));
+        head.append(Some("Cartella di lavoro nei preferiti"), Some("win.bookmark-folder"));
         head.append(Some("Apri un preferito…"), Some("win.bookmarks"));
         m.append_section(None, &head);
-        m.append_section(None, &crate::ui::path_menu(&self.bookmarks.borrow(), "win.open-bookmark", "(nessun preferito)"));
+        let bookmarks = self.bookmarks.borrow();
+        if bookmarks.is_empty() {
+            m.append_section(None, &crate::ui::path_menu(&[], "win.open-bookmark", "(nessun preferito)"));
+            return;
+        }
+        // A bookmark no longer on disk is listed with the files.
+        let (dirs, files): (Vec<PathBuf>, Vec<PathBuf>) = bookmarks.iter().cloned().partition(|p| p.is_dir());
+        if !dirs.is_empty() {
+            m.append_section(Some("Cartelle di lavoro"), &crate::ui::path_menu(&dirs, "win.open-bookmark", ""));
+        }
+        if !files.is_empty() {
+            m.append_section(Some("File"), &crate::ui::path_menu(&files, "win.open-bookmark", ""));
+        }
     }
 
-    /// Check mark of "File corrente nei preferiti" for the active tab.
+    /// Check marks of "File corrente nei preferiti" for the active tab and
+    /// of "Cartella di lavoro nei preferiti".
     pub(super) fn update_bookmark_state(&self) {
-        let Some(a) = self.action("bookmark") else { return };
-        let path = self.active_doc().and_then(|d| d.path.borrow().clone());
-        a.set_enabled(path.is_some());
-        let on = path.is_some_and(|p| self.bookmarks.borrow().contains(&p));
-        a.set_state(&on.to_variant());
+        if let Some(a) = self.action("bookmark") {
+            let path = self.active_doc().and_then(|d| d.path.borrow().clone());
+            a.set_enabled(path.is_some());
+            let on = path.is_some_and(|p| self.bookmarks.borrow().contains(&p));
+            a.set_state(&on.to_variant());
+        }
+        if let Some(a) = self.action("bookmark-folder") {
+            let dir = self.workdir.borrow().clone();
+            a.set_enabled(dir.is_some());
+            let on = dir.is_some_and(|d| self.bookmarks.borrow().contains(&d));
+            a.set_state(&on.to_variant());
+        }
     }
 
     fn set_bookmarks(&self, list: Vec<PathBuf>) {
@@ -73,6 +99,23 @@ impl Editor {
         } else {
             list.push(path.clone());
             self.message(&format!("{} aggiunto ai preferiti", name_of(&path)));
+        }
+        self.set_bookmarks(list);
+    }
+
+    /// Add or remove the working folder.
+    fn toggle_folder_bookmark(&self) {
+        let Some(dir) = self.workdir.borrow().clone() else {
+            self.message("Nessuna cartella di lavoro aperta");
+            return;
+        };
+        let mut list = self.bookmarks.borrow().clone();
+        if let Some(i) = list.iter().position(|p| *p == dir) {
+            list.remove(i);
+            self.message(&format!("{} tolta dai preferiti", name_of(&dir)));
+        } else {
+            list.push(dir.clone());
+            self.message(&format!("{} aggiunta ai preferiti", name_of(&dir)));
         }
         self.set_bookmarks(list);
     }

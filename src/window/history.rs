@@ -205,7 +205,7 @@ impl History {
         version.view.set_editable(false);
         version.apply_settings();
         stack.add_titled(&scrolled(&patch_view), Some("patch"), "Modifiche del commit");
-        stack.add_titled(&version.scroller, Some("version"), "Versione completa");
+        stack.add_titled(&version.page, Some("version"), "Versione completa");
         stack.add_titled(&scrolled(&current_view), Some("current"), "Confronto con il file attuale");
         let switcher = gtk::StackSwitcher::builder().stack(&stack).build();
         let bar = gtk::Box::new(gtk::Orientation::Horizontal, 6);

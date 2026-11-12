@@ -248,7 +248,7 @@ impl Editor {
 
     pub(super) fn append_restored(&self, d: &Rc<Doc>, pane: usize, split: bool) {
         let nb = &self.notebooks[if split { pane } else { 0 }];
-        nb.append_page(&d.scroller, Some(&d.tab));
+        nb.append_page(&d.page, Some(&d.tab));
     }
 
     /// Called when the window closes: unsaved content stays in the cache

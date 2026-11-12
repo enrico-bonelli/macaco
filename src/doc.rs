@@ -275,6 +275,29 @@ impl Highlighter {
     }
 }
 
+/// Second view of the buffer, shown when the tab is split.
+pub struct SplitView {
+    pub view: gtk::TextView,
+    pub gutter: gtk::DrawingArea,
+    pub scroller: gtk::ScrolledWindow,
+}
+
+/// A text view with its line-number gutter, in a scrolled window.
+fn build_view(buffer: &gtk::TextBuffer) -> (gtk::TextView, gtk::DrawingArea, gtk::ScrolledWindow) {
+    let view = gtk::TextView::with_buffer(buffer);
+    view.add_css_class("macaco");
+    view.set_monospace(true);
+    view.set_left_margin(6);
+    view.set_right_margin(6);
+    view.set_top_margin(2);
+    view.set_bottom_margin(40);
+    view.set_input_hints(gtk::InputHints::NO_SPELLCHECK | gtk::InputHints::NO_EMOJI);
+    let gutter = gtk::DrawingArea::new();
+    view.set_gutter(gtk::TextWindowType::Left, Some(&gutter));
+    let scroller = gtk::ScrolledWindow::builder().child(&view).hexpand(true).vexpand(true).build();
+    (view, gutter, scroller)
+}
+
 pub struct Doc {
     pub id: RefCell<String>,
     pub path: RefCell<Option<PathBuf>>,
@@ -286,6 +309,17 @@ pub struct Doc {
     pub view: gtk::TextView,
     pub gutter: gtk::DrawingArea,
     pub scroller: gtk::ScrolledWindow,
+    /// Top widget of the document (the page of its tab): `scroller`, and
+    /// the second view when the tab is split.
+    pub page: gtk::Paned,
+    split: RefCell<Option<SplitView>>,
+    /// The second view is the one used last: the buffer cursor is its.
+    split_active: Cell<bool>,
+    /// While split: selection (insert, bound) of the view not in use (the
+    /// two views share the buffer cursor, swapped when the focus moves).
+    other_sel: RefCell<Option<(gtk::TextMark, gtk::TextMark)>>,
+    /// `other_sel` while the document is unloaded.
+    other_sel_saved: Cell<Option<(i32, i32)>>,
     pub tab: gtk::Box,
     pub label: gtk::Label,
     pub close_button: gtk::Button,
@@ -319,7 +353,8 @@ pub struct Doc {
     fold_pending: Cell<bool>,
     /// Header lines of the collapsed blocks while the document is unloaded.
     saved_folds: RefCell<Vec<u32>>,
-    gutter_hover: Cell<bool>,
+    /// The pointer is over the gutter of the first / second view.
+    gutter_hover: [Cell<bool>; 2],
     /// Times the content was (re)loaded.
     loads: Cell<u32>,
     /// Modification time and size of the file when it was read or saved.
@@ -387,17 +422,13 @@ impl Doc {
             live::DOCS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             live::BUFFERS.with(|b| b.borrow_mut().push(buffer.downgrade()));
         }
-        let view = gtk::TextView::with_buffer(&buffer);
-        view.add_css_class("macaco");
-        view.set_monospace(true);
-        view.set_left_margin(6);
-        view.set_right_margin(6);
-        view.set_top_margin(2);
-        view.set_bottom_margin(40);
-        view.set_input_hints(gtk::InputHints::NO_SPELLCHECK | gtk::InputHints::NO_EMOJI);
-        let gutter = gtk::DrawingArea::new();
-        view.set_gutter(gtk::TextWindowType::Left, Some(&gutter));
-        let scroller = gtk::ScrolledWindow::builder().child(&view).hexpand(true).vexpand(true).build();
+        let (view, gutter, scroller) = build_view(&buffer);
+        // With one child the handle is hidden.
+        let page = gtk::Paned::new(gtk::Orientation::Vertical);
+        page.set_start_child(Some(&scroller));
+        page.set_shrink_start_child(false);
+        page.set_shrink_end_child(false);
+        page.set_wide_handle(true);
 
         let label = gtk::Label::new(None);
         let close_button = gtk::Button::from_icon_name("window-close-symbolic");
@@ -419,6 +450,11 @@ impl Doc {
             view,
             gutter,
             scroller,
+            page,
+            split: RefCell::new(None),
+            split_active: Cell::new(false),
+            other_sel: RefCell::new(None),
+            other_sel_saved: Cell::new(None),
             tab,
             label,
             close_button,
@@ -451,7 +487,7 @@ impl Doc {
             fold_cache: RefCell::new(None),
             fold_pending: Cell::new(false),
             saved_folds: RefCell::new(Vec::new()),
-            gutter_hover: Cell::new(false),
+            gutter_hover: [Cell::new(false), Cell::new(false)],
             loads: Cell::new(0),
             disk_stamp: Cell::new(None),
             disk_change: Cell::new(DiskChange::None),
@@ -489,7 +525,7 @@ impl Doc {
                     d.check_folds();
                     d.schedule_highlight();
                     d.update_gutter_width();
-                    d.gutter.queue_draw();
+                    d.queue_gutters();
                     // Untitled: the tab shows the first words, while typing
                     // its label is set again only when they change.
                     if d.path.borrow().is_none() && d.update_title() {
@@ -510,15 +546,30 @@ impl Doc {
                 && !d.loading.get() {
                     d.reveal_cursor();
                     d.update_cursor_decorations();
-                    d.gutter.queue_draw();
+                    d.queue_gutters();
                 }
         });
 
+        self.connect_view(0);
+    }
+
+    /// View `idx` (0: the first, 1: the second when split), its gutter and
+    /// its scrolled window.
+    fn view_parts(&self, idx: usize) -> Option<(gtk::TextView, gtk::DrawingArea, gtk::ScrolledWindow)> {
+        if idx == 0 {
+            return Some((self.view.clone(), self.gutter.clone(), self.scroller.clone()));
+        }
+        self.split.borrow().as_ref().map(|v| (v.view.clone(), v.gutter.clone(), v.scroller.clone()))
+    }
+
+    /// Gutter, editing keys and focus tracking of view `idx`.
+    fn connect_view(self: &Rc<Self>, idx: usize) {
+        let Some((view, gutter, scroller)) = self.view_parts(idx) else { return };
         // Line numbers.
         let w = Rc::downgrade(self);
-        self.gutter.set_draw_func(move |da, cr, width, height| {
+        gutter.set_draw_func(move |da, cr, width, height| {
             if let Some(d) = w.upgrade() {
-                d.draw_gutter(da, cr, width, height);
+                d.draw_gutter(idx, da, cr, width, height);
             }
         });
         // Fold handles: click to collapse or expand, shown on hover.
@@ -527,40 +578,40 @@ impl Doc {
         let w = Rc::downgrade(self);
         click.connect_pressed(move |g, _, _, y| {
             if let Some(d) = w.upgrade()
-                && let Some(line) = d.gutter_line_at(y)
+                && let Some(line) = d.gutter_line_at(idx, y)
                 && d.toggle_fold_line(line)
             {
                 g.set_state(gtk::EventSequenceState::Claimed);
             }
         });
-        self.gutter.add_controller(click);
+        gutter.add_controller(click);
         let motion = gtk::EventControllerMotion::new();
         let w = Rc::downgrade(self);
         motion.connect_enter(move |_, _, y| {
             if let Some(d) = w.upgrade() {
-                d.gutter_hover.set(true);
-                d.update_gutter_pointer(y);
-                d.gutter.queue_draw();
+                d.gutter_hover[idx].set(true);
+                d.update_gutter_pointer(idx, y);
+                d.queue_gutters();
             }
         });
         let w = Rc::downgrade(self);
         motion.connect_motion(move |_, _, y| {
             if let Some(d) = w.upgrade() {
-                d.update_gutter_pointer(y);
+                d.update_gutter_pointer(idx, y);
             }
         });
         let w = Rc::downgrade(self);
         motion.connect_leave(move |_| {
             if let Some(d) = w.upgrade() {
-                d.gutter_hover.set(false);
-                d.gutter.queue_draw();
+                d.gutter_hover[idx].set(false);
+                d.queue_gutters();
             }
         });
-        self.gutter.add_controller(motion);
+        gutter.add_controller(motion);
 
         // Scrolling, or a new height of the text: the gutter follows.
-        let vadj = self.scroller.vadjustment();
-        let g = self.gutter.downgrade();
+        let vadj = scroller.vadjustment();
+        let g = gutter.downgrade();
         let redraw = move |_: &gtk::Adjustment| {
             if let Some(g) = g.upgrade() {
                 g.queue_draw();
@@ -578,29 +629,178 @@ impl Doc {
             let hooked = d.key_hook.borrow().as_ref().is_some_and(|h| h(key, state));
             if hooked || d.handle_key(key, state) { glib::Propagation::Stop } else { glib::Propagation::Proceed }
         });
-        self.view.add_controller(keys);
+        view.add_controller(keys);
+
+        // The two views of a split tab share the cursor: each keeps its own.
+        let focus = gtk::EventControllerFocus::new();
+        let w = Rc::downgrade(self);
+        focus.connect_enter(move |_| {
+            if let Some(d) = w.upgrade() {
+                d.view_entered(idx);
+            }
+        });
+        view.add_controller(focus);
+        if idx == 1 {
+            self.configure_view(&view);
+        }
+    }
+
+    // ---------------------------------------------------------- split view
+
+    pub fn is_split(&self) -> bool {
+        self.split.borrow().is_some()
+    }
+
+    pub fn split_orientation(&self) -> Option<gtk::Orientation> {
+        self.is_split().then(|| self.page.orientation())
+    }
+
+    /// Split the tab in two views of the buffer, one above the other
+    /// (`Vertical`) or side by side (`Horizontal`). Returns the new view
+    /// and its scrolled window, or `None` if the tab was already split
+    /// (only the orientation changes).
+    pub fn split(self: &Rc<Self>, orientation: gtk::Orientation) -> Option<(gtk::TextView, gtk::ScrolledWindow)> {
+        self.page.set_orientation(orientation);
+        if self.is_split() {
+            self.center_split();
+            return None;
+        }
+        let (view, gutter, scroller) = build_view(&self.buffer);
+        let buf = &self.buffer;
+        let ins = buf.iter_at_mark(&buf.get_insert());
+        let bound = buf.iter_at_mark(&buf.selection_bound());
+        *self.other_sel.borrow_mut() = Some((buf.create_mark(None, &ins, false), buf.create_mark(None, &bound, false)));
+        self.split_active.set(false);
+        *self.split.borrow_mut() = Some(SplitView { view: view.clone(), gutter: gutter.clone(), scroller: scroller.clone() });
+        self.connect_view(1);
+        self.update_gutter_width();
+        self.page.set_end_child(Some(&scroller));
+        self.center_split();
+        // The new view starts where the first one is.
+        let (from, to) = (self.scroller.vadjustment(), scroller.vadjustment());
+        glib::idle_add_local_once(move || to.set_value(from.value()));
+        Some((view, scroller))
+    }
+
+    /// Divider in the middle (once the tab has its size).
+    fn center_split(&self) {
+        let page = self.page.downgrade();
+        glib::idle_add_local_once(move || {
+            if let Some(p) = page.upgrade() {
+                let size = if p.orientation() == gtk::Orientation::Vertical { p.height() } else { p.width() };
+                p.set_position(size / 2);
+            }
+        });
+    }
+
+    /// Back to a single view, keeping the cursor of the view in use.
+    pub fn unsplit(&self) {
+        let Some(v) = self.split.borrow_mut().take() else { return };
+        let had_focus = v.view.has_focus();
+        self.page.set_end_child(None::<&gtk::Widget>);
+        if let Some((a, b)) = self.other_sel.borrow_mut().take() {
+            self.buffer.delete_mark(&a);
+            self.buffer.delete_mark(&b);
+        }
+        self.other_sel_saved.set(None);
+        self.split_active.set(false);
+        self.gutter_hover[1].set(false);
+        if had_focus {
+            self.view.grab_focus();
+        }
+        self.view.scroll_mark_onscreen(&self.buffer.get_insert());
+    }
+
+    /// The focus entered view `idx`: give it its own cursor back.
+    fn view_entered(&self, idx: usize) {
+        let second = idx == 1;
+        if self.split_active.get() == second || !self.loaded.get() {
+            return;
+        }
+        let marks = self.other_sel.borrow();
+        let Some((a, b)) = marks.as_ref() else { return };
+        let buf = &self.buffer;
+        let (ins, bound) = (buf.iter_at_mark(&buf.get_insert()), buf.iter_at_mark(&buf.selection_bound()));
+        let (new_ins, new_bound) = (buf.iter_at_mark(a), buf.iter_at_mark(b));
+        buf.move_mark(a, &ins);
+        buf.move_mark(b, &bound);
+        self.split_active.set(second);
+        buf.select_range(&new_ins, &new_bound);
+    }
+
+    /// The view in use: the second one of a split tab if it had the focus
+    /// last. Searches, jumps and popups act on it.
+    pub fn active_view(&self) -> gtk::TextView {
+        if self.split_active.get()
+            && let Some(v) = self.split.borrow().as_ref()
+        {
+            return v.view.clone();
+        }
+        self.view.clone()
+    }
+
+    /// Both views of a split tab, or the only one.
+    pub fn views(&self) -> Vec<gtk::TextView> {
+        let mut v = vec![self.view.clone()];
+        if let Some(s) = self.split.borrow().as_ref() {
+            v.push(s.view.clone());
+        }
+        v
+    }
+
+    /// Give the focus to the view in use.
+    pub fn focus(&self) {
+        self.active_view().grab_focus();
+    }
+
+    /// Move the focus to the other view of a split tab.
+    pub fn focus_other_view(&self) -> bool {
+        let other = match self.split.borrow().as_ref() {
+            Some(v) if !self.split_active.get() => v.view.clone(),
+            Some(_) => self.view.clone(),
+            None => return false,
+        };
+        other.grab_focus();
+        true
+    }
+
+    fn queue_gutters(&self) {
+        self.gutter.queue_draw();
+        if let Some(v) = self.split.borrow().as_ref() {
+            v.gutter.queue_draw();
+        }
+    }
+
+    fn any_gutter_hover(&self) -> bool {
+        self.gutter_hover.iter().any(Cell::get)
     }
 
     // ------------------------------------------------------------ settings
 
     pub fn apply_settings(&self) {
+        for v in self.views() {
+            self.configure_view(&v);
+        }
+        if !self.shared.settings.borrow().highlight_line {
+            remove_tag_where_applied(&self.buffer, &self.shared.tags.curline);
+        }
+        self.update_gutter_width();
+        self.update_cursor_decorations();
+        self.queue_gutters();
+    }
+
+    /// Wrapping and tab stops of a view.
+    fn configure_view(&self, view: &gtk::TextView) {
         let s = self.shared.settings.borrow();
-        self.view.set_wrap_mode(if s.wrap { gtk::WrapMode::WordChar } else { gtk::WrapMode::None });
+        view.set_wrap_mode(if s.wrap { gtk::WrapMode::WordChar } else { gtk::WrapMode::None });
         let font = self.shared.font.borrow();
-        let ctx = self.view.pango_context();
+        let ctx = view.pango_context();
         let layout = pango::Layout::new(&ctx);
         layout.set_font_description(Some(&font));
         layout.set_text(&" ".repeat(s.tab_width as usize));
         let mut tabs = pango::TabArray::new(1, true);
         tabs.set_tab(0, pango::TabAlign::Left, layout.pixel_size().0);
-        self.view.set_tabs(&tabs);
-        if !s.highlight_line {
-            remove_tag_where_applied(&self.buffer, &self.shared.tags.curline);
-        }
-        drop((s, font));
-        self.update_gutter_width();
-        self.update_cursor_decorations();
-        self.gutter.queue_draw();
+        view.set_tabs(&tabs);
     }
 
     /// Width of the column of the fold handles (0 if the language cannot
@@ -612,19 +812,25 @@ impl Doc {
     fn update_gutter_width(&self) {
         let numbers = self.shared.settings.borrow().line_numbers;
         let fw = self.fold_width();
-        self.gutter.set_visible(numbers || fw > 0);
         let w = if numbers {
             let digits = count_digits(self.buffer.line_count()).max(2);
             digits * self.shared.digit_width.get() + 2 * GUTTER_PAD + fw
         } else {
             fw + GUTTER_PAD / 2
         };
-        if self.gutter.content_width() != w {
-            self.gutter.set_content_width(w);
+        let mut gutters = vec![self.gutter.clone()];
+        if let Some(v) = self.split.borrow().as_ref() {
+            gutters.push(v.gutter.clone());
+        }
+        for g in gutters {
+            g.set_visible(numbers || fw > 0);
+            if g.content_width() != w {
+                g.set_content_width(w);
+            }
         }
     }
 
-    fn draw_gutter(self: &Rc<Self>, da: &gtk::DrawingArea, cr: &gtk::cairo::Context, width: i32, height: i32) {
+    fn draw_gutter(self: &Rc<Self>, idx: usize, da: &gtk::DrawingArea, cr: &gtk::cairo::Context, width: i32, height: i32) {
         let (dark, numbers) = {
             let s = self.shared.settings.borrow();
             (s.dark, s.line_numbers)
@@ -640,12 +846,17 @@ impl Doc {
         if !self.loaded.get() {
             return;
         }
+        let Some((view, _, _)) = self.view_parts(idx) else { return };
         let layout = da.create_pango_layout(None);
         layout.set_font_description(Some(&self.shared.font.borrow()));
-        let rect = self.view.visible_rect();
+        let rect = view.visible_rect();
         // The visible rect starts above line 0 by the top margin.
-        let (mut iter, _) = self.view.line_at_y(rect.y().max(0));
-        let cur_line = self.cursor_iter().line();
+        let (mut iter, _) = view.line_at_y(rect.y().max(0));
+        // The view not in use shows its own cursor line.
+        let cur_line = match self.other_sel.borrow().as_ref() {
+            Some((a, _)) if idx != self.split_active.get() as usize => self.buffer.iter_at_mark(a).line(),
+            _ => self.cursor_iter().line(),
+        };
         let bottom = rect.y() + rect.height();
         let fw = self.fold_width();
         // Collapsed blocks: (header line, first visible position after them),
@@ -659,7 +870,7 @@ impl Doc {
             }
         };
         folded.sort_unstable_by_key(|f| (f.0, f.1.offset()));
-        let foldable = if fw > 0 && self.gutter_hover.get() {
+        let foldable = if fw > 0 && self.gutter_hover[idx].get() {
             let r = self.cached_fold_ranges();
             if r.is_none() {
                 self.schedule_fold_ranges();
@@ -671,11 +882,11 @@ impl Doc {
         let half = (self.shared.digit_width.get() as f64 * 0.42).max(3.0);
         let mut num = String::with_capacity(12);
         loop {
-            let (y, h) = self.view.line_yrange(&iter);
+            let (y, h) = view.line_yrange(&iter);
             if y > bottom {
                 break;
             }
-            let (_, wy) = self.view.buffer_to_window_coords(gtk::TextWindowType::Left, 0, y);
+            let (_, wy) = view.buffer_to_window_coords(gtk::TextWindowType::Left, 0, y);
             let line = iter.line();
             if numbers {
                 num.clear();
@@ -731,22 +942,24 @@ impl Doc {
     }
 
     /// Line whose row in the gutter contains the window coordinate `y`.
-    fn gutter_line_at(&self, y: f64) -> Option<i32> {
+    fn gutter_line_at(&self, idx: usize, y: f64) -> Option<i32> {
         if !self.loaded.get() {
             return None;
         }
-        let (_, by) = self.view.window_to_buffer_coords(gtk::TextWindowType::Left, 0, y as i32);
-        let (it, top) = self.view.line_at_y(by);
-        let (_, h) = self.view.line_yrange(&it);
+        let (view, _, _) = self.view_parts(idx)?;
+        let (_, by) = view.window_to_buffer_coords(gtk::TextWindowType::Left, 0, y as i32);
+        let (it, top) = view.line_at_y(by);
+        let (_, h) = view.line_yrange(&it);
         (by >= top && by < top + h).then(|| it.line())
     }
 
-    fn update_gutter_pointer(&self, y: f64) {
-        let handle = self.gutter_line_at(y).is_some_and(|line| {
+    fn update_gutter_pointer(&self, idx: usize, y: f64) {
+        let Some((_, gutter, _)) = self.view_parts(idx) else { return };
+        let handle = self.gutter_line_at(idx, y).is_some_and(|line| {
             self.fold_index_at_line(line).is_some()
                 || self.cached_fold_ranges().is_some_and(|r| r.binary_search_by_key(&(line as u32), |r| r.header).is_ok())
         });
-        self.gutter.set_cursor_from_name(Some(if handle { "pointer" } else { "default" }));
+        gutter.set_cursor_from_name(Some(if handle { "pointer" } else { "default" }));
     }
 
     // ------------------------------------------------------------- folding
@@ -787,7 +1000,7 @@ impl Doc {
             let Some(d) = w.upgrade() else { return };
             if d.cached_fold_ranges().is_some() {
                 d.fold_pending.set(false);
-                d.gutter.queue_draw();
+                d.queue_gutters();
                 return;
             }
             let lang = d.lang.get();
@@ -795,7 +1008,7 @@ impl Doc {
             if !fold::supported(lang) || !d.loaded.get() || d.buffer.char_count() >= MAX_HIGHLIGHT_BYTES {
                 *d.fold_cache.borrow_mut() = Some((edit_gen, lang, Rc::new(Vec::new())));
                 d.fold_pending.set(false);
-                d.gutter.queue_draw();
+                d.queue_gutters();
                 return;
             }
             let text = d.text();
@@ -806,10 +1019,10 @@ impl Doc {
                 d.fold_pending.set(false);
                 if d.edit_gen.get() == edit_gen && d.lang.get() == lang {
                     *d.fold_cache.borrow_mut() = Some((edit_gen, lang, Rc::new(r)));
-                    if d.gutter_hover.get() {
-                        d.gutter.queue_draw();
+                    if d.any_gutter_hover() {
+                        d.queue_gutters();
                     }
-                } else if d.gutter_hover.get() {
+                } else if d.any_gutter_hover() {
                     d.schedule_fold_ranges();
                 }
             });
@@ -832,7 +1045,7 @@ impl Doc {
             return;
         }
         if self.fold_range_unchecked(r) {
-            self.gutter.queue_draw();
+            self.queue_gutters();
         }
     }
 
@@ -898,7 +1111,7 @@ impl Doc {
         let f = self.folds.borrow_mut().remove(i);
         self.drop_fold(f);
         self.retag_folds();
-        self.gutter.queue_draw();
+        self.queue_gutters();
     }
 
     /// Collapse or expand the block starting at `line`; false if there is
@@ -1003,7 +1216,7 @@ impl Doc {
         }
         let added = self.folds.borrow().len() - before;
         if added > 0 {
-            self.gutter.queue_draw();
+            self.queue_gutters();
         }
         added
     }
@@ -1016,7 +1229,7 @@ impl Doc {
         for f in folds {
             self.drop_fold(f);
         }
-        self.gutter.queue_draw();
+        self.queue_gutters();
     }
 
     /// After an edit: expand the blocks whose header was changed into
@@ -1083,8 +1296,8 @@ impl Doc {
 
     #[cfg(debug_assertions)]
     pub fn debug_gutter_hover(&self, on: bool) {
-        self.gutter_hover.set(on);
-        self.gutter.queue_draw();
+        self.gutter_hover[0].set(on);
+        self.queue_gutters();
     }
 
     // ------------------------------------------------------- changes on disk
@@ -1235,6 +1448,10 @@ impl Doc {
         self.buffer_text().into()
     }
 
+    fn other_sel_offsets(&self) -> Option<(i32, i32)> {
+        self.other_sel.borrow().as_ref().map(|(a, b)| (self.buffer.iter_at_mark(a).offset(), self.buffer.iter_at_mark(b).offset()))
+    }
+
     pub fn cursor_offset(&self) -> i32 {
         if self.loaded.get() {
             self.cursor_iter().offset()
@@ -1245,6 +1462,8 @@ impl Doc {
 
     /// Replace the buffer content without recording undo history.
     pub fn set_content(self: &Rc<Self>, text: &str, modified: bool, cursor: i32) {
+        // Selection of the other view of a split tab, kept across the reload.
+        let other = if self.loaded.get() { self.other_sel_offsets() } else { self.other_sel_saved.take() };
         self.unfold_all();
         self.loads.set(self.loads.get().wrapping_add(1));
         self.loading.set(true);
@@ -1254,6 +1473,10 @@ impl Doc {
         self.buffer.set_modified(modified);
         let it = self.buffer.iter_at_offset(cursor);
         self.buffer.place_cursor(&it);
+        if let (Some((a, b)), Some((oa, ob))) = (self.other_sel.borrow().as_ref(), other) {
+            self.buffer.move_mark(a, &self.buffer.iter_at_offset(oa));
+            self.buffer.move_mark(b, &self.buffer.iter_at_offset(ob));
+        }
         self.loading.set(false);
         self.loaded.set(true);
         self.record_disk_stamp();
@@ -1262,7 +1485,7 @@ impl Doc {
         self.update_gutter_width();
         self.update_cursor_decorations();
         self.refresh_title();
-        self.gutter.queue_draw();
+        self.queue_gutters();
     }
 
     /// Load the content of a file-backed or cached document that was
@@ -1311,6 +1534,7 @@ impl Doc {
             return false;
         }
         self.saved_cursor.set(self.cursor_offset());
+        self.other_sel_saved.set(self.other_sel_offsets());
         self.unloaded_modified.set(self.buffer.is_modified());
         self.unloaded_nonempty.set(self.buffer.char_count() > 0);
         *self.saved_folds.borrow_mut() = self.folds.borrow().iter().map(|f| self.buffer.iter_at_mark(&f.head).line() as u32).collect();
@@ -1518,7 +1742,7 @@ impl Doc {
             self.unfold_all();
         }
         self.update_gutter_width();
-        self.gutter.queue_draw();
+        self.queue_gutters();
         self.reset_highlight(true);
     }
 
@@ -1595,9 +1819,10 @@ impl Doc {
         // paint the visible slice first so frame 1 already has colours; the
         // sequential pass below will re-lex it with the exact state.
         if hl.preview.is_none() && hl.fresh_from + 256 < n {
-            let vis_line = if self.view.is_mapped() {
-                let rect = self.view.visible_rect();
-                if rect.height() > 0 { self.view.line_at_y(rect.y().max(0)).0.line().max(0) as usize } else { 0 }
+            let view = self.active_view();
+            let vis_line = if view.is_mapped() {
+                let rect = view.visible_rect();
+                if rect.height() > 0 { view.line_at_y(rect.y().max(0)).0.line().max(0) as usize } else { 0 }
             } else {
                 0
             };
@@ -1841,7 +2066,7 @@ impl Doc {
                 buf.insert(&mut it, &format!("\n{next}"));
             }
             buf.end_user_action();
-            self.view.scroll_mark_onscreen(&buf.get_insert());
+            self.active_view().scroll_mark_onscreen(&buf.get_insert());
             return true;
         }
         let opens = matches!(before, Some('{' | '[' | '(')) || (before == Some(':') && lang.colon_indents());
@@ -1866,7 +2091,7 @@ impl Doc {
             buf.place_cursor(&it);
         }
         buf.end_user_action();
-        self.view.scroll_mark_onscreen(&buf.get_insert());
+        self.active_view().scroll_mark_onscreen(&buf.get_insert());
         true
     }
 
@@ -2012,7 +2237,7 @@ impl Doc {
             it.set_line_offset(col.min((len - 1).max(0)));
             buf.place_cursor(&it);
         }
-        self.view.scroll_mark_onscreen(&buf.get_insert());
+        self.active_view().scroll_mark_onscreen(&buf.get_insert());
     }
 
     pub fn weak(self: &Rc<Self>) -> Weak<Doc> {
