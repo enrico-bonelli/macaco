@@ -960,6 +960,11 @@ impl Editor {
         // Diff mode: the other view follows the scrolling.
         let scrolled = self.doc_handler(d, |ed, d| ed.sync_scroll(d));
         d.scroller.vadjustment().connect_value_changed(move |_| scrolled());
+        // Search matches are painted around the visible lines.
+        let repaint = Rc::new(self.doc_handler(d, |ed, d| ed.schedule_search_paint(d)));
+        let r = repaint.clone();
+        d.scroller.vadjustment().connect_value_changed(move |_| r());
+        d.scroller.vadjustment().connect_page_size_notify(move |_| repaint());
 
         // Ctrl + mouse wheel zooms.
         let scroll = gtk::EventControllerScroll::new(gtk::EventControllerScrollFlags::VERTICAL);

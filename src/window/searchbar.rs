@@ -1,9 +1,14 @@
 //! The search and replace bar of the window.
 
 use super::*;
+use crate::search::Hits;
 
-/// Do not paint more search matches than this.
-pub(super) const MAX_MATCH_HIGHLIGHT: usize = 20_000;
+/// Do not paint more search matches than this at once.
+const MAX_MATCH_HIGHLIGHT: usize = 20_000;
+/// Lines painted at least above and below the visible ones.
+const PAINT_MARGIN_LINES: i32 = 100;
+/// Edited documents up to this size are searched again when scrolled.
+const RESEARCH_ON_SCROLL_CHARS: i32 = 2_000_000;
 
 impl Editor {
     pub(super) fn build_search_bar() -> (gtk::Revealer, SearchUi) {
@@ -58,9 +63,15 @@ impl Editor {
         self.search.revealer.set_reveal_child(true);
         if let Some(d) = self.active_doc()
             && let Some((a, b)) = d.buffer.selection_bounds()
-                && a.line() == b.line() {
-                    self.search.find.set_text(&d.buffer.text(&a, &b, true));
-                }
+            && a.line() == b.line()
+        {
+            // Setting the same text would search again (twice: the entry
+            // is emptied first).
+            let sel = d.buffer.text(&a, &b, true);
+            if self.search.find.text() != sel {
+                self.search.find.set_text(&sel);
+            }
+        }
         self.search.find.grab_focus();
         self.incremental_search();
     }
@@ -71,6 +82,7 @@ impl Editor {
             if d.is_loaded() {
                 crate::doc::remove_tag_where_applied(&d.buffer, &self.shared.tags.search);
             }
+            *d.search_hits.borrow_mut() = None;
         }
         self.search.info.set_text("");
         if let Some(d) = self.active_doc() {
@@ -103,71 +115,124 @@ impl Editor {
         }
     }
 
-    /// Paint every match and report how many there are.
-    pub(super) fn highlight_matches(&self, d: &Rc<Doc>) -> usize {
-        match self.query() {
-            Some(q) => self.paint_matches(d, Some(&q), &d.buffer_text()),
-            None => self.paint_matches(d, None, ""),
+    /// The matches of `q` in `d`, searched again only when the query or
+    /// the text changed.
+    fn hits(&self, d: &Rc<Doc>, q: &Query) -> Rc<Hits> {
+        if let Some(h) = d.search_hits.borrow().as_ref()
+            && h.is_for(q, d.edit_gen())
+        {
+            return h.clone();
         }
+        let h = Rc::new(Hits::new(q, &d.buffer_text(), d.edit_gen()));
+        *d.search_hits.borrow_mut() = Some(h.clone());
+        h
     }
 
-    /// `highlight_matches` with the query and the text of `d` at hand.
-    pub(super) fn paint_matches(&self, d: &Rc<Doc>, q: Option<&Query>, text: &str) -> usize {
-        let buf = &d.buffer;
-        let tag = &self.shared.tags.search;
-        crate::doc::remove_tag_where_applied(buf, tag);
-        let Some(q) = q else { return 0 };
-        let ascii = text.is_ascii();
-        let mut count = 0;
-        let mut last = (0usize, 0usize);
-        let mut it = buf.start_iter();
-        let mut cur_char = 0usize;
-        for m in q.re.find_iter(text) {
-            if m.start() == m.end() {
-                continue;
-            }
-            count += 1;
-            if count <= MAX_MATCH_HIGHLIGHT {
-                let (s, e) = if ascii {
-                    (m.start(), m.end())
-                } else {
-                    let s = crate::search::char_offset(text, last, m.start());
-                    let e = s + text[m.start()..m.end()].chars().count();
-                    last = (m.end(), e);
-                    (s, e)
-                };
-                if s > cur_char {
-                    it.forward_chars((s - cur_char) as i32);
-                }
-                let start_it = it;
-                it.forward_chars((e - s) as i32);
-                cur_char = e;
-                buf.apply_tag(tag, &start_it, &it);
-            }
-        }
+    /// `hits`, with the count shown and the visible matches painted.
+    fn refresh_hits(&self, d: &Rc<Doc>, q: &Query) -> Rc<Hits> {
+        let h = self.hits(d, q);
+        self.show_count(h.count);
+        self.paint_visible(d, &h);
+        h
+    }
+
+    fn show_count(&self, count: usize) {
         self.search.info.set_tooltip_text(None);
         self.search.info.set_text(&match count {
             0 => "nessun risultato".to_string(),
             1 => "1 risultato".to_string(),
             n => format!("{n} risultati"),
         });
-        count
+    }
+
+    /// Remove the painted matches of `d` (its matches are kept).
+    fn clear_paint(&self, d: &Doc) {
+        crate::doc::remove_tag_where_applied(&d.buffer, &self.shared.tags.search);
+        if let Some(h) = d.search_hits.borrow().as_ref() {
+            h.painted.set((0, 0));
+        }
+    }
+
+    /// Paint the matches around the visible lines of `d`. Painting every
+    /// match of a big file costs tens of milliseconds and fills the buffer
+    /// with tag toggles: the rest is painted when scrolled into view.
+    fn paint_visible(&self, d: &Doc, h: &Hits) {
+        let buf = &d.buffer;
+        let view = &d.view;
+        let rect = view.visible_rect();
+        let (top, bottom) = if rect.height() > 0 {
+            (view.line_at_y(rect.y()).0.line(), view.line_at_y(rect.y() + rect.height()).0.line())
+        } else {
+            let l = d.cursor_iter().line();
+            (l, l)
+        };
+        let chars_of = |line: i32| buf.iter_at_line(line).map_or_else(|| buf.char_count(), |it| it.offset()) as u32;
+        let (a, b) = (chars_of(top), chars_of(bottom + 1));
+        let (pa, pb) = h.painted.get();
+        if pa < pb && pa <= a && b <= pb {
+            return;
+        }
+        let margin = (bottom - top).max(PAINT_MARGIN_LINES);
+        let (a, b) = (chars_of((top - margin).max(0)), chars_of(bottom + 1 + margin));
+        let tag = &self.shared.tags.search;
+        crate::doc::remove_tag_where_applied(buf, tag);
+        for &(s, e) in h.within(a, b).iter().take(MAX_MATCH_HIGHLIGHT) {
+            buf.apply_tag(tag, &buf.iter_at_offset(s as i32), &buf.iter_at_offset(e as i32));
+        }
+        h.painted.set((a, b));
+    }
+
+    /// Repaint the matches of `d` after it scrolled (once per idle).
+    pub(super) fn schedule_search_paint(self: &Rc<Self>, d: &Rc<Doc>) {
+        if d.search_hits.borrow().is_none() || !self.search.revealer.reveals_child() || d.search_paint_queued.replace(true) {
+            return;
+        }
+        let (ed, wd) = (Rc::downgrade(self), d.weak());
+        // Before the next frame is drawn.
+        glib::idle_add_local_full(glib::Priority::HIGH_IDLE, move || {
+            let (Some(ed), Some(d)) = (ed.upgrade(), wd.upgrade()) else { return glib::ControlFlow::Break };
+            d.search_paint_queued.set(false);
+            if !ed.search.revealer.reveals_child() || !d.is_loaded() {
+                return glib::ControlFlow::Break;
+            }
+            let Some(h) = d.search_hits.borrow().clone() else { return glib::ControlFlow::Break };
+            if h.generation == d.edit_gen() {
+                ed.paint_visible(&d, &h);
+            } else if d.buffer.char_count() <= RESEARCH_ON_SCROLL_CHARS
+                && let Some(q) = ed.query()
+            {
+                // Edited since the search: cheap to search again. In big
+                // files the painted matches move with the text until the
+                // next search.
+                ed.refresh_hits(&d, &q);
+            }
+            glib::ControlFlow::Break
+        });
+    }
+
+    /// Show the matches of the query in `d` (a tab switched to).
+    pub(super) fn highlight_matches(&self, d: &Rc<Doc>) {
+        match self.query() {
+            Some(q) => {
+                self.refresh_hits(d, &q);
+            }
+            None => self.clear_paint(d),
+        }
     }
 
     pub(super) fn incremental_search(&self) {
         let Some(d) = self.active_doc() else { return };
-        // One copy of the text and one compiled query for each key press.
         let Some(q) = self.query() else {
-            self.paint_matches(&d, None, "");
+            self.clear_paint(&d);
             return;
         };
-        let text = d.buffer_text();
-        if self.paint_matches(&d, Some(&q), &text) > 0 {
+        let h = self.refresh_hits(&d, &q);
+        if h.count > 0 {
             // Restart from the beginning of the current selection.
             let buf = &d.buffer;
             let start = buf.selection_bounds().map(|(a, _)| a).unwrap_or_else(|| buf.iter_at_mark(&buf.get_insert()));
             buf.place_cursor(&start);
-            self.select_match(&d, &q, &text, true);
+            self.select_match(&d, &q, &h, true);
         }
     }
 
@@ -179,18 +244,33 @@ impl Editor {
             return;
         }
         let Some(q) = self.query() else { return };
-        self.select_match(&d, &q, &d.buffer_text(), forward);
+        let h = self.refresh_hits(&d, &q);
+        self.select_match(&d, &q, &h, forward);
     }
 
-    /// `find_step` with the query and the text of `d` at hand.
-    pub(super) fn select_match(&self, d: &Rc<Doc>, q: &Query, text: &str, forward: bool) {
+    /// `find_step` with the matches of `d` at hand.
+    fn select_match(&self, d: &Rc<Doc>, q: &Query, h: &Hits, forward: bool) {
         let buf = &d.buffer;
         let (sel_a, sel_b) = buf.selection_bounds().unwrap_or_else(|| {
             let i = buf.iter_at_mark(&buf.get_insert());
             (i, i)
         });
-        let pivot_char = if forward { sel_b.offset() } else { sel_a.offset() } as usize;
-        let pivot = crate::search::byte_at_char(text, pivot_char);
+        let pivot = if forward { sel_b.offset() } else { sel_a.offset() } as u32;
+        let found = if forward { h.next(pivot) } else { h.prev(pivot) };
+        let found = found.unwrap_or_else(|| Self::scan_match(&d.buffer_text(), q, pivot, forward));
+        match found {
+            Some((s, e)) => {
+                buf.select_range(&buf.iter_at_offset(s as i32), &buf.iter_at_offset(e as i32));
+                d.view.scroll_to_mark(&buf.get_insert(), 0.1, false, 0.0, 0.0);
+            }
+            None => self.search.info.set_text("nessun risultato"),
+        }
+    }
+
+    /// Next/previous match from character `pivot` searching `text`, for
+    /// the matches past the ones kept by `Hits`; character offsets.
+    fn scan_match(text: &str, q: &Query, pivot: u32, forward: bool) -> Option<(u32, u32)> {
+        let pivot = crate::search::byte_at_char(text, pivot as usize);
         let nonempty = |m: &regex::Match| m.start() != m.end();
         let found = if forward {
             q.re.find_iter(&text[pivot..]).find(nonempty).map(|m| (m.start() + pivot, m.end() + pivot)).or_else(|| {
@@ -207,43 +287,40 @@ impl Editor {
             }
             before.or(last)
         };
-        match found {
-            Some((s, e)) => {
-                let (cs, ce) = if text.is_ascii() {
-                    (s as i32, e as i32)
-                } else {
-                    let cs = text[..s].chars().count() as i32;
-                    (cs, cs + text[s..e].chars().count() as i32)
-                };
-                buf.select_range(&buf.iter_at_offset(cs), &buf.iter_at_offset(ce));
-                d.view.scroll_to_mark(&buf.get_insert(), 0.1, false, 0.0, 0.0);
-            }
-            None => self.search.info.set_text("nessun risultato"),
-        }
+        found.map(|(s, e)| {
+            let cs = text[..s].chars().count();
+            (cs as u32, (cs + text[s..e].chars().count()) as u32)
+        })
     }
 
     pub(super) fn replace_one(&self) {
         let Some(d) = self.active_doc() else { return };
         let Some(q) = self.query() else { return };
+        let h = self.hits(&d, &q);
         let buf = &d.buffer;
-        let mut text = d.text();
         if let Some((mut a, mut b)) = buf.selection_bounds() {
-            let start_b = crate::search::byte_at_char(&text, a.offset() as usize);
-            let sel = buf.text(&a, &b, true);
-            let end_b = start_b + sel.len();
+            let (sa, sb) = (a.offset() as u32, b.offset() as u32);
             // The selection must be exactly a match.
-            if let Some(m) = q.re.find_at(&text, start_b)
-                && m.start() == start_b && m.end() == end_b {
-                    let rep = q.replacement(&text, start_b, &self.search.replace.text());
-                    buf.begin_user_action();
-                    buf.delete(&mut a, &mut b);
-                    buf.insert(&mut a, &rep);
-                    buf.end_user_action();
-                    text.replace_range(start_b..end_b, &rep);
-                }
+            let text = (q.opts.regex || h.is_match(sa, sb).is_none()).then(|| d.buffer_text());
+            let start_b = text.as_ref().map(|t| crate::search::byte_at_char(t, sa as usize));
+            let is_match = h.is_match(sa, sb).unwrap_or_else(|| {
+                let (Some(t), Some(start_b)) = (&text, start_b) else { return false };
+                q.re.find_at(t, start_b).is_some_and(|m| m.start() == start_b && t[m.start()..m.end()].chars().count() == (sb - sa) as usize)
+            });
+            if is_match {
+                let repl = self.search.replace.text();
+                let rep = match (&text, start_b) {
+                    (Some(t), Some(start_b)) => q.replacement(t, start_b, &repl),
+                    _ => repl.to_string(),
+                };
+                buf.begin_user_action();
+                buf.delete(&mut a, &mut b);
+                buf.insert(&mut a, &rep);
+                buf.end_user_action();
+            }
         }
-        self.select_match(&d, &q, &text, true);
-        self.paint_matches(&d, Some(&q), &text);
+        let h = self.refresh_hits(&d, &q);
+        self.select_match(&d, &q, &h, true);
     }
 
     pub(super) fn replace_all(&self) {
@@ -284,7 +361,7 @@ impl Editor {
             }
             buf.end_user_action();
         }
-        self.paint_matches(&d, Some(&q), &d.buffer_text());
+        self.refresh_hits(&d, &q);
         self.message(&format!("{n} sostituzioni effettuate"));
     }
 }

@@ -298,6 +298,10 @@ pub struct Doc {
     saved_cursor: Cell<i32>,
     edit_gen: Cell<u64>,
     cache_gen: Cell<u64>,
+    /// Matches of the search bar query, while the bar is open.
+    pub search_hits: RefCell<Option<Rc<crate::search::Hits>>>,
+    /// A repaint of the matches around the visible lines is queued.
+    pub search_paint_queued: Cell<bool>,
     pub hidden_since: Cell<Option<Instant>>,
     /// Called first for every key press (completion popup); returns true
     /// if it handled the key.
@@ -426,6 +430,8 @@ impl Doc {
             saved_cursor: Cell::new(0),
             edit_gen: Cell::new(0),
             cache_gen: Cell::new(0),
+            search_hits: RefCell::new(None),
+            search_paint_queued: Cell::new(false),
             hidden_since: Cell::new(None),
             key_hook: RefCell::new(None),
             title: RefCell::new(String::new()),
@@ -1310,6 +1316,7 @@ impl Doc {
         *self.saved_folds.borrow_mut() = self.folds.borrow().iter().map(|f| self.buffer.iter_at_mark(&f.head).line() as u32).collect();
         self.unfold_all();
         *self.fold_cache.borrow_mut() = None;
+        *self.search_hits.borrow_mut() = None;
         self.loading.set(true);
         self.buffer.begin_irreversible_action();
         self.buffer.set_text("");
